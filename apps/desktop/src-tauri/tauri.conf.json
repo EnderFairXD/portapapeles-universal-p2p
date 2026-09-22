@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "desktop",
+  "productName": "ClipSync",
   "version": "0.1.0",
   "identifier": "com.portapapelesuniversal.desktop",
   "build": {
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "desktop",
+        "title": "ClipSync",
         "width": 800,
         "height": 600
       }
