@@ -2,7 +2,7 @@ export * from './types';
 export * from './constants';
 
 import { PROTOCOL_VERSION } from './constants';
-import type { SyncMessage, TextPayload } from './types';
+import type { FilePayload, SyncMessage, TextPayload } from './types';
 
 export interface BuildTextMessageInput {
   id: string;
@@ -22,6 +22,40 @@ export function buildTextMessage(input: BuildTextMessageInput): SyncMessage {
     timestamp: input.timestamp,
     checksum: input.checksum,
     type: 'text',
+    payload,
+  };
+}
+
+export interface BuildFileMessageInput {
+  id: string;
+  deviceId: string;
+  timestamp: number;
+  /** Checksum calculado por el caller (ver README) — hoy sobre el string base64, no sobre los bytes crudos (ver nota en sendFileMessage). */
+  checksum: string;
+  fileName: string;
+  mimeType: string;
+  size: number;
+  chunkIndex: number;
+  chunkTotal: number;
+  chunkData: string;
+}
+
+export function buildFileMessage(input: BuildFileMessageInput): SyncMessage {
+  const payload: FilePayload = {
+    fileName: input.fileName,
+    mimeType: input.mimeType,
+    size: input.size,
+    chunkIndex: input.chunkIndex,
+    chunkTotal: input.chunkTotal,
+    chunkData: input.chunkData,
+  };
+  return {
+    protocolVersion: PROTOCOL_VERSION,
+    id: input.id,
+    deviceId: input.deviceId,
+    timestamp: input.timestamp,
+    checksum: input.checksum,
+    type: 'file',
     payload,
   };
 }
