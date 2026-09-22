@@ -55,8 +55,15 @@ async fn handle_connection(
                 write_half.write_all(b"ERROR invalid_message\n").await?;
             }
         }
+
+        // El protocolo actual es una conexión = un mensaje. Si seguíamos el loop hacia
+        // next_line(), nos quedábamos esperando más datos que el cliente nunca manda (solo
+        // espera a que el servidor cierre) — interbloqueo que colgaba la UI móvil
+        // indefinidamente. Cerramos explícitamente tras responder en vez de seguir leyendo.
+        break;
     }
 
+    write_half.shutdown().await?;
     Ok(())
 }
 
