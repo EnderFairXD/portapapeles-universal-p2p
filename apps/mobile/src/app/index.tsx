@@ -16,14 +16,27 @@ const TRANSPORTS: { id: TransportId; label: string; available: boolean }[] = [
 ];
 
 /**
- * Puerto/ruta de vista previa para el Modo Invitado. OJO: docs/architecture.md §6 diseñó
- * este modo con puerto 52848 y rutas `/t/<token>/clipboard` (con token de sesión). Esta
- * pantalla usa el puerto/ruta que se pidió mostrar aquí (8080, /receive) como mockup —
- * todavía no hay servidor real detrás (ver nota en el modal). Hay que reconciliar ambos
- * antes de implementar el servidor HTTP de verdad en la fase de Modo Invitado.
+ * Puerto y forma de ruta del Modo Invitado, alineados con el diseño seguro de
+ * docs/architecture.md §6: puerto 52848 (distinto del 52847 de LanTransport) y
+ * `/t/<token>/clipboard`, con token de sesión — sin token, cualquiera en la LAN del PC
+ * público podría pedir el clipboard. Sigue siendo un mockup visual: el servidor HTTP real
+ * (y la generación/expiración real del token) es trabajo de la fase de implementación.
  */
-const GUEST_MODE_PORT = 8080;
-const GUEST_MODE_PATH = '/receive';
+const GUEST_MODE_PORT = 52848;
+
+function buildGuestModePath(token: string): string {
+  return `/t/${token}/clipboard`;
+}
+
+/** Token corto de ejemplo para el mockup — en la implementación real se genera por sesión y expira. */
+function generateMockToken(): string {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin caracteres ambiguos (O/0, I/1)
+  let token = '';
+  for (let i = 0; i < 4; i += 1) {
+    token += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return token;
+}
 
 const colors = {
   bg: '#0d0e24',
@@ -61,6 +74,7 @@ export default function DiscoveryScreen() {
   const [guestModeVisible, setGuestModeVisible] = useState(false);
   const [deviceIp, setDeviceIp] = useState<string | null>(null);
   const [ipLoading, setIpLoading] = useState(false);
+  const [guestToken, setGuestToken] = useState<string | null>(null);
   const stopDiscoveryRef = useRef<(() => void) | null>(null);
 
   const log = useCallback<LogFn>((msg, level = 'info') => {
@@ -144,6 +158,7 @@ export default function DiscoveryScreen() {
 
   const handleOpenGuestMode = useCallback(async () => {
     setGuestModeVisible(true);
+    setGuestToken(generateMockToken());
     setIpLoading(true);
     try {
       const ip = await Network.getIpAddressAsync();
@@ -164,10 +179,10 @@ export default function DiscoveryScreen() {
     [log],
   );
 
-  const curlCommand = deviceIp ? `curl http://${deviceIp}:${GUEST_MODE_PORT}${GUEST_MODE_PATH}` : null;
-  const powershellCommand = deviceIp
-    ? `Invoke-WebRequest -Uri http://${deviceIp}:${GUEST_MODE_PORT}${GUEST_MODE_PATH} -OutFile clip.txt`
-    : null;
+  const guestModeUrl =
+    deviceIp && guestToken ? `http://${deviceIp}:${GUEST_MODE_PORT}${buildGuestModePath(guestToken)}` : null;
+  const curlCommand = guestModeUrl ? `curl ${guestModeUrl}` : null;
+  const powershellCommand = guestModeUrl ? `Invoke-WebRequest -Uri ${guestModeUrl} -OutFile clip.txt` : null;
 
   return (
     <View style={styles.container}>
@@ -309,12 +324,24 @@ export default function DiscoveryScreen() {
               traer el portapapeles de este móvil, sin instalar ningún cliente.
             </Text>
 
-            <Text style={styles.modalLabel}>IP de este móvil</Text>
-            {ipLoading ? (
-              <ActivityIndicator size="small" color={colors.cyan} />
-            ) : (
-              <Text style={styles.modalIp}>{deviceIp ?? 'No disponible (¿WiFi conectado?)'}</Text>
-            )}
+            <View style={styles.modalInfoRow}>
+              <View style={styles.modalInfoCol}>
+                <Text style={styles.modalLabel}>IP de este móvil</Text>
+                {ipLoading ? (
+                  <ActivityIndicator size="small" color={colors.cyan} />
+                ) : (
+                  <Text style={styles.modalIp}>{deviceIp ?? 'No disponible'}</Text>
+                )}
+              </View>
+              <View style={styles.modalInfoCol}>
+                <Text style={styles.modalLabel}>Token de sesión</Text>
+                <Text style={styles.modalToken}>{guestToken ?? '····'}</Text>
+              </View>
+            </View>
+            <Text style={styles.modalHint}>
+              El token cambia cada vez que abres este modo — sin él, nadie más en esa red puede pedir tu
+              portapapeles.
+            </Text>
 
             <Text style={styles.modalLabel}>Linux / macOS</Text>
             <Pressable
@@ -322,7 +349,9 @@ export default function DiscoveryScreen() {
               disabled={!curlCommand}
               onPress={() => curlCommand && handleCopyCommand(curlCommand, 'Comando curl')}
             >
-              <Text style={styles.commandText}>{curlCommand ?? `curl http://<ip>:${GUEST_MODE_PORT}${GUEST_MODE_PATH}`}</Text>
+              <Text style={styles.commandText}>
+                {curlCommand ?? `curl http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')}`}
+              </Text>
             </Pressable>
 
             <Text style={styles.modalLabel}>Windows (PowerShell)</Text>
@@ -332,7 +361,8 @@ export default function DiscoveryScreen() {
               onPress={() => powershellCommand && handleCopyCommand(powershellCommand, 'Comando PowerShell')}
             >
               <Text style={styles.commandText}>
-                {powershellCommand ?? `Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${GUEST_MODE_PATH} -OutFile clip.txt`}
+                {powershellCommand ??
+                  `Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')} -OutFile clip.txt`}
               </Text>
             </Pressable>
 
@@ -493,8 +523,11 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   modalBody: { color: colors.textMuted, fontSize: 13, lineHeight: 18 },
+  modalInfoRow: { flexDirection: 'row', gap: 20 },
+  modalInfoCol: { flex: 1 },
   modalLabel: { color: colors.text, fontSize: 12, fontWeight: '700', marginTop: 4 },
   modalIp: { color: colors.cyan, fontSize: 18, fontWeight: '700', fontFamily: 'monospace' },
+  modalToken: { color: colors.indigo, fontSize: 18, fontWeight: '700', fontFamily: 'monospace', letterSpacing: 2 },
   commandBox: {
     backgroundColor: colors.surfaceAlt,
     borderWidth: 1,
