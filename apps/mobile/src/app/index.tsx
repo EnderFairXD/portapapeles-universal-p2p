@@ -1,7 +1,9 @@
+import * as Clipboard from 'expo-clipboard';
 import * as DocumentPicker from 'expo-document-picker';
 import { LinearGradient } from 'expo-linear-gradient';
+import * as Network from 'expo-network';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, FlatList, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { DiscoveredPeer, LogFn, PickedFile, sendFileMessage, sendTextMessage, startLanDiscovery } from '@/lib/lanTransport';
 
@@ -12,6 +14,16 @@ const TRANSPORTS: { id: TransportId; label: string; available: boolean }[] = [
   { id: 'usb', label: 'USB', available: false },
   { id: 'bluetooth', label: 'Bluetooth', available: false },
 ];
+
+/**
+ * Puerto/ruta de vista previa para el Modo Invitado. OJO: docs/architecture.md §6 diseñó
+ * este modo con puerto 52848 y rutas `/t/<token>/clipboard` (con token de sesión). Esta
+ * pantalla usa el puerto/ruta que se pidió mostrar aquí (8080, /receive) como mockup —
+ * todavía no hay servidor real detrás (ver nota en el modal). Hay que reconciliar ambos
+ * antes de implementar el servidor HTTP de verdad en la fase de Modo Invitado.
+ */
+const GUEST_MODE_PORT = 8080;
+const GUEST_MODE_PATH = '/receive';
 
 const colors = {
   bg: '#0d0e24',
@@ -46,6 +58,9 @@ export default function DiscoveryScreen() {
   const [message, setMessage] = useState('');
   const [file, setFile] = useState<PickedFile | null>(null);
   const [sending, setSending] = useState(false);
+  const [guestModeVisible, setGuestModeVisible] = useState(false);
+  const [deviceIp, setDeviceIp] = useState<string | null>(null);
+  const [ipLoading, setIpLoading] = useState(false);
   const stopDiscoveryRef = useRef<(() => void) | null>(null);
 
   const log = useCallback<LogFn>((msg, level = 'info') => {
@@ -127,6 +142,33 @@ export default function DiscoveryScreen() {
     [log],
   );
 
+  const handleOpenGuestMode = useCallback(async () => {
+    setGuestModeVisible(true);
+    setIpLoading(true);
+    try {
+      const ip = await Network.getIpAddressAsync();
+      setDeviceIp(ip && ip !== '0.0.0.0' ? ip : null);
+    } catch (error) {
+      log(`No se pudo obtener la IP del dispositivo: ${String(error)}`, 'error');
+      setDeviceIp(null);
+    } finally {
+      setIpLoading(false);
+    }
+  }, [log]);
+
+  const handleCopyCommand = useCallback(
+    async (command: string, label: string) => {
+      await Clipboard.setStringAsync(command);
+      log(`${label} copiado al portapapeles`);
+    },
+    [log],
+  );
+
+  const curlCommand = deviceIp ? `curl http://${deviceIp}:${GUEST_MODE_PORT}${GUEST_MODE_PATH}` : null;
+  const powershellCommand = deviceIp
+    ? `Invoke-WebRequest -Uri http://${deviceIp}:${GUEST_MODE_PORT}${GUEST_MODE_PATH} -OutFile clip.txt`
+    : null;
+
   return (
     <View style={styles.container}>
       <LinearGradient colors={[colors.indigoDeep, colors.bg]} style={styles.header}>
@@ -150,6 +192,10 @@ export default function DiscoveryScreen() {
             );
           })}
         </View>
+
+        <Pressable onPress={handleOpenGuestMode} style={styles.guestModeLink}>
+          <Text style={styles.guestModeLinkText}>🖥️ Modo Terminal / Sin Instalar</Text>
+        </Pressable>
 
         <View style={styles.sectionHeader}>
           <Text style={styles.sectionTitle}>Dispositivos en la LAN</Text>
@@ -240,6 +286,60 @@ export default function DiscoveryScreen() {
           renderItem={({ item }) => <Text style={styles.logLine}>{item}</Text>}
         />
       </View>
+
+      <Modal
+        visible={guestModeVisible}
+        animationType="slide"
+        transparent
+        onRequestClose={() => setGuestModeVisible(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Modo Terminal — Sin Instalar</Text>
+              <Pressable onPress={() => setGuestModeVisible(false)} hitSlop={8}>
+                <Text style={styles.modalClose}>✕</Text>
+              </Pressable>
+            </View>
+
+            <Text style={styles.modalBadge}>🚧 Vista previa — el servidor HTTP todavía no existe</Text>
+
+            <Text style={styles.modalBody}>
+              Para un PC público o sin permisos de instalación: ejecuta uno de estos comandos allí para
+              traer el portapapeles de este móvil, sin instalar ningún cliente.
+            </Text>
+
+            <Text style={styles.modalLabel}>IP de este móvil</Text>
+            {ipLoading ? (
+              <ActivityIndicator size="small" color={colors.cyan} />
+            ) : (
+              <Text style={styles.modalIp}>{deviceIp ?? 'No disponible (¿WiFi conectado?)'}</Text>
+            )}
+
+            <Text style={styles.modalLabel}>Linux / macOS</Text>
+            <Pressable
+              style={styles.commandBox}
+              disabled={!curlCommand}
+              onPress={() => curlCommand && handleCopyCommand(curlCommand, 'Comando curl')}
+            >
+              <Text style={styles.commandText}>{curlCommand ?? `curl http://<ip>:${GUEST_MODE_PORT}${GUEST_MODE_PATH}`}</Text>
+            </Pressable>
+
+            <Text style={styles.modalLabel}>Windows (PowerShell)</Text>
+            <Pressable
+              style={styles.commandBox}
+              disabled={!powershellCommand}
+              onPress={() => powershellCommand && handleCopyCommand(powershellCommand, 'Comando PowerShell')}
+            >
+              <Text style={styles.commandText}>
+                {powershellCommand ?? `Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${GUEST_MODE_PATH} -OutFile clip.txt`}
+              </Text>
+            </Pressable>
+
+            <Text style={styles.modalHint}>Toca un comando para copiarlo.</Text>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -268,6 +368,9 @@ const styles = StyleSheet.create({
   pillText: { color: colors.textMuted, fontSize: 13, fontWeight: '600' },
   pillTextActive: { color: colors.text },
   pillBadge: { color: colors.textMuted, fontSize: 9 },
+
+  guestModeLink: { alignSelf: 'flex-start' },
+  guestModeLinkText: { color: colors.cyan, fontSize: 12, fontWeight: '600' },
 
   sectionHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 },
   sectionTitle: { color: colors.text, fontSize: 14, fontWeight: '700' },
@@ -359,4 +462,46 @@ const styles = StyleSheet.create({
     paddingTop: 8,
   },
   logLine: { fontFamily: 'monospace', fontSize: 10, color: colors.textMuted, paddingVertical: 1 },
+
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(4, 5, 16, 0.72)',
+    justifyContent: 'flex-end',
+  },
+  modalCard: {
+    backgroundColor: colors.surface,
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    padding: 20,
+    paddingBottom: 36,
+    gap: 10,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  modalHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
+  modalTitle: { color: colors.text, fontSize: 17, fontWeight: '700' },
+  modalClose: { color: colors.textMuted, fontSize: 18, fontWeight: '700', paddingHorizontal: 4 },
+  modalBadge: {
+    alignSelf: 'flex-start',
+    backgroundColor: colors.surfaceAlt,
+    color: colors.cyan,
+    fontSize: 11,
+    fontWeight: '600',
+    paddingVertical: 4,
+    paddingHorizontal: 10,
+    borderRadius: 999,
+    overflow: 'hidden',
+  },
+  modalBody: { color: colors.textMuted, fontSize: 13, lineHeight: 18 },
+  modalLabel: { color: colors.text, fontSize: 12, fontWeight: '700', marginTop: 4 },
+  modalIp: { color: colors.cyan, fontSize: 18, fontWeight: '700', fontFamily: 'monospace' },
+  commandBox: {
+    backgroundColor: colors.surfaceAlt,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 10,
+    padding: 10,
+  },
+  commandText: { color: colors.text, fontFamily: 'monospace', fontSize: 12 },
+  modalHint: { color: colors.textMuted, fontSize: 11, fontStyle: 'italic', marginTop: 2 },
 });

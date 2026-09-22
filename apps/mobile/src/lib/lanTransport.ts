@@ -85,29 +85,66 @@ export function startLanDiscovery(onPeerFound: (peer: DiscoveredPeer) => void, l
 }
 
 /**
+ * Cuánto esperar la respuesta del peer antes de dar el envío por fallido. Sin esto, un
+ * peer que no responde (apagado, IP obsoleta, firewall) dejaba la promesa colgada para
+ * siempre y con ella el spinner de "enviando" en la UI — ver nota de bug en sendSyncMessage.
+ */
+const SEND_TIMEOUT_MS = 5000;
+
+/**
  * Conecta por TCP al peer y envía un SyncMessage ya construido.
  * Framing "una línea = un mensaje" (NDJSON): JSON.stringify escapa cualquier salto de
  * línea embebido, así que un simple "\n" delimita mensajes sin ambigüedad.
+ *
+ * Bug corregido: antes esta promesa solo se resolvía en el evento 'close' del socket, pero
+ * nunca cerrábamos la conexión desde aquí — dependíamos por completo de que el servidor la
+ * cerrara. El servidor (transport.rs), a su vez, volvía a esperar una línea más tras
+ * responder "OK", así que nunca cerraba tampoco. Resultado: interbloqueo — ambos lados
+ * esperando al otro — y la promesa (y por tanto el `isSending` de la UI) jamás se resolvía.
+ * El fix es doble: (1) el servidor ahora cierra tras responder al primer mensaje, y (2) aquí
+ * ya no dependemos de eso — en cuanto llega la respuesta cerramos el socket nosotros mismos
+ * y resolvemos, más un timeout de seguridad por si el peer no responde en absoluto.
  */
 function sendSyncMessage(peer: DiscoveredPeer, message: SyncMessage, log: LogFn): Promise<void> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+
     log(`Conectando a ${peer.host}:${peer.port}…`);
     const client = TcpSocket.createConnection({ host: peer.host, port: peer.port }, () => {
       log(`Conectado. Enviando mensaje ${message.id} (${message.type})`);
       client.write(JSON.stringify(message) + '\n');
     });
 
+    const timeoutId = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      log(`Tiempo de espera agotado (${SEND_TIMEOUT_MS / 1000}s) esperando respuesta de ${peer.host}:${peer.port}`, 'error');
+      client.destroy();
+      reject(new Error('send_timeout'));
+    }, SEND_TIMEOUT_MS);
+
     client.on('data', (data) => {
-      log(`Respuesta del peer: ${data.toString()}`);
+      log(`Respuesta del peer: ${data.toString().trim()}`);
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
+      client.destroy();
+      resolve();
     });
 
     client.on('error', (error: unknown) => {
       log(`Error de socket: ${String(error)}`, 'error');
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
       reject(error instanceof Error ? error : new Error(String(error)));
     });
 
     client.on('close', () => {
       log('Conexión cerrada');
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutId);
       resolve();
     });
   });
