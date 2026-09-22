@@ -6,15 +6,18 @@ import * as Network from 'expo-network';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, FlatList, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
-import { DiscoveredPeer, LogFn, PickedFile, sendFileMessage, sendTextMessage, startLanDiscovery } from '@/lib/lanTransport';
+import { DEFAULT_TCP_PORT } from '@clipsync/protocol';
+
+import { startBleDiscovery, type BleDiscoveredPeer } from '@/lib/bleTransport';
 import { startGuestServer, type GuestServerHandle } from '@/lib/guestServer';
+import { DiscoveredPeer, LogFn, PickedFile, sendFileMessage, sendTextMessage, startLanDiscovery } from '@/lib/lanTransport';
 
 type TransportId = 'lan' | 'usb' | 'bluetooth';
 
-const TRANSPORTS: { id: TransportId; label: string; available: boolean }[] = [
-  { id: 'lan', label: 'LAN', available: true },
-  { id: 'usb', label: 'USB', available: false },
-  { id: 'bluetooth', label: 'Bluetooth', available: false },
+const TRANSPORTS: { id: TransportId; label: string }[] = [
+  { id: 'lan', label: 'LAN' },
+  { id: 'usb', label: 'USB' },
+  { id: 'bluetooth', label: 'Bluetooth' },
 ];
 
 /**
@@ -58,17 +61,27 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+interface OsCommandEntry {
+  /** Ej. "📥 Recibir portapapeles" / "📤 Enviar texto". */
+  label: string;
+  command: string | null;
+  placeholder: string;
+}
+
 interface OsCommandBlockProps {
   icon: string;
   title: string;
   accent: string;
-  command: string | null;
-  placeholder: string;
-  onCopy: () => void;
+  commands: OsCommandEntry[];
+  onCopy: (command: string, label: string) => void;
 }
 
-/** Bloque visual autocontenido por sistema operativo — evita que Windows y Linux/Mac se mezclen en una sola lista. */
-function OsCommandBlock({ icon, title, accent, command, placeholder, onCopy }: OsCommandBlockProps) {
+/**
+ * Bloque visual autocontenido por sistema operativo — evita que Windows y Linux/Mac se
+ * mezclen en una sola lista. Cada bloque puede traer varios comandos (hoy: recibir vía
+ * GET y enviar vía POST), cada uno con su propia etiqueta y botón de copiar.
+ */
+function OsCommandBlock({ icon, title, accent, commands, onCopy }: OsCommandBlockProps) {
   return (
     <View style={[styles.osBlock, { borderColor: accent }]}>
       <View style={styles.osBlockHeader}>
@@ -77,12 +90,21 @@ function OsCommandBlock({ icon, title, accent, command, placeholder, onCopy }: O
         </View>
         <Text style={styles.osBlockTitle}>{title}</Text>
       </View>
-      <Pressable style={styles.commandBox} disabled={!command} onPress={onCopy}>
-        <Text style={styles.commandText} selectable>
-          {command ?? placeholder}
-        </Text>
-      </Pressable>
-      <Text style={styles.osBlockHint}>Toca el comando para copiarlo</Text>
+      {commands.map((entry) => (
+        <View key={entry.label} style={styles.osCommandEntry}>
+          <Text style={styles.osCommandLabel}>{entry.label}</Text>
+          <Pressable
+            style={styles.commandBox}
+            disabled={!entry.command}
+            onPress={() => entry.command && onCopy(entry.command, `${title} — ${entry.label}`)}
+          >
+            <Text style={styles.commandText} selectable>
+              {entry.command ?? entry.placeholder}
+            </Text>
+          </Pressable>
+        </View>
+      ))}
+      <Text style={styles.osBlockHint}>Toca un comando para copiarlo</Text>
     </View>
   );
 }
@@ -95,6 +117,7 @@ function OsCommandBlock({ icon, title, accent, command, placeholder, onCopy }: O
 export default function DiscoveryScreen() {
   const [logs, setLogs] = useState<string[]>([]);
   const [peers, setPeers] = useState<DiscoveredPeer[]>([]);
+  const [blePeers, setBlePeers] = useState<BleDiscoveredPeer[]>([]);
   const [selectedPeer, setSelectedPeer] = useState<DiscoveredPeer | null>(null);
   const [scanning, setScanning] = useState(false);
   const [transport, setTransport] = useState<TransportId>('lan');
@@ -138,15 +161,38 @@ export default function DiscoveryScreen() {
 
   const handleScan = useCallback(() => {
     if (scanning) return;
-    setScanning(true);
     setPeers([]);
+    setBlePeers([]);
     setSelectedPeer(null);
-    stopDiscoveryRef.current = startLanDiscovery((found) => {
-      setPeers((prev) =>
-        prev.some((p) => p.host === found.host && p.port === found.port) ? prev : [...prev, found],
+
+    if (transport === 'lan') {
+      setScanning(true);
+      stopDiscoveryRef.current = startLanDiscovery((found) => {
+        setPeers((prev) =>
+          prev.some((p) => p.host === found.host && p.port === found.port) ? prev : [...prev, found],
+        );
+      }, log);
+      return;
+    }
+
+    if (transport === 'usb') {
+      // adb reverse hace que el 127.0.0.1 del propio móvil llegue al servidor del PC — no
+      // hay nada que escanear, el "peer" es siempre este mismo. El túnel en sí todavía se
+      // establece a mano (`usb.rs` en el escritorio no está enlazado a la UI todavía).
+      const usbPeer: DiscoveredPeer = { name: 'PC vía USB (adb reverse)', host: '127.0.0.1', port: DEFAULT_TCP_PORT };
+      setPeers([usbPeer]);
+      log(
+        `Modo USB: usando el túnel en 127.0.0.1:${DEFAULT_TCP_PORT} — requiere haber corrido "adb reverse tcp:${DEFAULT_TCP_PORT} tcp:${DEFAULT_TCP_PORT}" en el PC (todavía manual)`,
       );
+      return;
+    }
+
+    // Bluetooth
+    setScanning(true);
+    stopDiscoveryRef.current = startBleDiscovery((found) => {
+      setBlePeers((prev) => (prev.some((p) => p.id === found.id) ? prev : [...prev, found]));
     }, log);
-  }, [log, scanning]);
+  }, [log, scanning, transport]);
 
   const handleStopScan = useCallback(() => {
     stopDiscoveryRef.current?.();
@@ -199,14 +245,17 @@ export default function DiscoveryScreen() {
 
   const handleTransportPress = useCallback(
     (id: TransportId) => {
-      const target = TRANSPORTS.find((t) => t.id === id);
-      if (!target?.available) {
-        log(`Transporte "${target?.label}" — próximamente`, 'error');
-        return;
-      }
+      if (id === transport) return;
+      stopDiscoveryRef.current?.();
+      stopDiscoveryRef.current = null;
+      setScanning(false);
+      setPeers([]);
+      setBlePeers([]);
+      setSelectedPeer(null);
       setTransport(id);
+      log(`Transporte activo: ${TRANSPORTS.find((t) => t.id === id)?.label}`);
     },
-    [log],
+    [log, transport],
   );
 
   const handleOpenGuestMode = useCallback(async () => {
@@ -246,14 +295,23 @@ export default function DiscoveryScreen() {
 
   const guestModeUrl =
     deviceIp && guestToken ? `http://${deviceIp}:${GUEST_MODE_PORT}${buildGuestModePath(guestToken)}` : null;
-  const curlCommand = guestModeUrl ? `curl ${guestModeUrl}` : null;
-  const powershellCommand = guestModeUrl ? `Invoke-WebRequest -Uri ${guestModeUrl} -OutFile clip.txt` : null;
+
+  // Bidireccional: recibir (GET) trae el portapapeles del móvil; enviar (POST) escribe
+  // el texto en él — ambas rutas ya responden de verdad en guestServer.ts.
+  const curlGetCommand = guestModeUrl ? `curl ${guestModeUrl}` : null;
+  const curlPostCommand = guestModeUrl ? `curl -X POST -d "Hola desde el PC" ${guestModeUrl}` : null;
+  const powershellGetCommand = guestModeUrl ? `Invoke-WebRequest -Uri ${guestModeUrl} -OutFile clip.txt` : null;
+  const powershellPostCommand = guestModeUrl
+    ? `Invoke-WebRequest -Uri ${guestModeUrl} -Method POST -Body "Hola desde el PC"`
+    : null;
 
   return (
     <View style={styles.container}>
       <LinearGradient colors={[colors.indigoDeep, colors.bg]} style={styles.header}>
         <Text style={styles.title}>ClipSync</Text>
-        <Text style={styles.subtitle}>Portapapeles universal P2P — Fase 2 (LAN)</Text>
+        <Text style={styles.subtitle}>
+          Portapapeles universal P2P — {TRANSPORTS.find((t) => t.id === transport)?.label}
+        </Text>
       </LinearGradient>
 
       <View style={styles.body}>
@@ -264,10 +322,9 @@ export default function DiscoveryScreen() {
               <Pressable
                 key={t.id}
                 onPress={() => handleTransportPress(t.id)}
-                style={[styles.pill, active && styles.pillActive, !t.available && styles.pillDisabled]}
+                style={[styles.pill, active && styles.pillActive]}
               >
                 <Text style={[styles.pillText, active && styles.pillTextActive]}>{t.label}</Text>
-                {!t.available && <Text style={styles.pillBadge}>🔒 Próximamente</Text>}
               </Pressable>
             );
           })}
@@ -278,14 +335,38 @@ export default function DiscoveryScreen() {
         </Pressable>
 
         <View style={styles.sectionHeader}>
-          <Text style={styles.sectionTitle}>Dispositivos en la LAN</Text>
+          <Text style={styles.sectionTitle}>
+            {transport === 'lan' && 'Dispositivos en la LAN'}
+            {transport === 'usb' && 'Conexión USB'}
+            {transport === 'bluetooth' && 'Dispositivos Bluetooth cercanos'}
+          </Text>
           <Pressable onPress={scanning ? handleStopScan : handleScan} style={styles.scanButton}>
             {scanning && <ActivityIndicator size="small" color={colors.cyan} style={styles.scanSpinner} />}
             <Text style={styles.scanButtonText}>{scanning ? 'Detener' : 'Buscar'}</Text>
           </Pressable>
         </View>
 
-        {peers.length === 0 ? (
+        {transport === 'bluetooth' ? (
+          blePeers.length === 0 ? (
+            <Text style={styles.emptyText}>
+              {scanning ? 'Buscando dispositivos BLE…' : 'Sin dispositivos detectados todavía. Pulsa "Buscar".'}
+            </Text>
+          ) : (
+            <FlatList
+              data={blePeers}
+              keyExtractor={(p) => p.id}
+              style={styles.peerList}
+              renderItem={({ item }) => (
+                <View style={styles.peerRow}>
+                  <View>
+                    <Text style={styles.peerName}>{item.name ?? 'Dispositivo sin nombre'}</Text>
+                    <Text style={styles.peerAddress}>{item.id}</Text>
+                  </View>
+                </View>
+              )}
+            />
+          )
+        ) : peers.length === 0 ? (
           <Text style={styles.emptyText}>
             {scanning ? 'Buscando…' : 'Sin dispositivos descubiertos todavía. Pulsa "Buscar".'}
           </Text>
@@ -314,46 +395,59 @@ export default function DiscoveryScreen() {
           />
         )}
 
-        <Text style={styles.sectionTitle}>Mensaje</Text>
-        <TextInput
-          style={[styles.input, !!file && styles.inputDisabled]}
-          placeholder="Escribe o pega el texto a enviar…"
-          placeholderTextColor={colors.textMuted}
-          value={message}
-          onChangeText={(text) => {
-            setMessage(text);
-            if (text.length > 0) setFile(null);
-          }}
-          multiline
-          editable={!file}
-        />
-
-        <View style={styles.attachRow}>
-          <Pressable
-            onPress={handlePickFile}
-            disabled={message.trim().length > 0}
-            style={[styles.attachButton, message.trim().length > 0 && styles.attachButtonDisabled]}
-          >
-            <Text style={styles.attachButtonText}>📎 Adjuntar archivo</Text>
-          </Pressable>
-          {file && (
-            <View style={styles.attachedFile}>
-              <Text style={styles.attachedFileName} numberOfLines={1}>
-                {file.name}
-              </Text>
-              <Text style={styles.attachedFileSize}>{formatBytes(file.size)}</Text>
-              <Pressable onPress={() => setFile(null)} hitSlop={8}>
-                <Text style={styles.attachedFileRemove}>✕</Text>
-              </Pressable>
-            </View>
-          )}
-        </View>
-
-        <Pressable onPress={handleSend} disabled={!canSend} style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}>
-          <Text style={[styles.sendButtonText, !canSend && styles.sendButtonTextDisabled]}>
-            {selectedPeer ? `Enviar a ${selectedPeer.name}` : 'Selecciona un PC primero'}
+        {transport === 'bluetooth' ? (
+          <Text style={styles.emptyText}>
+            El envío por Bluetooth todavía no está implementado — esta pestaña hoy solo detecta dispositivos
+            cercanos que anuncien el servicio (Fase 4 en progreso, ver docs/architecture.md §5).
           </Text>
-        </Pressable>
+        ) : (
+          <>
+            <Text style={styles.sectionTitle}>Mensaje</Text>
+            <TextInput
+              style={[styles.input, !!file && styles.inputDisabled]}
+              placeholder="Escribe o pega el texto a enviar…"
+              placeholderTextColor={colors.textMuted}
+              value={message}
+              onChangeText={(text) => {
+                setMessage(text);
+                if (text.length > 0) setFile(null);
+              }}
+              multiline
+              editable={!file}
+            />
+
+            <View style={styles.attachRow}>
+              <Pressable
+                onPress={handlePickFile}
+                disabled={message.trim().length > 0}
+                style={[styles.attachButton, message.trim().length > 0 && styles.attachButtonDisabled]}
+              >
+                <Text style={styles.attachButtonText}>📎 Adjuntar archivo</Text>
+              </Pressable>
+              {file && (
+                <View style={styles.attachedFile}>
+                  <Text style={styles.attachedFileName} numberOfLines={1}>
+                    {file.name}
+                  </Text>
+                  <Text style={styles.attachedFileSize}>{formatBytes(file.size)}</Text>
+                  <Pressable onPress={() => setFile(null)} hitSlop={8}>
+                    <Text style={styles.attachedFileRemove}>✕</Text>
+                  </Pressable>
+                </View>
+              )}
+            </View>
+
+            <Pressable
+              onPress={handleSend}
+              disabled={!canSend}
+              style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}
+            >
+              <Text style={[styles.sendButtonText, !canSend && styles.sendButtonTextDisabled]}>
+                {selectedPeer ? `Enviar a ${selectedPeer.name}` : 'Selecciona un PC primero'}
+              </Text>
+            </Pressable>
+          </>
+        )}
 
         <FlatList
           style={styles.logList}
@@ -406,18 +500,38 @@ export default function DiscoveryScreen() {
               icon="⊞"
               title="Windows (PowerShell)"
               accent={colors.indigo}
-              command={powershellCommand}
-              placeholder={`Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')} -OutFile clip.txt`}
-              onCopy={() => powershellCommand && handleCopyCommand(powershellCommand, 'Comando PowerShell')}
+              commands={[
+                {
+                  label: '📥 Recibir portapapeles',
+                  command: powershellGetCommand,
+                  placeholder: `Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')} -OutFile clip.txt`,
+                },
+                {
+                  label: '📤 Enviar texto',
+                  command: powershellPostCommand,
+                  placeholder: `Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')} -Method POST -Body "texto"`,
+                },
+              ]}
+              onCopy={handleCopyCommand}
             />
 
             <OsCommandBlock
               icon="❯_"
               title="Linux / macOS (Terminal)"
               accent={colors.cyan}
-              command={curlCommand}
-              placeholder={`curl http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')}`}
-              onCopy={() => curlCommand && handleCopyCommand(curlCommand, 'Comando curl')}
+              commands={[
+                {
+                  label: '📥 Recibir portapapeles',
+                  command: curlGetCommand,
+                  placeholder: `curl http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')}`,
+                },
+                {
+                  label: '📤 Enviar texto',
+                  command: curlPostCommand,
+                  placeholder: `curl -X POST -d "texto" http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')}`,
+                },
+              ]}
+              onCopy={handleCopyCommand}
             />
           </View>
         </View>
@@ -492,10 +606,8 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
   },
   pillActive: { backgroundColor: colors.indigo, borderColor: colors.indigo },
-  pillDisabled: { opacity: 0.55 },
   pillText: { color: colors.textMuted, fontSize: 13, fontWeight: '600' },
   pillTextActive: { color: colors.text },
-  pillBadge: { color: colors.textMuted, fontSize: 9 },
 
   guestModeLink: { alignSelf: 'flex-start' },
   guestModeLinkText: { color: colors.cyan, fontSize: 12, fontWeight: '600' },
@@ -655,6 +767,8 @@ const styles = StyleSheet.create({
   osBlockIcon: { fontSize: 12, color: colors.bg, fontWeight: '900' },
   osBlockTitle: { color: colors.text, fontSize: 13, fontWeight: '700' },
   osBlockHint: { color: colors.textMuted, fontSize: 10, fontStyle: 'italic' },
+  osCommandEntry: { gap: 4 },
+  osCommandLabel: { color: colors.textMuted, fontSize: 11, fontWeight: '600' },
 
   loadingOverlay: {
     position: 'absolute',
