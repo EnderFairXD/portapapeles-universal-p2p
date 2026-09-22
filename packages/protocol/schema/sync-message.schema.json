@@ -1,0 +1,144 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://portapapeles-universal-p2p/schema/sync-message.schema.json",
+  "title": "SyncMessage",
+  "description": "Mensaje único intercambiado entre el cliente móvil y el cliente de escritorio, independiente del transporte (LAN, USB o Bluetooth). Es el contrato compartido: cualquier cambio aquí debe versionarse y respetarse por igual en ambos clientes.",
+  "type": "object",
+  "required": ["protocolVersion", "id", "deviceId", "type", "timestamp", "checksum", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "protocolVersion": {
+      "type": "string",
+      "description": "Versión semver del protocolo, ej. \"1.0.0\". Permite detectar incompatibilidades entre un móvil y un escritorio desactualizados.",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "id": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Identificador único de este mensaje (UUID v4). Usado para deduplicar reintentos y para referenciar chunks del mismo archivo."
+    },
+    "deviceId": {
+      "type": "string",
+      "format": "uuid",
+      "description": "Identificador estable del dispositivo emisor, generado una vez en el primer emparejamiento."
+    },
+    "type": {
+      "type": "string",
+      "enum": ["text", "file", "token"],
+      "description": "Discrimina la forma del campo payload."
+    },
+    "timestamp": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Marca de tiempo Unix en milisegundos en el momento en que el emisor generó el mensaje (no de envío ni de recepción)."
+    },
+    "checksum": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$",
+      "description": "SHA-256 en hexadecimal minúscula del contenido completo (para 'file', del archivo reensamblado completo, no del chunk individual)."
+    },
+    "payload": {
+      "description": "Forma exacta condicionada por el campo 'type'.",
+      "oneOf": [
+        { "$ref": "#/$defs/textPayload" },
+        { "$ref": "#/$defs/filePayload" },
+        { "$ref": "#/$defs/tokenPayload" }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "type": { "const": "text" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/textPayload" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "file" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/filePayload" } } }
+    },
+    {
+      "if": { "properties": { "type": { "const": "token" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/tokenPayload" } } }
+    }
+  ],
+  "$defs": {
+    "textPayload": {
+      "type": "object",
+      "required": ["content"],
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "Texto plano copiado al portapapeles.",
+          "maxLength": 1048576
+        }
+      }
+    },
+    "tokenPayload": {
+      "type": "object",
+      "required": ["content"],
+      "additionalProperties": false,
+      "properties": {
+        "content": {
+          "type": "string",
+          "description": "Cadena sensible (API key, OTP, contraseña de un solo uso, etc.). Se envía cifrada a nivel de transporte; los clientes deben evitar loggear este campo y expirarlo de la vista tras un tiempo corto.",
+          "maxLength": 8192
+        },
+        "label": {
+          "type": "string",
+          "description": "Etiqueta opcional para mostrar en UI sin revelar el contenido, ej. \"Código 2FA de GitHub\".",
+          "maxLength": 128
+        },
+        "expiresAt": {
+          "type": "integer",
+          "description": "Unix ms opcional tras el cual el receptor debe descartar/ocultar el token de su historial."
+        }
+      }
+    },
+    "filePayload": {
+      "type": "object",
+      "required": ["fileName", "mimeType", "size", "chunkIndex", "chunkTotal", "chunkData"],
+      "additionalProperties": false,
+      "properties": {
+        "fileName": {
+          "type": "string",
+          "maxLength": 255
+        },
+        "mimeType": {
+          "type": "string",
+          "description": "Tipo MIME declarado por el emisor, ej. \"application/pdf\"."
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Tamaño total del archivo en bytes (no del chunk)."
+        },
+        "chunkIndex": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Índice de este fragmento, base 0."
+        },
+        "chunkTotal": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Número total de fragmentos en los que se dividió el archivo."
+        },
+        "chunkData": {
+          "type": "string",
+          "contentEncoding": "base64",
+          "description": "Bytes del fragmento, codificados en base64. El tamaño de fragmento lo decide cada Transport según sus límites (ej. MTU de BLE vs buffer de TCP)."
+        }
+      }
+    }
+  },
+  "examples": [
+    {
+      "protocolVersion": "1.0.0",
+      "id": "b3f6c9de-2f2e-4b7a-9b6b-5b6a8f5b6a8f",
+      "deviceId": "a1a1a1a1-b2b2-4c4c-9d9d-e5e5e5e5e5e5",
+      "type": "text",
+      "timestamp": 1732300800000,
+      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "payload": { "content": "https://example.com/pedido/12345" }
+    }
+  ]
+}
