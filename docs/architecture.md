@@ -20,7 +20,7 @@ La app "todoterreno" no elige un único medio: prueba medios en orden de prefere
 | **2** | WiFi/LAN — mDNS + TCP | Ambos dispositivos en la misma red local; caso por defecto y de mejor rendimiento | ✅ Implementado (`LanTransport`) |
 | **3** | Cable USB — túnel ADB | Sin red compartida pero con cable disponible (ej. WiFi corporativo con aislamiento de clientes) | 🔜 Pendiente |
 | **4** | Bluetooth — BLE / Classic | Sin red ni cable, en movilidad (ej. exteriores, coche) | 🔜 Pendiente |
-| **5** | Modo Invitado — servidor HTTP efímero | El **PC no puede** (o no debe) instalar el cliente Tauri — equipos públicos, de empresa con permisos restringidos, kioscos | 🔜 Pendiente, modo manual (no entra en el triaje automático) |
+| **5** | Modo Invitado — servidor HTTP efímero | El **PC no puede** (o no debe) instalar el cliente Tauri — equipos públicos, de empresa con permisos restringidos, kioscos | ✅ Implementado (`guestServer.ts`), modo manual (no entra en el triaje automático) |
 
 El triaje automático (Fases 2–4) vive en el móvil como una cadena de intentos: LAN → USB → Bluetooth. El Modo Invitado (Fase 5) es una acción explícita del usuario ("no encuentro mi PC / no puedo instalar nada ahí") y se lanza desde una pantalla separada, no desde el flujo de auto-descubrimiento — ver §6.
 
@@ -92,12 +92,14 @@ Para el caso "estoy en un PC público/de la oficina, sin permisos de instalació
 **Token de sesión:** al activarse, la app genera un token corto (ej. 6 caracteres alfanuméricos) y lo muestra en pantalla junto con la URL completa y un QR. Todas las rutas exigen el token; sin descubrimiento por mDNS (un PC público probablemente no lo tiene habilitado o no queremos que cualquiera en esa red lo encuentre solo), así que el usuario teclea la IP:puerto o escanea el QR. La sesión expira sola a los N minutos (ej. 10) y el servidor se apaga — acota la ventana de exposición.
 
 **Endpoints** (bajo `/t/<token>/...`; cualquier request sin el token correcto se descarta):
-- `GET /t/<token>` → página HTML mínima autocontenida (sin JS externo): textarea + botón para pegar texto hacia el móvil, y el contenido actual del portapapeles del móvil para copiarlo manualmente.
-- `POST /t/<token>/clipboard` (body = texto plano) → el móvil escribe ese texto en su portapapeles nativo vía `expo-clipboard`.
-- `GET /t/<token>/clipboard` → devuelve el portapapeles actual del móvil como `text/plain`, pensado para `curl`/`Invoke-RestMethod` sin necesidad de abrir un navegador:
+- `GET /t/<token>` → página HTML mínima autocontenida (sin JS externo): textarea + botón para pegar texto hacia el móvil, y el contenido actual del portapapeles del móvil para copiarlo manualmente. **Pendiente** — hoy no hay ruta de navegador, solo las dos de abajo.
+- `POST /t/<token>/clipboard` (body = texto plano) → el móvil escribe ese texto en su portapapeles nativo vía `expo-clipboard`. ✅ Implementado.
+- `GET /t/<token>/clipboard` → devuelve el portapapeles actual del móvil como `text/plain`, pensado para `curl`/`Invoke-RestMethod` sin necesidad de abrir un navegador. ✅ Implementado.
   ```bash
   curl http://192.168.1.23:52848/t/7f3a2b/clipboard
   ```
+
+**Estado de implementación** (`apps/mobile/src/lib/guestServer.ts`): servidor HTTP/1.1 mínimo (una petición por conexión, sin keep-alive, sin `Content-Length` — el cuerpo se delimita cerrando la conexión) sobre `TcpSocket.createServer()`, con las dos rutas de arriba. El token hoy son 4 caracteres (no 6) y no hay QR ni expiración por temporizador — la "expiración" real es que el servidor se apaga al cerrar el modal del Modo Invitado (`handleCloseGuestMode` en `index.tsx`), lo cual ya acota la ventana de exposición aunque de forma menos fina que un timer. Sin la página HTML de `GET /t/<token>` todavía.
 
 **Riesgo aceptado y por qué:** este modo sirve HTTP plano, sin el intercambio ECDH que protege las Fases 2–4 (no hay programa cliente al otro lado con quien negociar una clave). El texto viaja sin cifrar dentro de la LAN local del PC público durante la ventana de la sesión. Mitigaciones: token de un solo uso por sesión, expiración corta, activación explícita y visible (el usuario ve en pantalla que el servidor está expuesto y puede apagarlo a mano), y documentar claramente que **no es apto para tokens/contraseñas de alto valor** — solo para texto de conveniencia. Si en el futuro se necesita subir el nivel de seguridad, la vía es TLS con un certificado autofirmado + que el usuario acepte la advertencia del navegador, pero eso empeora la experiencia "sin fricción" que es la razón de ser de este modo, así que se deja fuera del alcance inicial.
 
