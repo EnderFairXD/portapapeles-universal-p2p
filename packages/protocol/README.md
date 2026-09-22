@@ -1,4 +1,4 @@
-# @portapapeles/protocol
+# @clipsync/protocol
 
 Fuente única de verdad para el mensaje que intercambian el cliente móvil (Expo/React Native) y el cliente de escritorio (Tauri/Rust), sin importar el transporte (LAN, USB o Bluetooth).
 

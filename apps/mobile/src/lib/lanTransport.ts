@@ -7,7 +7,7 @@ import {
   MDNS_SERVICE_DOMAIN,
   MDNS_SERVICE_NAME,
   MDNS_SERVICE_PROTOCOL,
-} from '@portapapeles/protocol';
+} from '@clipsync/protocol';
 
 export interface DiscoveredPeer {
   name: string;

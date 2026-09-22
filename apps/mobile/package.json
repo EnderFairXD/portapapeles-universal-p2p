@@ -1,9 +1,9 @@
 {
-  "name": "mobile",
+  "name": "@clipsync/mobile",
   "version": "1.0.0",
   "main": "expo-router/entry",
   "dependencies": {
-    "@portapapeles/protocol": "workspace:*",
+    "@clipsync/protocol": "workspace:*",
     "expo": "~57.0.24",
     "expo-clipboard": "~57.0.2",
     "expo-constants": "~57.0.19",
