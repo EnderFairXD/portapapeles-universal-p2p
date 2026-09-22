@@ -1,9 +1,10 @@
+import { BlurView } from 'expo-blur';
 import * as Clipboard from 'expo-clipboard';
 import * as DocumentPicker from 'expo-document-picker';
 import { LinearGradient } from 'expo-linear-gradient';
 import * as Network from 'expo-network';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ActivityIndicator, FlatList, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
+import { ActivityIndicator, Animated, FlatList, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { DiscoveredPeer, LogFn, PickedFile, sendFileMessage, sendTextMessage, startLanDiscovery } from '@/lib/lanTransport';
 
@@ -57,6 +58,35 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+interface OsCommandBlockProps {
+  icon: string;
+  title: string;
+  accent: string;
+  command: string | null;
+  placeholder: string;
+  onCopy: () => void;
+}
+
+/** Bloque visual autocontenido por sistema operativo — evita que Windows y Linux/Mac se mezclen en una sola lista. */
+function OsCommandBlock({ icon, title, accent, command, placeholder, onCopy }: OsCommandBlockProps) {
+  return (
+    <View style={[styles.osBlock, { borderColor: accent }]}>
+      <View style={styles.osBlockHeader}>
+        <View style={[styles.osBlockIconWrap, { backgroundColor: accent }]}>
+          <Text style={styles.osBlockIcon}>{icon}</Text>
+        </View>
+        <Text style={styles.osBlockTitle}>{title}</Text>
+      </View>
+      <Pressable style={styles.commandBox} disabled={!command} onPress={onCopy}>
+        <Text style={styles.commandText} selectable>
+          {command ?? placeholder}
+        </Text>
+      </Pressable>
+      <Text style={styles.osBlockHint}>Toca el comando para copiarlo</Text>
+    </View>
+  );
+}
+
 /**
  * Pantalla de depuración/demo de la Fase 2: sin pulido final, pero ya con los flujos
  * reales (selección de dispositivo, payload texto/archivo, selector de transporte)
@@ -71,6 +101,10 @@ export default function DiscoveryScreen() {
   const [message, setMessage] = useState('');
   const [file, setFile] = useState<PickedFile | null>(null);
   const [sending, setSending] = useState(false);
+  const [sendProgress, setSendProgress] = useState<{ sent: number; total: number } | null>(null);
+  // useState (no useRef): el lint del proyecto (react-hooks/refs) prohíbe leer `.current`
+  // de un ref durante el render, y `progressAnim` se usa en el JSX de abajo.
+  const [progressAnim] = useState(() => new Animated.Value(0));
   const [guestModeVisible, setGuestModeVisible] = useState(false);
   const [deviceIp, setDeviceIp] = useState<string | null>(null);
   const [ipLoading, setIpLoading] = useState(false);
@@ -84,6 +118,15 @@ export default function DiscoveryScreen() {
   }, []);
 
   useEffect(() => () => stopDiscoveryRef.current?.(), []);
+
+  useEffect(() => {
+    const target = sendProgress && sendProgress.total > 0 ? sendProgress.sent / sendProgress.total : 0;
+    Animated.timing(progressAnim, {
+      toValue: target,
+      duration: 220,
+      useNativeDriver: false, // animamos "width" en %, no soportado por el native driver
+    }).start();
+  }, [sendProgress, progressAnim]);
 
   const handleScan = useCallback(() => {
     if (scanning) return;
@@ -129,9 +172,10 @@ export default function DiscoveryScreen() {
   const handleSend = useCallback(async () => {
     if (!selectedPeer) return;
     setSending(true);
+    setSendProgress(null);
     try {
       if (file) {
-        await sendFileMessage(selectedPeer, file, log);
+        await sendFileMessage(selectedPeer, file, log, (sent, total) => setSendProgress({ sent, total }));
         setFile(null);
       } else {
         await sendTextMessage(selectedPeer, message.trim(), log);
@@ -141,6 +185,7 @@ export default function DiscoveryScreen() {
       // el detalle del error ya quedó registrado por sendTextMessage/sendFileMessage vía log()
     } finally {
       setSending(false);
+      setSendProgress(null);
     }
   }, [selectedPeer, file, message, log]);
 
@@ -285,13 +330,9 @@ export default function DiscoveryScreen() {
         </View>
 
         <Pressable onPress={handleSend} disabled={!canSend} style={[styles.sendButton, !canSend && styles.sendButtonDisabled]}>
-          {sending ? (
-            <ActivityIndicator size="small" color={colors.bg} />
-          ) : (
-            <Text style={[styles.sendButtonText, !canSend && styles.sendButtonTextDisabled]}>
-              {selectedPeer ? `Enviar a ${selectedPeer.name}` : 'Selecciona un PC primero'}
-            </Text>
-          )}
+          <Text style={[styles.sendButtonText, !canSend && styles.sendButtonTextDisabled]}>
+            {selectedPeer ? `Enviar a ${selectedPeer.name}` : 'Selecciona un PC primero'}
+          </Text>
         </Pressable>
 
         <FlatList
@@ -343,33 +384,72 @@ export default function DiscoveryScreen() {
               portapapeles.
             </Text>
 
-            <Text style={styles.modalLabel}>Linux / macOS</Text>
-            <Pressable
-              style={styles.commandBox}
-              disabled={!curlCommand}
-              onPress={() => curlCommand && handleCopyCommand(curlCommand, 'Comando curl')}
-            >
-              <Text style={styles.commandText}>
-                {curlCommand ?? `curl http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')}`}
-              </Text>
-            </Pressable>
+            <OsCommandBlock
+              icon="⊞"
+              title="Windows (PowerShell)"
+              accent={colors.indigo}
+              command={powershellCommand}
+              placeholder={`Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')} -OutFile clip.txt`}
+              onCopy={() => powershellCommand && handleCopyCommand(powershellCommand, 'Comando PowerShell')}
+            />
 
-            <Text style={styles.modalLabel}>Windows (PowerShell)</Text>
-            <Pressable
-              style={styles.commandBox}
-              disabled={!powershellCommand}
-              onPress={() => powershellCommand && handleCopyCommand(powershellCommand, 'Comando PowerShell')}
-            >
-              <Text style={styles.commandText}>
-                {powershellCommand ??
-                  `Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')} -OutFile clip.txt`}
-              </Text>
-            </Pressable>
-
-            <Text style={styles.modalHint}>Toca un comando para copiarlo.</Text>
+            <OsCommandBlock
+              icon="❯_"
+              title="Linux / macOS (Terminal)"
+              accent={colors.cyan}
+              command={curlCommand}
+              placeholder={`curl http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')}`}
+              onCopy={() => curlCommand && handleCopyCommand(curlCommand, 'Comando curl')}
+            />
           </View>
         </View>
       </Modal>
+
+      {sending && (
+        <View style={styles.loadingOverlay} pointerEvents="auto">
+          <BlurView intensity={45} tint="dark" style={StyleSheet.absoluteFill} />
+          <View style={styles.loadingCard}>
+            <LinearGradient colors={[colors.indigo, colors.cyan]} style={styles.loadingRing}>
+              <View style={styles.loadingRingInner}>
+                <ActivityIndicator size="small" color={colors.cyan} />
+              </View>
+            </LinearGradient>
+
+            <Text style={styles.loadingTitle}>{file ? `Enviando "${file.name}"` : 'Enviando mensaje…'}</Text>
+
+            {sendProgress ? (
+              <>
+                <View style={styles.progressTrack}>
+                  <Animated.View
+                    style={[
+                      styles.progressFillWrap,
+                      {
+                        width: progressAnim.interpolate({
+                          inputRange: [0, 1],
+                          outputRange: ['0%', '100%'],
+                        }),
+                      },
+                    ]}
+                  >
+                    <LinearGradient
+                      colors={[colors.indigo, colors.cyan]}
+                      start={{ x: 0, y: 0 }}
+                      end={{ x: 1, y: 0 }}
+                      style={StyleSheet.absoluteFill}
+                    />
+                  </Animated.View>
+                </View>
+                <Text style={styles.loadingSubtitle}>
+                  Fragmento {sendProgress.sent} de {sendProgress.total} ·{' '}
+                  {Math.round((sendProgress.sent / sendProgress.total) * 100)}%
+                </Text>
+              </>
+            ) : (
+              <Text style={styles.loadingSubtitle}>Esperando respuesta del PC…</Text>
+            )}
+          </View>
+        </View>
+      )}
     </View>
   );
 }
@@ -537,4 +617,71 @@ const styles = StyleSheet.create({
   },
   commandText: { color: colors.text, fontFamily: 'monospace', fontSize: 12 },
   modalHint: { color: colors.textMuted, fontSize: 11, fontStyle: 'italic', marginTop: 2 },
+
+  osBlock: {
+    backgroundColor: colors.surfaceAlt,
+    borderWidth: 1.5,
+    borderRadius: 14,
+    padding: 12,
+    gap: 8,
+    marginTop: 4,
+  },
+  osBlockHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  osBlockIconWrap: {
+    width: 22,
+    height: 22,
+    borderRadius: 6,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  osBlockIcon: { fontSize: 12, color: colors.bg, fontWeight: '900' },
+  osBlockTitle: { color: colors.text, fontSize: 13, fontWeight: '700' },
+  osBlockHint: { color: colors.textMuted, fontSize: 10, fontStyle: 'italic' },
+
+  loadingOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loadingCard: {
+    width: '78%',
+    backgroundColor: 'rgba(23, 25, 53, 0.9)',
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: 20,
+    paddingVertical: 28,
+    paddingHorizontal: 24,
+    alignItems: 'center',
+    gap: 14,
+  },
+  loadingRing: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+    padding: 3,
+  },
+  loadingRingInner: {
+    flex: 1,
+    width: '100%',
+    borderRadius: 24,
+    backgroundColor: colors.surface,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loadingTitle: { color: colors.text, fontSize: 15, fontWeight: '700', textAlign: 'center' },
+  loadingSubtitle: { color: colors.textMuted, fontSize: 12, textAlign: 'center' },
+  progressTrack: {
+    width: '100%',
+    height: 8,
+    borderRadius: 999,
+    backgroundColor: colors.surface,
+    overflow: 'hidden',
+  },
+  progressFillWrap: { height: '100%', borderRadius: 999, overflow: 'hidden' },
 });

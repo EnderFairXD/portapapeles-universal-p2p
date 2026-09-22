@@ -1,5 +1,5 @@
 import * as Crypto from 'expo-crypto';
-import { File } from 'expo-file-system';
+import { File, FileMode } from 'expo-file-system';
 import TcpSocket from 'react-native-tcp-socket';
 import Zeroconf from 'react-native-zeroconf';
 
@@ -28,13 +28,38 @@ export interface PickedFile {
 export type LogLevel = 'info' | 'error';
 export type LogFn = (message: string, level?: LogLevel) => void;
 
+/** Tamaño de cada fragmento al mandar un archivo (ver sendFileMessage). */
+const FILE_CHUNK_BYTES = 1024 * 1024;
+
 /**
- * Límite provisional para el envío de archivos: hoy se manda en un único SyncMessage
- * (chunkIndex 0 / chunkTotal 1), sin el loop de fragmentación real. Por encima de esto
- * el mensaje NDJSON sería una línea demasiado grande; el chunking de verdad es trabajo
- * de una fase posterior (ver docs/architecture.md).
+ * Techo de cordura, no una limitación técnica real (el chunking ya no carga el archivo
+ * entero en memoria): evita transferencias absurdamente largas por error de selección.
  */
-const MAX_SINGLE_MESSAGE_FILE_BYTES = 2 * 1024 * 1024;
+const MAX_FILE_BYTES = 200 * 1024 * 1024;
+
+const BASE64_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+
+/**
+ * Codifica un Uint8Array a base64 sin pasar por `String.fromCharCode(...bytes)`: con un
+ * chunk de 1 MB, el spread de ~1 millón de argumentos puede reventar el stack de Hermes.
+ * Este loop es O(n) y no tiene ese límite.
+ */
+function bytesToBase64(bytes: Uint8Array): string {
+  const out: string[] = [];
+  const len = bytes.length;
+  for (let i = 0; i < len; i += 3) {
+    const b0 = bytes[i];
+    const b1 = i + 1 < len ? bytes[i + 1] : 0;
+    const b2 = i + 2 < len ? bytes[i + 2] : 0;
+    const triple = (b0 << 16) | (b1 << 8) | b2;
+
+    out.push(BASE64_ALPHABET[(triple >> 18) & 0x3f]);
+    out.push(BASE64_ALPHABET[(triple >> 12) & 0x3f]);
+    out.push(i + 1 < len ? BASE64_ALPHABET[(triple >> 6) & 0x3f] : '=');
+    out.push(i + 2 < len ? BASE64_ALPHABET[triple & 0x3f] : '=');
+  }
+  return out.join('');
+}
 
 const zeroconf = new Zeroconf();
 
@@ -163,40 +188,73 @@ export async function sendTextMessage(peer: DiscoveredPeer, content: string, log
   await sendSyncMessage(peer, message, log);
 }
 
+export type FileSendProgress = (sentChunks: number, totalChunks: number) => void;
+
 /**
- * Envía un archivo local como un único SyncMessage de tipo 'file' (sin fragmentar
- * todavía, ver MAX_SINGLE_MESSAGE_FILE_BYTES). El checksum se calcula sobre el string
- * base64 ya codificado, no sobre los bytes crudos del archivo — es una simplificación
- * consciente para esta fase: no invalida la demo (ambos extremos lo tratan igual), pero
- * no es un hash "canónico" del archivo original hasta que se implemente el chunking real.
+ * Envía un archivo local fragmentado en mensajes 'file' de FILE_CHUNK_BYTES cada uno.
+ * Antes se leía el archivo entero de una vez con `file.base64()` — con archivos de pocos
+ * MB eso colapsaba el puente de RN (un string base64 gigante cruzando a nativo de una
+ * sola vez). Ahora se abre el archivo con `File.open('r')` y se lee con `readBytes()` en
+ * fragmentos, así que nunca hay más de un chunk en memoria a la vez.
+ *
+ * Todos los chunks de una misma transferencia comparten el mismo `id` (actúa como id de
+ * transferencia para que el receptor los agrupe — ver descripción de `id` en el schema);
+ * se distinguen por `chunkIndex`/`chunkTotal`. El checksum de cada chunk es del propio
+ * `chunkData` en base64, no del archivo completo — calcular eso exigiría releer el
+ * archivo entero, justo el problema de memoria que el chunking evita (mismo criterio que
+ * en transport.rs).
+ *
+ * Cada chunk se manda en su propia conexión TCP corta (reutilizando sendSyncMessage tal
+ * cual, sin reabrir el debate del cierre de conexión resuelto en el bugfix anterior),
+ * una tras otra en secuencia — más lento que una conexión persistente, pero mucho más
+ * simple de razonar; optimizarlo es trabajo de una fase posterior si hace falta.
  */
-export async function sendFileMessage(peer: DiscoveredPeer, pickedFile: PickedFile, log: LogFn): Promise<void> {
-  if (pickedFile.size > MAX_SINGLE_MESSAGE_FILE_BYTES) {
-    const limitMb = (MAX_SINGLE_MESSAGE_FILE_BYTES / (1024 * 1024)).toFixed(0);
-    log(
-      `"${pickedFile.name}" pesa demasiado para esta fase (límite ${limitMb} MB sin fragmentación real)`,
-      'error',
-    );
-    throw new Error('file_too_large_for_single_message');
+export async function sendFileMessage(
+  peer: DiscoveredPeer,
+  pickedFile: PickedFile,
+  log: LogFn,
+  onProgress?: FileSendProgress,
+): Promise<void> {
+  if (pickedFile.size > MAX_FILE_BYTES) {
+    const limitMb = (MAX_FILE_BYTES / (1024 * 1024)).toFixed(0);
+    log(`"${pickedFile.name}" supera el límite de ${limitMb} MB`, 'error');
+    throw new Error('file_too_large');
   }
 
-  log(`Leyendo "${pickedFile.name}"…`);
+  const transferId = Crypto.randomUUID();
+  const deviceId = getDeviceId();
   const file = new File(pickedFile.uri);
-  const base64Content = await file.base64();
+  const handle = file.open(FileMode.ReadOnly);
 
-  const checksum = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, base64Content);
-  const message = buildFileMessage({
-    id: Crypto.randomUUID(),
-    deviceId: getDeviceId(),
-    timestamp: Date.now(),
-    checksum,
-    fileName: pickedFile.name,
-    mimeType: pickedFile.mimeType,
-    size: pickedFile.size,
-    chunkIndex: 0,
-    chunkTotal: 1,
-    chunkData: base64Content,
-  });
+  try {
+    const totalSize = handle.size ?? pickedFile.size;
+    const chunkTotal = Math.max(1, Math.ceil(totalSize / FILE_CHUNK_BYTES));
+    log(`Enviando "${pickedFile.name}" en ${chunkTotal} fragmento(s) de ${FILE_CHUNK_BYTES / (1024 * 1024)} MB…`);
 
-  await sendSyncMessage(peer, message, log);
+    for (let chunkIndex = 0; chunkIndex < chunkTotal; chunkIndex += 1) {
+      const bytes = handle.readBytes(FILE_CHUNK_BYTES);
+      const chunkData = bytesToBase64(bytes);
+      const checksum = await Crypto.digestStringAsync(Crypto.CryptoDigestAlgorithm.SHA256, chunkData);
+
+      const message = buildFileMessage({
+        id: transferId,
+        deviceId,
+        timestamp: Date.now(),
+        checksum,
+        fileName: pickedFile.name,
+        mimeType: pickedFile.mimeType,
+        size: totalSize,
+        chunkIndex,
+        chunkTotal,
+        chunkData,
+      });
+
+      await sendSyncMessage(peer, message, log);
+      onProgress?.(chunkIndex + 1, chunkTotal);
+    }
+
+    log(`"${pickedFile.name}" enviado completo (${chunkTotal} fragmento(s))`);
+  } finally {
+    handle.close();
+  }
 }
