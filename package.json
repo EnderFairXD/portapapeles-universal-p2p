@@ -1,0 +1,16 @@
+{
+  "name": "portapapeles-universal-p2p",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Sincronización P2P offline de portapapeles (texto, tokens y archivos) entre móvil y escritorio vía LAN, USB o Bluetooth.",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "mobile": "pnpm --filter mobile start",
+    "desktop": "pnpm --filter desktop tauri dev"
+  },
+  "license": "UNLICENSED",
+  "packageManager": "pnpm@12.5.1"
+}
