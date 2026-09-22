@@ -1,7 +1,7 @@
 {
   "expo": {
-    "name": "mobile",
-    "slug": "mobile",
+    "name": "ClipSync",
+    "slug": "clipsync",
     "version": "1.0.0",
     "scheme": "portapapelesuniversal",
     "orientation": "portrait",
@@ -23,8 +23,12 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "android.permission.CHANGE_WIFI_MULTICAST_STATE",
-        "android.permission.ACCESS_WIFI_STATE"
-      ]
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT"
+      ],
+      "package": "com.enderfirexd.mobile"
     },
     "web": {
       "favicon": "./assets/favicon.png"

@@ -572,6 +572,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipsync"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "btleplug",
+ "hex",
+ "hostname",
+ "mdns-sd",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "tokio",
+]
+
+[[package]]
 name = "combine"
 version = "4.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -883,24 +901,6 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "desktop"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "btleplug",
- "hex",
- "hostname",
- "mdns-sd",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "tokio",
 ]
 
 [[package]]
