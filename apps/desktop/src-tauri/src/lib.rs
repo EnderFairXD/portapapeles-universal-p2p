@@ -1,6 +1,8 @@
+mod bluetooth;
 mod discovery;
 mod protocol;
 mod transport;
+mod usb;
 
 use protocol::DEFAULT_TCP_PORT;
 

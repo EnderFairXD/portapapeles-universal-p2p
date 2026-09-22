@@ -6,7 +6,7 @@ Fuente única de verdad para el mensaje que intercambian el cliente móvil (Expo
 
 - [`schema/sync-message.schema.json`](./schema/sync-message.schema.json) — JSON Schema (draft 2020-12) del `SyncMessage`, documentación normativa del formato. Define tres variantes de `payload` según `type`: `text`, `file` (fragmentado en chunks) y `token`.
 - [`src/types.ts`](./src/types.ts) — Tipos TypeScript escritos a mano que reflejan el schema, consumidos directamente como fuente por Metro (no requiere paso de build).
-- [`src/constants.ts`](./src/constants.ts) — `PROTOCOL_VERSION`, puerto TCP por defecto y el nombre del servicio mDNS en sus dos formas (bare para `react-native-zeroconf`, cualificada para `mdns-sd`).
+- [`src/constants.ts`](./src/constants.ts) — `PROTOCOL_VERSION`, puerto TCP por defecto, el nombre del servicio mDNS en sus dos formas (bare para `react-native-zeroconf`, cualificada para `mdns-sd`), y `BLE_SERVICE_UUID` (Fase 4, debe coincidir con la constante homónima en `apps/desktop/src-tauri/src/bluetooth.rs`).
 - [`src/index.ts`](./src/index.ts) — `buildTextMessage()`, `buildFileMessage()` e `isSyncMessage()` (validación de forma en runtime).
 
 El lado Rust (`apps/desktop/src-tauri/src/protocol.rs`) no importa este paquete (no se puede desde Rust); replica manualmente la misma forma con `serde`. **Cualquier cambio en `schema/sync-message.schema.json` debe reflejarse a mano en `src/types.ts` (TS) y en `protocol.rs` (Rust), y debe ir acompañado de un bump de `PROTOCOL_VERSION`**, ya que ambos clientes lo validan de forma independiente sin un servidor central que arbitre versiones.
