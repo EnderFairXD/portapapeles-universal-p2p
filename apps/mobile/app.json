@@ -3,7 +3,7 @@
     "name": "ClipSync",
     "slug": "clipsync",
     "version": "1.0.0",
-    "scheme": "portapapelesuniversal",
+    "scheme": "clipsync",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "light",
@@ -11,7 +11,8 @@
       "typedRoutes": true
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.enderfirexd.clipsync"
     },
     "android": {
       "adaptiveIcon": {
@@ -28,7 +29,7 @@
         "android.permission.BLUETOOTH_ADMIN",
         "android.permission.BLUETOOTH_CONNECT"
       ],
-      "package": "com.enderfirexd.mobile"
+      "package": "com.enderfirexd.clipsync"
     },
     "web": {
       "favicon": "./assets/favicon.png"

@@ -1,5 +1,5 @@
 {
-  "name": "@portapapeles/protocol",
+  "name": "@clipsync/protocol",
   "version": "0.1.0",
   "private": true,
   "description": "Definición compartida del protocolo de sincronización (SyncMessage) entre el cliente móvil y el cliente de escritorio.",
