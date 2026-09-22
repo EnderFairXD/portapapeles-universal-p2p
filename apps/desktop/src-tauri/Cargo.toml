@@ -31,6 +31,7 @@ hostname = "0.4.2"
 hex = "0.4.3"
 base64 = "0.23.1"
 dirs = "7.0.0"
+uuid = "1.26.1"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
