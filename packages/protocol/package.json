@@ -3,8 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "description": "Definición compartida del protocolo de sincronización (SyncMessage) entre el cliente móvil y el cliente de escritorio.",
-  "main": "schema/sync-message.schema.json",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
   "files": [
-    "schema"
+    "schema",
+    "src"
   ]
 }
