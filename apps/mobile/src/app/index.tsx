@@ -7,6 +7,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, FlatList, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
 import { DiscoveredPeer, LogFn, PickedFile, sendFileMessage, sendTextMessage, startLanDiscovery } from '@/lib/lanTransport';
+import { startGuestServer, type GuestServerHandle } from '@/lib/guestServer';
 
 type TransportId = 'lan' | 'usb' | 'bluetooth';
 
@@ -20,8 +21,7 @@ const TRANSPORTS: { id: TransportId; label: string; available: boolean }[] = [
  * Puerto y forma de ruta del Modo Invitado, alineados con el diseño seguro de
  * docs/architecture.md §6: puerto 52848 (distinto del 52847 de LanTransport) y
  * `/t/<token>/clipboard`, con token de sesión — sin token, cualquiera en la LAN del PC
- * público podría pedir el clipboard. Sigue siendo un mockup visual: el servidor HTTP real
- * (y la generación/expiración real del token) es trabajo de la fase de implementación.
+ * público podría pedir el clipboard. El servidor real vive en src/lib/guestServer.ts.
  */
 const GUEST_MODE_PORT = 52848;
 
@@ -29,8 +29,8 @@ function buildGuestModePath(token: string): string {
   return `/t/${token}/clipboard`;
 }
 
-/** Token corto de ejemplo para el mockup — en la implementación real se genera por sesión y expira. */
-function generateMockToken(): string {
+/** Token de sesión: se genera de nuevo cada vez que se abre el Modo Invitado y expira al cerrarlo (el servidor se detiene). */
+function generateGuestToken(): string {
   const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin caracteres ambiguos (O/0, I/1)
   let token = '';
   for (let i = 0; i < 4; i += 1) {
@@ -109,7 +109,9 @@ export default function DiscoveryScreen() {
   const [deviceIp, setDeviceIp] = useState<string | null>(null);
   const [ipLoading, setIpLoading] = useState(false);
   const [guestToken, setGuestToken] = useState<string | null>(null);
+  const [guestServerRunning, setGuestServerRunning] = useState(false);
   const stopDiscoveryRef = useRef<(() => void) | null>(null);
+  const guestServerRef = useRef<GuestServerHandle | null>(null);
 
   const log = useCallback<LogFn>((msg, level = 'info') => {
     console.log(`[LAN] ${msg}`);
@@ -117,7 +119,13 @@ export default function DiscoveryScreen() {
     setLogs((prev) => [line, ...prev].slice(0, 100));
   }, []);
 
-  useEffect(() => () => stopDiscoveryRef.current?.(), []);
+  useEffect(
+    () => () => {
+      stopDiscoveryRef.current?.();
+      guestServerRef.current?.stop();
+    },
+    [],
+  );
 
   useEffect(() => {
     const target = sendProgress && sendProgress.total > 0 ? sendProgress.sent / sendProgress.total : 0;
@@ -203,7 +211,8 @@ export default function DiscoveryScreen() {
 
   const handleOpenGuestMode = useCallback(async () => {
     setGuestModeVisible(true);
-    setGuestToken(generateMockToken());
+    const token = generateGuestToken();
+    setGuestToken(token);
     setIpLoading(true);
     try {
       const ip = await Network.getIpAddressAsync();
@@ -214,7 +223,18 @@ export default function DiscoveryScreen() {
     } finally {
       setIpLoading(false);
     }
+
+    guestServerRef.current?.stop();
+    guestServerRef.current = startGuestServer({ port: GUEST_MODE_PORT, token, log });
+    setGuestServerRunning(true);
   }, [log]);
+
+  const handleCloseGuestMode = useCallback(() => {
+    setGuestModeVisible(false);
+    guestServerRef.current?.stop();
+    guestServerRef.current = null;
+    setGuestServerRunning(false);
+  }, []);
 
   const handleCopyCommand = useCallback(
     async (command: string, label: string) => {
@@ -343,26 +363,24 @@ export default function DiscoveryScreen() {
         />
       </View>
 
-      <Modal
-        visible={guestModeVisible}
-        animationType="slide"
-        transparent
-        onRequestClose={() => setGuestModeVisible(false)}
-      >
+      <Modal visible={guestModeVisible} animationType="slide" transparent onRequestClose={handleCloseGuestMode}>
         <View style={styles.modalOverlay}>
           <View style={styles.modalCard}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Modo Terminal — Sin Instalar</Text>
-              <Pressable onPress={() => setGuestModeVisible(false)} hitSlop={8}>
+              <Pressable onPress={handleCloseGuestMode} hitSlop={8}>
                 <Text style={styles.modalClose}>✕</Text>
               </Pressable>
             </View>
 
-            <Text style={styles.modalBadge}>🚧 Vista previa — el servidor HTTP todavía no existe</Text>
+            <Text style={styles.modalBadge}>
+              {guestServerRunning ? `🟢 Servidor activo en el puerto ${GUEST_MODE_PORT}` : '⏳ Iniciando servidor…'}
+            </Text>
 
             <Text style={styles.modalBody}>
               Para un PC público o sin permisos de instalación: ejecuta uno de estos comandos allí para
-              traer el portapapeles de este móvil, sin instalar ningún cliente.
+              traer el portapapeles de este móvil, sin instalar ningún cliente. Al cerrar este modo, el
+              servidor se detiene y el token deja de servir.
             </Text>
 
             <View style={styles.modalInfoRow}>
