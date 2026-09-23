@@ -6,7 +6,7 @@ import * as Network from 'expo-network';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Animated, FlatList, Modal, Pressable, StyleSheet, Text, TextInput, View } from 'react-native';
 
-import { DEFAULT_TCP_PORT } from '@clipsync/protocol';
+import { DEFAULT_TCP_PORT, GUEST_MODE_PORT } from '@clipsync/protocol';
 
 import { startBleDiscovery, type BleDiscoveredPeer } from '@/lib/bleTransport';
 import { startGuestServer, type GuestServerHandle } from '@/lib/guestServer';
@@ -21,13 +21,12 @@ const TRANSPORTS: { id: TransportId; label: string }[] = [
 ];
 
 /**
- * Puerto y forma de ruta del Modo Invitado, alineados con el diseño seguro de
- * docs/architecture.md §6: puerto 52848 (distinto del 52847 de LanTransport) y
+ * Ruta del Modo Invitado, alineada con el diseño seguro de docs/architecture.md §6:
  * `/t/<token>/clipboard`, con token de sesión — sin token, cualquiera en la LAN del PC
- * público podría pedir el clipboard. El servidor real vive en src/lib/guestServer.ts.
+ * público podría pedir el clipboard. GUEST_MODE_PORT ahora vive en @clipsync/protocol
+ * (antes era una constante local aquí) porque apps/desktop/src-tauri/src/usb.rs también
+ * lo necesita para re-exponerlo vía `adb reverse`.
  */
-const GUEST_MODE_PORT = 52848;
-
 function buildGuestModePath(token: string): string {
   return `/t/${token}/clipboard`;
 }
