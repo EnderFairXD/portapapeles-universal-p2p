@@ -117,6 +117,30 @@ export function startLanDiscovery(onPeerFound: (peer: DiscoveredPeer) => void, l
 const SEND_TIMEOUT_MS = 5000;
 
 /**
+ * El texto exacto de un error de conexión rechazada depende de la plataforma (Android
+ * envuelve `ECONNREFUSED`/`errno`, iOS da su propio mensaje) — por eso se busca por
+ * varias variantes en vez de una sola cadena literal.
+ */
+function isConnectionRefused(error: unknown): boolean {
+  const text = error instanceof Error ? error.message : String(error);
+  return /econnrefused|connection refused/i.test(text);
+}
+
+/**
+ * En modo USB, `peer.host` es siempre "127.0.0.1" (ver handleScan en index.tsx) — si esa
+ * conexión se rechaza, el motivo casi seguro es que el túnel `adb reverse` todavía no
+ * está levantado (app de escritorio cerrada, cable desconectado, o el watcher de
+ * usb.rs todavía no detectó el dispositivo). Mostrar el volcado crudo del socket ahí no
+ * ayuda a nadie; este mensaje sí dice qué hacer.
+ */
+function describeSocketError(peer: DiscoveredPeer, error: unknown): string {
+  if (peer.host === '127.0.0.1' && isConnectionRefused(error)) {
+    return '⚠️ No se pudo conectar por USB. Asegúrate de que la app de escritorio ClipSync está abierta y el cable conectado.';
+  }
+  return `Error de socket: ${String(error)}`;
+}
+
+/**
  * Conecta por TCP al peer y envía un SyncMessage ya construido.
  * Framing "una línea = un mensaje" (NDJSON): JSON.stringify escapa cualquier salto de
  * línea embebido, así que un simple "\n" delimita mensajes sin ambigüedad.
@@ -158,7 +182,7 @@ function sendSyncMessage(peer: DiscoveredPeer, message: SyncMessage, log: LogFn)
     });
 
     client.on('error', (error: unknown) => {
-      log(`Error de socket: ${String(error)}`, 'error');
+      log(describeSocketError(peer, error), 'error');
       if (settled) return;
       settled = true;
       clearTimeout(timeoutId);

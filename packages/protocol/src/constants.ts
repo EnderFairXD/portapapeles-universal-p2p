@@ -2,6 +2,15 @@ export const PROTOCOL_VERSION = '1.0.0';
 
 export const DEFAULT_TCP_PORT = 52847;
 
+/**
+ * Puerto del servidor HTTP del Modo Invitado (Fase 5, ver docs/architecture.md §6).
+ * Distinto de DEFAULT_TCP_PORT para poder correr ambos servidores a la vez. El túnel USB
+ * (apps/desktop/src-tauri/src/usb.rs) necesita este valor tal cual para re-exponer
+ * también este puerto vía `adb reverse` — debe coincidir con GUEST_MODE_PORT en
+ * protocol.rs.
+ */
+export const GUEST_MODE_PORT = 52848;
+
 /** Forma "bare" del tipo de servicio, tal como la espera react-native-zeroconf (scan(type, protocol, domain)). */
 export const MDNS_SERVICE_NAME = 'p2pclip';
 export const MDNS_SERVICE_PROTOCOL = 'tcp';

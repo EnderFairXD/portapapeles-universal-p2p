@@ -34,6 +34,11 @@ pub fn run() {
                 }
             });
 
+            // Sondeo periódico en background: detecta un móvil por USB y establece
+            // `adb reverse` para P2P y Modo Invitado. Si `adb` no está instalado, el
+            // watcher lo loguea una vez y sigue reintentando sin tumbar la app.
+            usb::spawn_reverse_tunnel_watcher();
+
             Ok(())
         })
         .run(tauri::generate_context!())
