@@ -9,7 +9,7 @@ import { ActivityIndicator, Animated, FlatList, Modal, Pressable, StyleSheet, Te
 import { DEFAULT_TCP_PORT, GUEST_MODE_PORT } from '@clipsync/protocol';
 
 import { startBleDiscovery, type BleDiscoveredPeer } from '@/lib/bleTransport';
-import { startGuestServer, type GuestServerHandle } from '@/lib/guestServer';
+import { startGuestServer, type GuestPayload, type GuestServerHandle } from '@/lib/guestServer';
 import { DiscoveredPeer, LogFn, PickedFile, sendFileMessage, sendTextMessage, startLanDiscovery } from '@/lib/lanTransport';
 
 type TransportId = 'lan' | 'usb' | 'bluetooth';
@@ -19,27 +19,6 @@ const TRANSPORTS: { id: TransportId; label: string }[] = [
   { id: 'usb', label: 'USB' },
   { id: 'bluetooth', label: 'Bluetooth' },
 ];
-
-/**
- * Ruta del Modo Invitado, alineada con el diseño seguro de docs/architecture.md §6:
- * `/t/<token>/clipboard`, con token de sesión — sin token, cualquiera en la LAN del PC
- * público podría pedir el clipboard. GUEST_MODE_PORT ahora vive en @clipsync/protocol
- * (antes era una constante local aquí) porque apps/desktop/src-tauri/src/usb.rs también
- * lo necesita para re-exponerlo vía `adb reverse`.
- */
-function buildGuestModePath(token: string): string {
-  return `/t/${token}/clipboard`;
-}
-
-/** Token de sesión: se genera de nuevo cada vez que se abre el Modo Invitado y expira al cerrarlo (el servidor se detiene). */
-function generateGuestToken(): string {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // sin caracteres ambiguos (O/0, I/1)
-  let token = '';
-  for (let i = 0; i < 4; i += 1) {
-    token += alphabet[Math.floor(Math.random() * alphabet.length)];
-  }
-  return token;
-}
 
 const colors = {
   bg: '#0d0e24',
@@ -60,50 +39,25 @@ function formatBytes(bytes: number): string {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-interface OsCommandEntry {
-  /** Ej. "📥 Recibir portapapeles" / "📤 Enviar texto". */
+interface CopyRowProps {
+  icon: string;
   label: string;
   command: string | null;
-  placeholder: string;
-}
-
-interface OsCommandBlockProps {
-  icon: string;
-  title: string;
-  accent: string;
-  commands: OsCommandEntry[];
   onCopy: (command: string, label: string) => void;
 }
 
-/**
- * Bloque visual autocontenido por sistema operativo — evita que Windows y Linux/Mac se
- * mezclen en una sola lista. Cada bloque puede traer varios comandos (hoy: recibir vía
- * GET y enviar vía POST), cada uno con su propia etiqueta y botón de copiar.
- */
-function OsCommandBlock({ icon, title, accent, commands, onCopy }: OsCommandBlockProps) {
+/** Fila de comando copiable — el Modo Invitado ya no distingue por SO (curl funciona igual en Windows 10+, Linux y Mac). */
+function CopyRow({ icon, label, command, onCopy }: CopyRowProps) {
   return (
-    <View style={[styles.osBlock, { borderColor: accent }]}>
-      <View style={styles.osBlockHeader}>
-        <View style={[styles.osBlockIconWrap, { backgroundColor: accent }]}>
-          <Text style={styles.osBlockIcon}>{icon}</Text>
-        </View>
-        <Text style={styles.osBlockTitle}>{title}</Text>
-      </View>
-      {commands.map((entry) => (
-        <View key={entry.label} style={styles.osCommandEntry}>
-          <Text style={styles.osCommandLabel}>{entry.label}</Text>
-          <Pressable
-            style={styles.commandBox}
-            disabled={!entry.command}
-            onPress={() => entry.command && onCopy(entry.command, `${title} — ${entry.label}`)}
-          >
-            <Text style={styles.commandText} selectable>
-              {entry.command ?? entry.placeholder}
-            </Text>
-          </Pressable>
-        </View>
-      ))}
-      <Text style={styles.osBlockHint}>Toca un comando para copiarlo</Text>
+    <View style={styles.osCommandEntry}>
+      <Text style={styles.osCommandLabel}>
+        {icon} {label}
+      </Text>
+      <Pressable style={styles.commandBox} disabled={!command} onPress={() => command && onCopy(command, label)}>
+        <Text style={styles.commandText} selectable>
+          {command ?? '…'}
+        </Text>
+      </Pressable>
     </View>
   );
 }
@@ -127,11 +81,16 @@ export default function DiscoveryScreen() {
   // useState (no useRef): el lint del proyecto (react-hooks/refs) prohíbe leer `.current`
   // de un ref durante el render, y `progressAnim` se usa en el JSX de abajo.
   const [progressAnim] = useState(() => new Animated.Value(0));
+
+  // Modo Invitado: selección propia, independiente de `message`/`file` (que son para
+  // envío P2P) — el usuario puede querer compartir algo distinto por este modo.
   const [guestModeVisible, setGuestModeVisible] = useState(false);
+  const [guestMessage, setGuestMessage] = useState('');
+  const [guestFile, setGuestFile] = useState<PickedFile | null>(null);
+  const [guestServerRunning, setGuestServerRunning] = useState(false);
   const [deviceIp, setDeviceIp] = useState<string | null>(null);
   const [ipLoading, setIpLoading] = useState(false);
-  const [guestToken, setGuestToken] = useState<string | null>(null);
-  const [guestServerRunning, setGuestServerRunning] = useState(false);
+
   const stopDiscoveryRef = useRef<(() => void) | null>(null);
   const guestServerRef = useRef<GuestServerHandle | null>(null);
 
@@ -176,13 +135,10 @@ export default function DiscoveryScreen() {
 
     if (transport === 'usb') {
       // adb reverse hace que el 127.0.0.1 del propio móvil llegue al servidor del PC — no
-      // hay nada que escanear, el "peer" es siempre este mismo. El túnel en sí todavía se
-      // establece a mano (`usb.rs` en el escritorio no está enlazado a la UI todavía).
+      // hay nada que escanear, el "peer" es siempre este mismo.
       const usbPeer: DiscoveredPeer = { name: 'PC vía USB (adb reverse)', host: '127.0.0.1', port: DEFAULT_TCP_PORT };
       setPeers([usbPeer]);
-      log(
-        `Modo USB: usando el túnel en 127.0.0.1:${DEFAULT_TCP_PORT} — requiere haber corrido "adb reverse tcp:${DEFAULT_TCP_PORT} tcp:${DEFAULT_TCP_PORT}" en el PC (todavía manual)`,
-      );
+      log(`Modo USB: usando el túnel en 127.0.0.1:${DEFAULT_TCP_PORT} (el escritorio lo levanta solo al detectar el cable)`);
       return;
     }
 
@@ -207,18 +163,24 @@ export default function DiscoveryScreen() {
     [log],
   );
 
-  const handlePickFile = useCallback(async () => {
+  const pickFile = useCallback(async (): Promise<PickedFile | null> => {
     const result = await DocumentPicker.getDocumentAsync({ copyToCacheDirectory: true });
-    if (result.canceled || !result.assets?.[0]) return;
+    if (result.canceled || !result.assets?.[0]) return null;
     const asset = result.assets[0];
-    setFile({
+    return {
       uri: asset.uri,
       name: asset.name,
       size: asset.size ?? 0,
       mimeType: asset.mimeType ?? 'application/octet-stream',
-    });
-    log(`Archivo adjuntado: ${asset.name} (${formatBytes(asset.size ?? 0)})`);
-  }, [log]);
+    };
+  }, []);
+
+  const handlePickFile = useCallback(async () => {
+    const picked = await pickFile();
+    if (!picked) return;
+    setFile(picked);
+    log(`Archivo adjuntado: ${picked.name} (${formatBytes(picked.size)})`);
+  }, [pickFile, log]);
 
   const canSend = !!selectedPeer && !sending && (message.trim().length > 0 || !!file);
 
@@ -259,8 +221,6 @@ export default function DiscoveryScreen() {
 
   const handleOpenGuestMode = useCallback(async () => {
     setGuestModeVisible(true);
-    const token = generateGuestToken();
-    setGuestToken(token);
     setIpLoading(true);
     try {
       const ip = await Network.getIpAddressAsync();
@@ -271,14 +231,36 @@ export default function DiscoveryScreen() {
     } finally {
       setIpLoading(false);
     }
-
-    guestServerRef.current?.stop();
-    guestServerRef.current = startGuestServer({ port: GUEST_MODE_PORT, token, log });
-    setGuestServerRunning(true);
   }, [log]);
 
   const handleCloseGuestMode = useCallback(() => {
     setGuestModeVisible(false);
+    guestServerRef.current?.stop();
+    guestServerRef.current = null;
+    setGuestServerRunning(false);
+  }, []);
+
+  const handlePickGuestFile = useCallback(async () => {
+    const picked = await pickFile();
+    if (!picked) return;
+    setGuestFile(picked);
+    log(`Archivo para compartir: ${picked.name} (${formatBytes(picked.size)})`);
+  }, [pickFile, log]);
+
+  const canActivateGuestServer = guestMessage.trim().length > 0 || !!guestFile;
+
+  const handleActivateGuestServer = useCallback(() => {
+    if (!canActivateGuestServer) return;
+    const payload: GuestPayload = guestFile
+      ? { kind: 'file', uri: guestFile.uri, name: guestFile.name, mimeType: guestFile.mimeType, size: guestFile.size }
+      : { kind: 'text', content: guestMessage.trim() };
+
+    guestServerRef.current?.stop();
+    guestServerRef.current = startGuestServer({ port: GUEST_MODE_PORT, payload, log });
+    setGuestServerRunning(true);
+  }, [canActivateGuestServer, guestFile, guestMessage, log]);
+
+  const handleStopGuestServer = useCallback(() => {
     guestServerRef.current?.stop();
     guestServerRef.current = null;
     setGuestServerRunning(false);
@@ -292,17 +274,9 @@ export default function DiscoveryScreen() {
     [log],
   );
 
-  const guestModeUrl =
-    deviceIp && guestToken ? `http://${deviceIp}:${GUEST_MODE_PORT}${buildGuestModePath(guestToken)}` : null;
-
-  // Bidireccional: recibir (GET) trae el portapapeles del móvil; enviar (POST) escribe
-  // el texto en él — ambas rutas ya responden de verdad en guestServer.ts.
-  const curlGetCommand = guestModeUrl ? `curl ${guestModeUrl}` : null;
-  const curlPostCommand = guestModeUrl ? `curl -X POST -d "Hola desde el PC" ${guestModeUrl}` : null;
-  const powershellGetCommand = guestModeUrl ? `Invoke-WebRequest -Uri ${guestModeUrl} -OutFile clip.txt` : null;
-  const powershellPostCommand = guestModeUrl
-    ? `Invoke-WebRequest -Uri ${guestModeUrl} -Method POST -Body "Hola desde el PC"`
-    : null;
+  const guestModeUrl = deviceIp ? `http://${deviceIp}:${GUEST_MODE_PORT}` : null;
+  const curlOutputName = guestFile ? guestFile.name : 'compartido.txt';
+  const curlCommand = guestModeUrl ? `curl ${guestModeUrl} -o "${curlOutputName}"` : null;
 
   return (
     <View style={styles.container}>
@@ -466,72 +440,81 @@ export default function DiscoveryScreen() {
               </Pressable>
             </View>
 
-            <Text style={styles.modalBadge}>
-              {guestServerRunning ? `🟢 Servidor activo en el puerto ${GUEST_MODE_PORT}` : '⏳ Iniciando servidor…'}
-            </Text>
+            {!guestServerRunning ? (
+              <>
+                <Text style={styles.modalBody}>
+                  Para un PC público o sin permisos de instalación: elige qué compartir y activa el servidor.
+                  Mientras esté activo, cualquiera que sepa tu IP en esa red puede descargarlo — sin instalar
+                  nada, sin token que teclear.
+                </Text>
 
-            <Text style={styles.modalBody}>
-              Para un PC público o sin permisos de instalación: ejecuta uno de estos comandos allí para
-              traer el portapapeles de este móvil, sin instalar ningún cliente. Al cerrar este modo, el
-              servidor se detiene y el token deja de servir.
-            </Text>
+                <Text style={styles.modalLabel}>¿Qué quieres compartir?</Text>
+                <TextInput
+                  style={[styles.input, !!guestFile && styles.inputDisabled]}
+                  placeholder="Escribe un texto…"
+                  placeholderTextColor={colors.textMuted}
+                  value={guestMessage}
+                  onChangeText={(text) => {
+                    setGuestMessage(text);
+                    if (text.length > 0) setGuestFile(null);
+                  }}
+                  multiline
+                  editable={!guestFile}
+                />
 
-            <View style={styles.modalInfoRow}>
-              <View style={styles.modalInfoCol}>
+                <View style={styles.attachRow}>
+                  <Pressable
+                    onPress={handlePickGuestFile}
+                    disabled={guestMessage.trim().length > 0}
+                    style={[styles.attachButton, guestMessage.trim().length > 0 && styles.attachButtonDisabled]}
+                  >
+                    <Text style={styles.attachButtonText}>📎 Adjuntar archivo</Text>
+                  </Pressable>
+                  {guestFile && (
+                    <View style={styles.attachedFile}>
+                      <Text style={styles.attachedFileName} numberOfLines={1}>
+                        {guestFile.name}
+                      </Text>
+                      <Text style={styles.attachedFileSize}>{formatBytes(guestFile.size)}</Text>
+                      <Pressable onPress={() => setGuestFile(null)} hitSlop={8}>
+                        <Text style={styles.attachedFileRemove}>✕</Text>
+                      </Pressable>
+                    </View>
+                  )}
+                </View>
+
+                <Pressable
+                  onPress={handleActivateGuestServer}
+                  disabled={!canActivateGuestServer}
+                  style={[styles.sendButton, !canActivateGuestServer && styles.sendButtonDisabled]}
+                >
+                  <Text style={[styles.sendButtonText, !canActivateGuestServer && styles.sendButtonTextDisabled]}>
+                    ▶ Activar servidor
+                  </Text>
+                </Pressable>
+              </>
+            ) : (
+              <>
+                <Text style={styles.modalBadge}>🟢 Servidor activo en el puerto {GUEST_MODE_PORT}</Text>
+                <Text style={styles.modalBody}>
+                  Compartiendo: {guestFile ? `📎 ${guestFile.name} (${formatBytes(guestFile.size)})` : `texto (${guestMessage.trim().length} caracteres)`}
+                </Text>
+
                 <Text style={styles.modalLabel}>IP de este móvil</Text>
                 {ipLoading ? (
                   <ActivityIndicator size="small" color={colors.cyan} />
                 ) : (
                   <Text style={styles.modalIp}>{deviceIp ?? 'No disponible'}</Text>
                 )}
-              </View>
-              <View style={styles.modalInfoCol}>
-                <Text style={styles.modalLabel}>Token de sesión</Text>
-                <Text style={styles.modalToken}>{guestToken ?? '····'}</Text>
-              </View>
-            </View>
-            <Text style={styles.modalHint}>
-              El token cambia cada vez que abres este modo — sin él, nadie más en esa red puede pedir tu
-              portapapeles.
-            </Text>
 
-            <OsCommandBlock
-              icon="⊞"
-              title="Windows (PowerShell)"
-              accent={colors.indigo}
-              commands={[
-                {
-                  label: '📥 Recibir portapapeles',
-                  command: powershellGetCommand,
-                  placeholder: `Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')} -OutFile clip.txt`,
-                },
-                {
-                  label: '📤 Enviar texto',
-                  command: powershellPostCommand,
-                  placeholder: `Invoke-WebRequest -Uri http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')} -Method POST -Body "texto"`,
-                },
-              ]}
-              onCopy={handleCopyCommand}
-            />
+                <CopyRow icon="🌐" label="Navegador Web" command={guestModeUrl} onCopy={handleCopyCommand} />
+                <CopyRow icon="💻" label="Terminal (curl)" command={curlCommand} onCopy={handleCopyCommand} />
 
-            <OsCommandBlock
-              icon="❯_"
-              title="Linux / macOS (Terminal)"
-              accent={colors.cyan}
-              commands={[
-                {
-                  label: '📥 Recibir portapapeles',
-                  command: curlGetCommand,
-                  placeholder: `curl http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')}`,
-                },
-                {
-                  label: '📤 Enviar texto',
-                  command: curlPostCommand,
-                  placeholder: `curl -X POST -d "texto" http://<ip>:${GUEST_MODE_PORT}${buildGuestModePath('····')}`,
-                },
-              ]}
-              onCopy={handleCopyCommand}
-            />
+                <Pressable onPress={handleStopGuestServer} style={styles.attachButton}>
+                  <Text style={styles.attachButtonText}>■ Detener servidor</Text>
+                </Pressable>
+              </>
+            )}
           </View>
         </View>
       </Modal>
@@ -665,6 +648,7 @@ const styles = StyleSheet.create({
     borderRadius: 999,
     paddingVertical: 8,
     paddingHorizontal: 14,
+    alignItems: 'center',
   },
   attachButtonDisabled: { opacity: 0.4 },
   attachButtonText: { color: colors.text, fontSize: 12, fontWeight: '600' },
@@ -732,11 +716,8 @@ const styles = StyleSheet.create({
     overflow: 'hidden',
   },
   modalBody: { color: colors.textMuted, fontSize: 13, lineHeight: 18 },
-  modalInfoRow: { flexDirection: 'row', gap: 20 },
-  modalInfoCol: { flex: 1 },
   modalLabel: { color: colors.text, fontSize: 12, fontWeight: '700', marginTop: 4 },
   modalIp: { color: colors.cyan, fontSize: 18, fontWeight: '700', fontFamily: 'monospace' },
-  modalToken: { color: colors.indigo, fontSize: 18, fontWeight: '700', fontFamily: 'monospace', letterSpacing: 2 },
   commandBox: {
     backgroundColor: colors.surfaceAlt,
     borderWidth: 1,
@@ -745,27 +726,6 @@ const styles = StyleSheet.create({
     padding: 10,
   },
   commandText: { color: colors.text, fontFamily: 'monospace', fontSize: 12 },
-  modalHint: { color: colors.textMuted, fontSize: 11, fontStyle: 'italic', marginTop: 2 },
-
-  osBlock: {
-    backgroundColor: colors.surfaceAlt,
-    borderWidth: 1.5,
-    borderRadius: 14,
-    padding: 12,
-    gap: 8,
-    marginTop: 4,
-  },
-  osBlockHeader: { flexDirection: 'row', alignItems: 'center', gap: 8 },
-  osBlockIconWrap: {
-    width: 22,
-    height: 22,
-    borderRadius: 6,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  osBlockIcon: { fontSize: 12, color: colors.bg, fontWeight: '900' },
-  osBlockTitle: { color: colors.text, fontSize: 13, fontWeight: '700' },
-  osBlockHint: { color: colors.textMuted, fontSize: 10, fontStyle: 'italic' },
   osCommandEntry: { gap: 4 },
   osCommandLabel: { color: colors.textMuted, fontSize: 11, fontWeight: '600' },
 
