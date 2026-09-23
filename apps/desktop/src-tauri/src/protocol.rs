@@ -11,7 +11,7 @@ pub const DEFAULT_TCP_PORT: u16 = 52847;
 /// Debe coincidir con GUEST_MODE_PORT en packages/protocol/src/constants.ts. El
 /// escritorio no sirve este puerto — solo lo necesita `usb.rs` para re-exponerlo vía
 /// `adb reverse` cuando el móvil está conectado por cable.
-pub const GUEST_MODE_PORT: u16 = 52848;
+pub const GUEST_MODE_PORT: u16 = 8080;
 
 /// Forma completamente cualificada esperada por `mdns-sd` (ServiceInfo::new).
 /// Debe coincidir con MDNS_FULL_SERVICE_TYPE en packages/protocol/src/constants.ts.

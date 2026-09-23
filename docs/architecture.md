@@ -18,7 +18,7 @@ La app "todoterreno" no elige un único medio: prueba medios en orden de prefere
 | Fase | Medio | Cuándo se usa | Estado |
 |---|---|---|---|
 | **2** | WiFi/LAN — mDNS + TCP | Ambos dispositivos en la misma red local; caso por defecto y de mejor rendimiento | ✅ Implementado (`LanTransport`) |
-| **3** | Cable USB — túnel ADB | Sin red compartida pero con cable disponible (ej. WiFi corporativo con aislamiento de clientes) | 🔜 Pendiente |
+| **3** | Cable USB — túnel ADB | Sin red compartida pero con cable disponible (ej. WiFi corporativo con aislamiento de clientes) | ✅ Implementado (`usb.rs`, sondeo automático cada 5s — no hotplug real, pero suficiente) |
 | **4** | Bluetooth — BLE / Classic | Sin red ni cable, en movilidad (ej. exteriores, coche) | 🔜 Pendiente |
 | **5** | Modo Invitado — servidor HTTP efímero | El **PC no puede** (o no debe) instalar el cliente Tauri — equipos públicos, de empresa con permisos restringidos, kioscos | ✅ Implementado (`guestServer.ts`), modo manual (no entra en el triaje automático) |
 
@@ -83,25 +83,25 @@ Orden de intento dentro de la fase: BLE primero (para confirmar que el peer sigu
 
 ## 6. Fase 5 — Modo Invitado (client-less, servidor HTTP efímero)
 
-Para el caso "estoy en un PC público/de la oficina, sin permisos de instalación, y necesito pasar un texto o un token" — no hay cliente Tauri en el otro extremo, así que el rol se invierte: **el móvil expone un servidor**, y el PC actúa como cliente usando herramientas que ya tiene instaladas (navegador, `curl`, PowerShell).
+Para el caso "estoy en un PC público/de la oficina, sin permisos de instalación, y necesito sacar un archivo o un texto de mi móvil" — no hay cliente Tauri en el otro extremo, así que el rol se invierte: **el móvil expone un servidor**, y el PC actúa como cliente usando herramientas que ya tiene instaladas (navegador, `curl`).
 
-**Activación:** exclusivamente manual (botón "Modo Invitado" en la app). Nunca se levanta como parte del triaje automático de las Fases 2–4, porque cambia el modelo de seguridad del sistema (ver riesgo abajo).
+**Rediseñado para fricción cero** (versión anterior con tokens y rutas `/t/<token>/clipboard` descartada — ver historial de commits): el flujo real de un técnico de sistemas es "elijo qué compartir → activo → alguien lo descarga en 5 segundos", no teclear una URL larga a mano. El diseño con token resultó exactamente lo contrario de eso.
 
-**Transporte:** `GuestHttpTransport`, HTTP/1.1 hablado a mano sobre `TcpSocket.createServer()` (misma librería que ya usa `LanTransport`, sin dependencias nuevas). Escucha en la IP LAN del móvil, puerto propio (ej. `52848`, distinto del `52847` de `LanTransport` para poder correr ambos a la vez).
+**Flujo actual:**
+1. El usuario elige qué compartir **dentro del propio modal del Modo Invitado** (texto o archivo — selección propia, independiente de lo que tenga puesto para enviar por P2P).
+2. Pulsa "▶ Activar servidor". El móvil arranca un servidor HTTP en el puerto `8080` (deliberadamente distinto del `52847` de `LanTransport`, para poder correr ambos a la vez si hiciera falta).
+3. El PC pide **la ruta raíz** (`GET /`, sin nada más que teclear) y recibe directamente el contenido — texto como `text/plain`, archivo con su `Content-Type`/`Content-Disposition` reales para que el navegador lo descargue con el nombre correcto.
+4. El usuario para el servidor a mano ("■ Detener servidor") o cerrando el modal.
 
-**Token de sesión:** al activarse, la app genera un token corto (ej. 6 caracteres alfanuméricos) y lo muestra en pantalla junto con la URL completa y un QR. Todas las rutas exigen el token; sin descubrimiento por mDNS (un PC público probablemente no lo tiene habilitado o no queremos que cualquiera en esa red lo encuentre solo), así que el usuario teclea la IP:puerto o escanea el QR. La sesión expira sola a los N minutos (ej. 10) y el servidor se apaga — acota la ventana de exposición.
+**Sin sistema de tokens.** Cualquiera que sepa la IP del móvil en esa red puede pedir `GET /` mientras el servidor esté activo — el modelo de seguridad ya no es "solo quien tiene el token", es "solo mientras el usuario lo deja activo, a propósito, viendo en pantalla que está expuesto". Coherente con el resto de la Fase 5: sigue siendo un modo manual, nunca un fallback automático, nunca deja el servidor corriendo en segundo plano sin que el usuario lo vea.
 
-**Endpoints** (bajo `/t/<token>/...`; cualquier request sin el token correcto se descarta):
-- `GET /t/<token>` → página HTML mínima autocontenida (sin JS externo): textarea + botón para pegar texto hacia el móvil, y el contenido actual del portapapeles del móvil para copiarlo manualmente. **Pendiente** — hoy no hay ruta de navegador, solo las dos de abajo.
-- `POST /t/<token>/clipboard` (body = texto plano) → el móvil escribe ese texto en su portapapeles nativo vía `expo-clipboard`. ✅ Implementado.
-- `GET /t/<token>/clipboard` → devuelve el portapapeles actual del móvil como `text/plain`, pensado para `curl`/`Invoke-RestMethod` sin necesidad de abrir un navegador. ✅ Implementado.
-  ```bash
-  curl http://192.168.1.23:52848/t/7f3a2b/clipboard
-  ```
+**Comandos que se muestran** (uno solo por medio, ya no hay distinción Windows/Linux — `curl` viene de serie en Windows 10+):
+- Navegador: `http://<ip>:8080`
+- Terminal: `curl http://<ip>:8080 -o "<nombre-real-del-archivo-o-compartido.txt>"`
 
-**Estado de implementación** (`apps/mobile/src/lib/guestServer.ts`): servidor HTTP/1.1 mínimo (una petición por conexión, sin keep-alive, sin `Content-Length` — el cuerpo se delimita cerrando la conexión) sobre `TcpSocket.createServer()`, con las dos rutas de arriba. El token hoy son 4 caracteres (no 6) y no hay QR ni expiración por temporizador — la "expiración" real es que el servidor se apaga al cerrar el modal del Modo Invitado (`handleCloseGuestMode` en `index.tsx`), lo cual ya acota la ventana de exposición aunque de forma menos fina que un timer. Sin la página HTML de `GET /t/<token>` todavía.
+**Transporte** (`apps/mobile/src/lib/guestServer.ts`): HTTP/1.1 hablado a mano sobre `TcpSocket.createServer()` (misma librería que ya usa `LanTransport`), una única ruta (`/`, GET). El texto se manda cerrando la conexión sin `Content-Length` (delimitado por cierre, válido en HTTP/1.1, evita medir bytes UTF-8 sin `Buffer`); el archivo sí lleva `Content-Length` real (el tamaño ya se conoce de antemano) y se transmite en crudo — sin base64 — vía `File.open()`/`FileHandle.readBytes()` en fragmentos de 1 MB, igual que `sendFileMessage` en `lanTransport.ts`, para no cargar archivos grandes enteros en memoria.
 
-**Riesgo aceptado y por qué:** este modo sirve HTTP plano, sin el intercambio ECDH que protege las Fases 2–4 (no hay programa cliente al otro lado con quien negociar una clave). El texto viaja sin cifrar dentro de la LAN local del PC público durante la ventana de la sesión. Mitigaciones: token de un solo uso por sesión, expiración corta, activación explícita y visible (el usuario ve en pantalla que el servidor está expuesto y puede apagarlo a mano), y documentar claramente que **no es apto para tokens/contraseñas de alto valor** — solo para texto de conveniencia. Si en el futuro se necesita subir el nivel de seguridad, la vía es TLS con un certificado autofirmado + que el usuario acepte la advertencia del navegador, pero eso empeora la experiencia "sin fricción" que es la razón de ser de este modo, así que se deja fuera del alcance inicial.
+**Riesgo aceptado y por qué:** este modo sirve HTTP plano, sin el intercambio ECDH que protege las Fases 2–4 (no hay programa cliente al otro lado con quien negociar una clave), y ahora sin ni siquiera un token — cualquiera en la misma red que sepa la IP puede pedir `GET /` mientras el servidor esté activo. Es una decisión deliberada: el token anterior generaba más fricción de la que aportaba seguridad real para el caso de uso (compartir algo de forma rápida y visible, no un secreto). Mitigaciones que quedan: activación explícita y visible (el usuario ve en pantalla que el servidor está expuesto y lo apaga a mano), y **no es apto para contenido sensible** — solo para texto/archivos de conveniencia. Si en el futuro hace falta subir el nivel de seguridad, la vía es TLS con certificado autofirmado (empeora la fricción, por eso queda fuera del alcance inicial) o volver a un token opcional para quien lo pida explícitamente.
 
 ## 7. Protocolo de sincronización
 
