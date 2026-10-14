@@ -32,3 +32,8 @@ Thumbs.db
 # Env / secrets
 .env
 .env.local
+
+# Archivos de herramientas locales
+CLAUDE.md
+AGENTS.md
+.claude/
