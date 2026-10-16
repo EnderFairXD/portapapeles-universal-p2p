@@ -64,6 +64,12 @@ describe("estado de conexión", () => {
     expect(q(".status-title")!.textContent).toBe("Conectado con Pixel 8 por WiFi");
   });
 
+  it("un transporte que coincide con un miembro de Object.prototype no se rotula", () => {
+    const transport = "constructor" as unknown as Peer["transport"];
+    render(root, state({ peers: [peer({ transport })] }));
+    expect(q(".status-title")!.textContent).toBe("Conectado con Pixel 8");
+  });
+
   it("con dos peers (relevo de sesión) muestra el último y no vuelve a «Esperando»", () => {
     const viejo = peer({ sessionId: 1, deviceName: "Pixel 8" });
     const nuevo = peer({ sessionId: 2, deviceName: "Pixel 9", transport: "usb" });
@@ -120,10 +126,56 @@ describe("transferencias", () => {
     expect(q('button[data-action="cancel"]')).toBeNull();
   });
 
-  it("un motivo de fallo desconocido se muestra tal cual y uno ausente se omite", () => {
+  it("un motivo desconocido o ausente solo dice «Falló»: el texto del móvil no se muestra", () => {
     render(root, state({ transfers: [transfer({ state: "failed", error: "disco_lleno" })] }));
-    expect(q(".transfer-detail")!.textContent).toBe("Falló: disco_lleno");
+    expect(q(".transfer-detail")!.textContent).toBe("Falló");
     render(root, state({ transfers: [transfer({ state: "failed", error: undefined })] }));
+    expect(q(".transfer-detail")!.textContent).toBe("Falló");
+    render(root, state({ transfers: [transfer({ state: "failed", error: null })] }));
+    expect(q(".transfer-detail")!.textContent).toBe("Falló");
+  });
+
+  it("los cierres de sesión «replaced» y «closed» se traducen", () => {
+    render(root, state({ transfers: [transfer({ state: "failed", error: "replaced" })] }));
+    expect(q(".transfer-detail")!.textContent).toBe("Falló: la conexión se reemplazó por una nueva");
+    render(root, state({ transfers: [transfer({ state: "failed", error: "closed" })] }));
+    expect(q(".transfer-detail")!.textContent).toBe("Falló: se cerró la conexión");
+  });
+
+  // Códigos que el Rust de PC o el móvil pueden poner en `error` (session.rs, hub.rs, files.rs y session.ts).
+  it.each([
+    "link_closed",
+    "heartbeat_timeout",
+    "protocol_error",
+    "internal_error",
+    "checksum_mismatch",
+    "hash_mismatch",
+    "size_mismatch",
+    "read_error",
+    "write_error",
+    "io_error",
+    "replaced",
+    "closed",
+    "cancelled",
+    "remote_error",
+    "no_peer",
+  ])("el código «%s» se muestra en español y no tal cual", (code) => {
+    render(root, state({ transfers: [transfer({ state: "failed", error: code })] }));
+    const text = q(".transfer-detail")!.textContent!;
+    expect(text.startsWith("Falló: ")).toBe(true);
+    expect(text).not.toContain(code);
+  });
+
+  it.each(["constructor", "toString", "__proto__", "hasOwnProperty", "valueOf"])(
+    "el motivo «%s» no resuelve a miembros de Object.prototype",
+    (error) => {
+      render(root, state({ transfers: [transfer({ state: "failed", error })] }));
+      expect(q(".transfer-detail")!.textContent).toBe("Falló");
+    },
+  );
+
+  it("un motivo de 10 000 caracteres no llega al DOM", () => {
+    render(root, state({ transfers: [transfer({ state: "failed", error: "x".repeat(10_000) })] }));
     expect(q(".transfer-detail")!.textContent).toBe("Falló");
   });
 

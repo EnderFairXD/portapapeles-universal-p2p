@@ -8,22 +8,34 @@ import type { HistoryItem, Transfer, UiState } from "./types";
 /** Caracteres de un texto que se llevan al DOM; el resto se corta (el clic copia el texto completo). */
 const MAX_PREVIEW_CHARS = 600;
 
-const TRANSPORT_LABEL: Record<string, string> = { wifi: "WiFi", usb: "USB" };
+// Mapas con `Map` y no objetos: `error` puede venir del móvil y "constructor" o
+// "toString" no deben resolver a miembros de Object.prototype.
+const TRANSPORT_LABEL = new Map([
+  ["wifi", "WiFi"],
+  ["usb", "USB"],
+]);
 
-/** Códigos de fallo del backend o del móvil; los desconocidos se muestran tal cual. */
-const ERROR_TEXT: Record<string, string> = {
-  link_closed: "se perdió la conexión",
-  heartbeat_timeout: "el móvil dejó de responder",
-  no_peer: "no hay móvil conectado",
-  read_error: "no se pudo leer el archivo",
-  write_error: "no se pudo guardar el archivo",
-  size_mismatch: "el tamaño no coincide",
-  checksum_mismatch: "el archivo llegó dañado",
-  hash_mismatch: "el archivo llegó dañado",
-  protocol_error: "error de protocolo",
-  internal_error: "error interno",
-  remote_error: "el móvil informó de un error",
-};
+/**
+ * Códigos de fallo que emiten el PC (session.rs, hub.rs, files.rs) y el móvil (session.ts).
+ * Un código que no esté aquí se muestra solo como «Falló»: el texto es del móvil y no se enseña.
+ */
+const ERROR_TEXT = new Map([
+  ["link_closed", "se perdió la conexión"],
+  ["heartbeat_timeout", "el móvil dejó de responder"],
+  ["replaced", "la conexión se reemplazó por una nueva"],
+  ["closed", "se cerró la conexión"],
+  ["no_peer", "no hay móvil conectado"],
+  ["cancelled", "se canceló"],
+  ["read_error", "no se pudo leer el archivo"],
+  ["write_error", "no se pudo guardar el archivo"],
+  ["io_error", "no se pudo guardar el archivo"],
+  ["size_mismatch", "el tamaño no coincide"],
+  ["checksum_mismatch", "el archivo llegó dañado"],
+  ["hash_mismatch", "el archivo llegó dañado"],
+  ["protocol_error", "error de protocolo"],
+  ["internal_error", "error interno"],
+  ["remote_error", "el móvil informó de un error"],
+]);
 
 const UNITS = ["B", "KB", "MB", "GB"];
 
@@ -195,7 +207,7 @@ function renderStatus(view: View, state: UiState): boolean {
   view.status.dataset.connected = peer ? "true" : "false";
   if (peer) {
     const name = peer.deviceName || "el móvil";
-    const via = TRANSPORT_LABEL[peer.transport];
+    const via = TRANSPORT_LABEL.get(peer.transport);
     setText(view.statusTitle, `Conectado con ${name}${via ? ` por ${via}` : ""}`);
     view.statusHint.hidden = true;
   } else {
@@ -302,9 +314,11 @@ function updateTransfer(row: TransferRow, t: Transfer): void {
     case "cancelled":
       detail = "Cancelado";
       break;
-    case "failed":
-      detail = t.error ? `Falló: ${ERROR_TEXT[t.error] ?? t.error}` : "Falló";
+    case "failed": {
+      const reason = t.error ? ERROR_TEXT.get(t.error) : undefined;
+      detail = reason ? `Falló: ${reason}` : "Falló";
       break;
+    }
     default:
       detail = formatProgress(t.bytes, t.size);
   }

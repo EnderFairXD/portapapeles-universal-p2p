@@ -104,8 +104,15 @@ async function watchDrops(): Promise<void> {
   });
 }
 
+function logFailure(what: string): (e: unknown) => void {
+  return (e) => console.error(`ClipSync: ${what}`, e);
+}
+
 async function main(): Promise<void> {
   render(app, EMPTY_STATE);
+
+  // Cada paso es independiente: que uno falle no deja a la ventana sin los demás.
+  const drops = watchDrops().catch(logFailure("no se pudo vigilar el arrastre de archivos"));
 
   // Primero el oyente y después `get_state`: no hay evento inicial, y si llega
   // uno mientras se pide el estado, el evento es más reciente y gana.
@@ -113,11 +120,17 @@ async function main(): Promise<void> {
   await listen<UiState>("ui-state", (e) => {
     gotEvent = true;
     apply(e.payload);
-  });
-  const initial = await invoke<UiState>("get_state");
-  if (!gotEvent) apply(initial);
+  }).catch(logFailure("no se pudo escuchar ui-state"));
 
-  await watchDrops();
+  try {
+    const initial = await invoke<UiState>("get_state");
+    if (!gotEvent) apply(initial);
+  } catch (e) {
+    logFailure("no se pudo cargar el estado")(e);
+    toast("No se pudo cargar el estado de la app");
+  }
+
+  await drops;
 }
 
-main().catch((e) => console.error("ClipSync: no se pudo iniciar la interfaz", e));
+main().catch(logFailure("no se pudo iniciar la interfaz"));

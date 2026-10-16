@@ -461,6 +461,7 @@ button {
 
 .transfer-detail {
   margin-top: 6px;
+  overflow-wrap: anywhere;
   color: var(--muted);
   font-size: 12.5px;
   font-variant-numeric: tabular-nums;
