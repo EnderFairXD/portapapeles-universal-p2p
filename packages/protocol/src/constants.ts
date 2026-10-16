@@ -1,30 +1,32 @@
-export const PROTOCOL_VERSION = '1.0.0';
+export const PROTOCOL_VERSION = 2;
 
 export const DEFAULT_TCP_PORT = 52847;
 
-/**
- * Puerto del servidor HTTP del Modo Invitado (Fase 5, ver docs/architecture.md §6).
- * 8080 a propósito: es el que curl/navegadores esperan por convención para un servidor
- * HTTP ad-hoc, y hace el comando de conexión más corto de recordar/teclear. El túnel USB
- * (apps/desktop/src-tauri/src/usb.rs) necesita este valor tal cual para re-exponer
- * también este puerto vía `adb reverse` — debe coincidir con GUEST_MODE_PORT en
- * protocol.rs.
- */
-export const GUEST_MODE_PORT = 8080;
-
-/** Forma "bare" del tipo de servicio, tal como la espera react-native-zeroconf (scan(type, protocol, domain)). */
-export const MDNS_SERVICE_NAME = 'p2pclip';
+/** Forma corta del servicio mDNS, tal como la espera react-native-zeroconf (scan(type, protocol, domain)). */
+export const MDNS_SERVICE_NAME = 'clipsync';
 export const MDNS_SERVICE_PROTOCOL = 'tcp';
 export const MDNS_SERVICE_DOMAIN = 'local.';
 
-/** Forma completamente cualificada, tal como la espera mdns-sd en el escritorio (ServiceInfo::new). */
+/** Forma completa, tal como la espera mdns-sd en el escritorio (ServiceInfo::new). */
 export const MDNS_FULL_SERVICE_TYPE = `_${MDNS_SERVICE_NAME}._${MDNS_SERVICE_PROTOCOL}.${MDNS_SERVICE_DOMAIN}`;
 
-/**
- * UUID v4 estático del servicio GATT BLE (Fase 4) — ambos lados escanean/anuncian este
- * mismo UUID para encontrarse. Debe coincidir con BLE_SERVICE_UUID en
- * apps/desktop/src-tauri/src/bluetooth.rs; cualquier cambio hay que replicarlo a mano
- * en los dos sitios (mismo criterio que el resto de constantes compartidas de este
- * paquete — ver README).
- */
-export const BLE_SERVICE_UUID = '2c9a7e4a-4f1b-4d6e-9c3a-8b7f61d2e5a4';
+/** Máximo de bytes de datos por trama (u16). */
+export const MAX_FRAME_BYTES = 65535;
+/** Bytes de archivo por trama de datos (48 KiB). */
+export const FILE_CHUNK_BYTES = 49152;
+/** Se confirma (file_ack) cada vez que se reciben 1 MiB. */
+export const FILE_ACK_EVERY_BYTES = 1048576;
+/** Máximo de bytes sin confirmar en vuelo (2 MiB). */
+export const FILE_WINDOW_BYTES = 2097152;
+/** Máximo de texto de portapapeles, en bytes UTF-8 (1 MiB). */
+export const MAX_CLIP_BYTES = 1048576;
+/** Máximo de un mensaje de control reensamblado (2 MiB). */
+export const MAX_CONTROL_BYTES = 2097152;
+
+export const HEARTBEAT_INTERVAL_MS = 10000;
+export const HEARTBEAT_TIMEOUT_MS = 30000;
+export const RECONNECT_INTERVAL_MS = 5000;
+export const CONNECT_TIMEOUT_MS = 2000;
+
+/** Elementos del historial de portapapeles. */
+export const MAX_HISTORY = 50;
