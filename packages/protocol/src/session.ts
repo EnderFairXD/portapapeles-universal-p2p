@@ -162,13 +162,8 @@ export class Session {
    * Lanza si la sesión aún no está lista (antes de `ready`) o ya se cerró.
    */
   sendClip(text: string): ClipDecision {
-    if (this.closed || !this.ready || !this.sync) throw new Error('La sesión no está lista');
-    const decision = this.sync.check(text);
-    if (decision === 'send') {
-      this.send({ kind: 'clip', id: this.opts.newTransferId(), text, hash: sha256Hex(text) });
-      this.sync.markSynced(text);
-    }
-    return decision;
+    if (this.closed || !this.ready) throw new Error('La sesión no está lista');
+    return this.pushClip(text);
   }
 
   sendFile(_src: FileSource): string {
@@ -254,29 +249,39 @@ export class Session {
   private async sendClientHello(): Promise<void> {
     this.sync = this.opts.clipSyncFor(null);
     const local = await this.opts.getLocalClip();
-    const willSendClip = local !== null && this.sync.check(local) === 'send';
+    // se anuncia solo lo que de verdad se podrá enviar (también si no cabe al codificarlo)
+    const willSendClip = local !== null && this.prepareClip(local).decision === 'send';
     if (willSendClip) this.startClip = local;
     this.send({ kind: 'hello', v: PROTOCOL_VERSION, ...this.self(), willSendClip });
   }
 
   private onServerHello(msg: HelloMsg): void {
-    this.becomeReady(msg);
     const text = this.startClip;
     this.startClip = null;
-    if (text !== null) this.sendClip(text);
+    if (text !== null) this.pushClip(text); // antes de ready, igual que el servidor
+    this.becomeReady(msg);
   }
 
   private async onClientHello(msg: HelloMsg): Promise<void> {
     const peer = { deviceId: msg.deviceId, deviceName: msg.deviceName };
     const sync = (this.sync = this.opts.clipSyncFor(peer));
     this.send({ kind: 'hello', v: PROTOCOL_VERSION, ...this.self() });
-    this.becomeReady(msg);
 
-    // la cola espera a esto, así que el clip del cliente aún no se ha procesado
+    // La regla se resuelve antes de ready: hasta entonces la app no puede llamar a sendClip.
+    // La cola espera a esto, así que el clip del cliente aún no se ha procesado.
     const local = await this.opts.getLocalClip();
-    if (this.closed || local === null || sync.check(local) !== 'send') return;
-    if (msg.willSendClip) this.emit('localClipSuperseded', local); // gana el móvil
-    else this.sendClip(local);
+    if (this.closed) return;
+    let superseded: string | null = null;
+    if (local !== null) {
+      if (!msg.willSendClip) this.pushClip(local);
+      else if (this.prepareClip(local).decision === 'send') {
+        // gana el móvil: el texto del PC se da por tratado para que no salga después y cruce
+        sync.markSynced(local);
+        superseded = local;
+      }
+    }
+    this.becomeReady(msg);
+    if (superseded !== null) this.emit('localClipSuperseded', superseded);
   }
 
   private becomeReady(msg: HelloMsg): void {
@@ -290,6 +295,28 @@ export class Session {
   }
 
   // --- portapapeles ---
+
+  /** Decide si un texto se envía; si su JSON no cabe en un mensaje de control, es 'too_large'. */
+  private prepareClip(text: string): { decision: ClipDecision; frames?: Uint8Array[] } {
+    const decision = this.sync!.check(text);
+    if (decision !== 'send') return { decision };
+    try {
+      const frames = encodeControl({ kind: 'clip', id: this.opts.newTransferId(), text, hash: sha256Hex(text) });
+      return { decision, frames };
+    } catch (e) {
+      if (e instanceof ProtocolError) return { decision: 'too_large' }; // p. ej. 1 MiB de comillas
+      throw e;
+    }
+  }
+
+  /** Único camino de salida de un clip, para el arranque y para sendClip. */
+  private pushClip(text: string): ClipDecision {
+    const { decision, frames } = this.prepareClip(text);
+    if (decision !== 'send') return decision;
+    this.write(frames!);
+    this.sync!.markSynced(text);
+    return decision;
+  }
 
   private onClip(msg: ClipMsg): void {
     if (new TextEncoder().encode(msg.text).length > MAX_CLIP_BYTES) {
@@ -321,11 +348,14 @@ export class Session {
   // --- salida ---
 
   private send(msg: ControlMessage): void {
+    this.write(encodeControl(msg));
+  }
+
+  private write(payloads: Uint8Array[]): void {
     if (this.closed) return;
     try {
-      for (const payload of encodeControl(msg)) this.link.write(encodeFrame(payload));
-    } catch (e) {
-      if (e instanceof ProtocolError) throw e;
+      for (const payload of payloads) this.link.write(encodeFrame(payload));
+    } catch {
       this.close('link_closed'); // fallo de escritura: el enlace está caído
     }
   }
