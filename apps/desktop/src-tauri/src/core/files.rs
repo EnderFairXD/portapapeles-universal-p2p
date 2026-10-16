@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 
 /// Máximo de bytes UTF-8 de un nombre de archivo.
 const MAX_NAME_BYTES: usize = 200;
+/// Máximo de nombres candidatos que se prueban al publicar antes de rendirse.
+const MAX_INTENTOS_NOMBRE: u32 = 10_000;
 
 fn es_reservado_windows(nombre: &str) -> bool {
     // La parte anterior al primer punto decide (también con extensión: "CON.txt").
@@ -26,28 +28,50 @@ fn recortar_final(s: &str) -> &str {
     s.trim_end_matches(['.', ' '])
 }
 
+/// Caracteres que no se admiten: prohibidos en Windows, de control y de formato/bidi
+/// (permiten disfrazar la extensión, p. ej. U+202E).
+fn es_caracter_prohibido(c: char) -> bool {
+    matches!(
+        c,
+        '<' | '>' | ':' | '"' | '|' | '?' | '*'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{2028}' | '\u{2029}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{FEFF}'
+    ) || c.is_control()
+}
+
 /// Deja un nombre seguro para guardar en cualquier sistema: sin rutas, sin caracteres
 /// prohibidos en Windows, sin nombres reservados y de 200 bytes como máximo.
+/// Es idempotente: `sanitize(sanitize(x)) == sanitize(x)`.
 pub fn sanitize_file_name(name: &str) -> String {
     let ultimo = name.rsplit(['/', '\\']).next().unwrap_or("");
-    let limpio: String = ultimo
-        .chars()
-        .filter(|c| !matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') && !c.is_control())
-        .collect();
-    let mut nombre = recortar_final(&limpio).to_string();
-    if nombre.is_empty() {
-        return "archivo".to_string();
-    }
-    if es_reservado_windows(&nombre) {
-        nombre.insert(0, '_');
-    }
+    let limpio: String = ultimo.chars().filter(|c| !es_caracter_prohibido(*c)).collect();
+    let recortado = recortar_final(&limpio);
+    // Un nombre formado solo por puntos y espacios antes de la extensión pasa a "archivo".
+    let mut nombre = con_stem_valido(recortado);
     if nombre.len() > MAX_NAME_BYTES {
         nombre = truncar(&nombre);
     }
-    if nombre.is_empty() {
-        "archivo".to_string()
+    // El chequeo de reservados va después de recortar/truncar: esas operaciones pueden
+    // dejar un nombre reservado ("CON" + espacios + "x.txt" -> "CON.txt").
+    if es_reservado_windows(&nombre) {
+        nombre.insert(0, '_');
+        if nombre.len() > MAX_NAME_BYTES {
+            nombre = truncar(&nombre);
+        }
+    }
+    nombre
+}
+
+/// Sustituye un stem sin ningún carácter útil (solo puntos/espacios, o vacío) por "archivo".
+fn con_stem_valido(nombre: &str) -> String {
+    let (stem, ext) = separar_extension(nombre);
+    if recortar_final(stem).trim_start_matches(['.', ' ']).is_empty() {
+        format!("archivo{ext}")
     } else {
-        nombre
+        nombre.to_string()
     }
 }
 
@@ -60,7 +84,12 @@ fn truncar(nombre: &str) -> String {
     while !stem.is_char_boundary(limite) {
         limite -= 1;
     }
-    format!("{}{}", recortar_final(&stem[..limite]), ext)
+    let corto = recortar_final(&stem[..limite]);
+    if corto.trim_start_matches(['.', ' ']).is_empty() {
+        format!("archivo{ext}")
+    } else {
+        format!("{corto}{ext}")
+    }
 }
 
 /// Separa "foto.jpg" en ("foto", ".jpg"). Sin extensión (o solo punto inicial): (nombre, "").
@@ -76,16 +105,21 @@ fn existe(ruta: &Path) -> bool {
     ruta.symlink_metadata().is_ok()
 }
 
+/// Candidato número `n` para `nombre` (ya saneado): `nombre.ext`, `nombre (1).ext`, …
+fn candidato(dir: &Path, nombre: &str, n: u32) -> PathBuf {
+    if n == 0 {
+        return dir.join(nombre);
+    }
+    let (stem, ext) = separar_extension(nombre);
+    dir.join(format!("{stem} ({n}){ext}"))
+}
+
 /// Ruta libre dentro de `dir`: `nombre.ext`, o `nombre (1).ext`, `nombre (2).ext`, …
+/// Solo es una consulta: no reserva nada (`FileReceiver` reserva de forma atómica).
 pub fn unique_path(dir: &Path, file_name: &str) -> PathBuf {
     let nombre = sanitize_file_name(file_name);
-    let primera = dir.join(&nombre);
-    if !existe(&primera) {
-        return primera;
-    }
-    let (stem, ext) = separar_extension(&nombre);
-    (1u32..)
-        .map(|n| dir.join(format!("{stem} ({n}){ext}")))
+    (0u32..)
+        .map(|n| candidato(dir, &nombre, n))
         .find(|p| !existe(p))
         .expect("u32 agotado")
 }
@@ -158,7 +192,7 @@ impl FileReceiver {
         } else {
             Err("checksum_mismatch".to_string())
         };
-        // Éxito o fallo, el .part ya no debe quedar (tras publicar no existe y esto es inocuo)
+        // Si falló, el .part se borra aquí; tras publicar con éxito `cerrado` evita tocarlo
         self.limpiar();
         res
     }
@@ -167,28 +201,34 @@ impl FileReceiver {
         self.limpiar();
     }
 
-    /// Sincroniza y mueve el `.part` a un nombre final libre, sin sobrescribir nunca.
+    /// Sincroniza y mueve el `.part` a un nombre final libre, sin sobrescribir nunca:
+    /// el destino se reserva con `create_new` (atómico) y solo entonces se renombra encima
+    /// del propio marcador.
     fn publicar(&mut self) -> Result<PathBuf, String> {
         let file = self.file.take().ok_or("receptor cerrado")?;
         file.sync_all().map_err(|e| format!("io_error: {e}"))?;
         drop(file); // cerrar antes de renombrar (Windows)
-        loop {
-            let destino = unique_path(&self.dir, &self.nombre);
-            // hard_link falla si el destino existe: no hay carrera que sobrescriba
-            match std::fs::hard_link(&self.part, &destino) {
-                Ok(()) => return Ok(destino),
-                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
-                Err(_) => {
-                    // Sistema de archivos sin enlaces duros: rename (la ventana es mínima)
-                    if existe(&destino) {
-                        continue;
-                    }
-                    return std::fs::rename(&self.part, &destino)
-                        .map(|()| destino)
-                        .map_err(|e| format!("io_error: {e}"));
+        for n in 0..MAX_INTENTOS_NOMBRE {
+            let destino = candidato(&self.dir, &self.nombre, n);
+            match OpenOptions::new().write(true).create_new(true).open(&destino) {
+                Ok(marcador) => {
+                    drop(marcador);
+                    return match std::fs::rename(&self.part, &destino) {
+                        Ok(()) => {
+                            self.cerrado = true; // el .part ya no existe
+                            Ok(destino)
+                        }
+                        Err(e) => {
+                            let _ = std::fs::remove_file(&destino);
+                            Err(format!("io_error: {e}"))
+                        }
+                    };
                 }
+                Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(format!("io_error: {e}")),
             }
         }
+        Err("io_error: demasiados nombres ocupados".to_string())
     }
 
     fn limpiar(&mut self) {
@@ -359,12 +399,110 @@ mod tests {
     }
 
     #[test]
-    fn drop_tras_finish_no_borra_el_archivo() {
+    fn tras_finish_queda_solo_el_archivo_final_con_su_contenido() {
         let d = tempfile::tempdir().unwrap();
         let mut r = FileReceiver::create(d.path(), "doc.txt").unwrap();
         r.write(b"abc").unwrap();
         let ruta = r.finish(&sha(b"abc")).unwrap();
-        assert!(ruta.exists());
+        // finish consume el receptor y su Drop ya se ejecutó: no debe haber tocado nada
+        assert_eq!(nombres_en(d.path()), vec!["doc.txt"]);
+        assert_eq!(fs::read(ruta).unwrap(), b"abc");
+    }
+
+    #[test]
+    fn destino_creado_justo_antes_de_finish_no_se_sobrescribe() {
+        let d = tempfile::tempdir().unwrap();
+        let mut r = FileReceiver::create(d.path(), "a.txt").unwrap();
+        r.write(b"nuevo").unwrap();
+        // otro escritor crea el destino (y el siguiente candidato) después de create
+        fs::write(d.path().join("a.txt"), b"otro").unwrap();
+        fs::write(d.path().join("a (1).txt"), b"otro1").unwrap();
+        let ruta = r.finish(&sha(b"nuevo")).unwrap();
+        assert_eq!(ruta, d.path().join("a (2).txt"));
+        assert_eq!(fs::read(d.path().join("a.txt")).unwrap(), b"otro");
+        assert_eq!(fs::read(d.path().join("a (1).txt")).unwrap(), b"otro1");
+        assert_eq!(fs::read(ruta).unwrap(), b"nuevo");
+        assert_eq!(nombres_en(d.path()), vec!["a (1).txt", "a (2).txt", "a.txt"]);
+    }
+
+    #[test]
+    fn sin_nombres_libres_devuelve_error_y_no_deja_restos() {
+        let d = tempfile::tempdir().unwrap();
+        let mut r = FileReceiver::create(d.path(), "a.txt").unwrap();
+        r.write(b"x").unwrap();
+        fs::write(d.path().join("a.txt"), b"0").unwrap();
+        for n in 1..MAX_INTENTOS_NOMBRE {
+            fs::write(d.path().join(format!("a ({n}).txt")), b"0").unwrap();
+        }
+        let err = r.finish(&sha(b"x")).unwrap_err();
+        assert!(err.starts_with("io_error"), "{err}");
+        // solo los 10 000 existentes: ni .part ni marcador
+        let nombres = nombres_en(d.path());
+        assert_eq!(nombres.len(), MAX_INTENTOS_NOMBRE as usize);
+        assert!(nombres.iter().all(|n| !n.ends_with(".part")));
+        assert!(nombres.iter().all(|n| fs::read(d.path().join(n)).unwrap() == b"0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallo_al_renombrar_no_deja_part_ni_marcador() {
+        let d = tempfile::tempdir().unwrap();
+        let mut r = FileReceiver::create(d.path(), "doc.txt").unwrap();
+        r.write(b"abc").unwrap();
+        // el .part desaparece por fuera: el rename fallará con el marcador ya reservado
+        fs::remove_file(d.path().join("doc.txt.part")).unwrap();
+        let err = r.finish(&sha(b"abc")).unwrap_err();
+        assert!(err.starts_with("io_error"), "{err}");
+        assert!(nombres_en(d.path()).is_empty());
+    }
+
+    #[test]
+    fn nombre_reservado_no_reaparece_tras_truncar() {
+        let entrada = format!("CON{}x.txt", " ".repeat(300));
+        assert_eq!(sanitize_file_name(&entrada), "_CON.txt");
+        assert_eq!(sanitize_file_name("CON. . .txt"), "_CON. . .txt");
+        let largo = format!("{}{}", "COM1", " ".repeat(300));
+        assert_eq!(sanitize_file_name(&largo), "_COM1");
+    }
+
+    #[test]
+    fn sanea_es_idempotente() {
+        let largo = "x".repeat(300);
+        let muchos_espacios = format!("CON{}x.txt", " ".repeat(300));
+        let ext_larga = format!("a.{}", "z".repeat(400));
+        let acentos = format!("{}.txt", "ñ".repeat(150));
+        let espacios_pdf = format!("{}.pdf", " ".repeat(300));
+        let entradas = [
+            "../../x", "a/b.txt", "C:\\x", "/etc/passwd", "CON", "con.txt", "", "..", ".", "a/",
+            "nombre. . ", "a?b*.txt", "COM1", "\u{202E}gpj.exe", "..pdf", ". .pdf", ".bashrc",
+            largo.as_str(), muchos_espacios.as_str(), ext_larga.as_str(), acentos.as_str(),
+            espacios_pdf.as_str(),
+        ];
+        for e in entradas {
+            let una = sanitize_file_name(e);
+            assert_eq!(sanitize_file_name(&una), una, "entrada: {e:?}");
+            assert!(una.len() <= MAX_NAME_BYTES && !una.is_empty());
+        }
+    }
+
+    #[test]
+    fn quita_caracteres_bidi_y_de_formato() {
+        // sin esto, "invoice\u{202E}txt.exe" se mostraría como "invoiceexe.txt"
+        assert_eq!(sanitize_file_name("invoice\u{202E}txt.exe"), "invoicetxt.exe");
+        assert_eq!(sanitize_file_name("a\u{200B}b\u{200F}c\u{2066}d\u{2069}e\u{FEFF}f"), "abcdef");
+        assert_eq!(sanitize_file_name("x\u{202A}\u{202B}\u{202C}\u{202D}.txt"), "x.txt");
+        assert_eq!(sanitize_file_name("l\u{2028}m\u{2029}n"), "lmn");
+    }
+
+    #[test]
+    fn stem_solo_de_puntos_o_espacios_pasa_a_archivo() {
+        assert_eq!(sanitize_file_name(&format!("{}.pdf", " ".repeat(300))), "archivo.pdf");
+        assert_eq!(sanitize_file_name("   .pdf"), "archivo.pdf");
+        assert_eq!(sanitize_file_name("..pdf"), "archivo.pdf");
+        assert_eq!(sanitize_file_name(".pdf"), ".pdf"); // fichero oculto, no es un stem vacío
+        // el espacio queda tras el corte por longitud
+        let n = sanitize_file_name(&format!("{}x.pdf", " ".repeat(300)));
+        assert_eq!(n, "archivo.pdf");
     }
 
     #[test]
@@ -391,7 +529,10 @@ mod tests {
             assert_eq!(ruta.parent().unwrap(), d.path(), "nombre: {nombre:?}");
             assert!(ruta.is_file());
         }
-        // y nada fuera del directorio temporal
-        assert!(!d.path().parent().unwrap().join("x").exists());
+        // un archivo por nombre hostil, todos directamente en el directorio y sin restos
+        let nombres = nombres_en(d.path());
+        assert_eq!(nombres.len(), hostiles.len());
+        assert!(nombres.iter().all(|n| !n.ends_with(".part")));
+        assert!(nombres.iter().all(|n| d.path().join(n).is_file()));
     }
 }
