@@ -99,7 +99,8 @@ pub(super) enum SessionEvent {
 /// Lo que la sesión necesita del Hub. `on_event` se llama de forma síncrona y en orden.
 pub(super) trait SessionHost: Send + Sync + 'static {
     fn local_clip(&self) -> Option<String>;
-    fn clip_sync_for(&self, device_id: &str) -> Arc<Mutex<ClipboardSync>>;
+    /// Al recibir el hello: asocia la sesión a ese dispositivo y devuelve su ClipboardSync.
+    fn clip_sync_for(&self, session_id: u64, device_id: &str) -> Arc<Mutex<ClipboardSync>>;
     fn on_event(&self, session_id: u64, event: SessionEvent);
 }
 
@@ -561,7 +562,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         device_name: String,
         will_send_clip: bool,
     ) {
-        self.sync = self.host.clip_sync_for(&device_id);
+        self.sync = self.host.clip_sync_for(self.cfg.id, &device_id);
         self.send(ControlMessage::Hello {
             v: PROTOCOL_VERSION,
             device_id: self.cfg.device_id.clone(),

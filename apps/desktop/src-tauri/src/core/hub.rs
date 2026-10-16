@@ -80,6 +80,8 @@ struct State {
 struct Entry {
     commands: mpsc::UnboundedSender<Command>,
     transport: Transport,
+    /// dispositivo del hello, desde que llega (también durante la regla de inicio)
+    device_id: Option<String>,
     /// dispositivo y orden de conexión, una vez completado el saludo
     peer: Option<(String, u64)>,
 }
@@ -98,8 +100,11 @@ impl SessionHost for Inner {
     /// Se llama con el hello, antes de la regla de inicio. Si el dispositivo ya tenía sesión (p. ej.
     /// TCP medio abierto), lo último "enviado" por ella puede no haber llegado: se olvida la
     /// sincronía para que la regla reenvíe el texto actual (un duplicado es inofensivo).
-    fn clip_sync_for(&self, device_id: &str) -> Arc<Mutex<ClipboardSync>> {
+    fn clip_sync_for(&self, session_id: u64, device_id: &str) -> Arc<Mutex<ClipboardSync>> {
         let mut st = lock(&self.state);
+        if let Some(e) = st.sessions.get_mut(&session_id) {
+            e.device_id = Some(device_id.to_string());
+        }
         let reconnect = st
             .sessions
             .values()
@@ -163,8 +168,14 @@ impl SessionHost for Inner {
                 else {
                     return; // solo se avisa de la desconexión de quien llegó a conectarse
                 };
-                // el enlace cayó: lo último escrito puede no haber llegado al móvil
-                if reason == "link_closed" || reason == "heartbeat_timeout" {
+                // el enlace cayó: lo último escrito puede no haber llegado al móvil. Si ya hay otra
+                // sesión del dispositivo (aunque esté saludando), su hello ya lo restableció y lo
+                // que haya marcado desde entonces es válido: no se toca.
+                let otra = st
+                    .sessions
+                    .values()
+                    .any(|e| e.device_id.as_deref() == Some(device_id.as_str()));
+                if (reason == "link_closed" || reason == "heartbeat_timeout") && !otra {
                     if let Some(sync) = st.syncs.get(&device_id) {
                         *lock(sync) = ClipboardSync::new(None);
                     }
@@ -238,6 +249,7 @@ impl Hub {
             Entry {
                 commands: tx,
                 transport,
+                device_id: None,
                 peer: None,
             },
         );
