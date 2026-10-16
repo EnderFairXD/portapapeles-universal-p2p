@@ -14,7 +14,7 @@ export function encodeFrame(payload: Uint8Array): Uint8Array {
 
 /** Reensambla tramas a partir de un flujo de bytes troceado de forma arbitraria. */
 export class FrameDecoder {
-  private buf = new Uint8Array(0);
+  private buf: Uint8Array = new Uint8Array(0);
 
   push(chunk: Uint8Array): Uint8Array[] {
     if (this.buf.length === 0) {
