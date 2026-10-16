@@ -1,22 +1,123 @@
+// Solo conecta eventos y comandos de Tauri con `render`; no pinta nada por sí mismo.
+
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open } from "@tauri-apps/plugin-dialog";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { render } from "./render";
+import type { UiState } from "./types";
 
-let greetInputEl: HTMLInputElement | null;
-let greetMsgEl: HTMLElement | null;
+const NO_PEER_TEXT = "Conecta el móvil para enviar";
 
-async function greet() {
-  if (greetMsgEl && greetInputEl) {
-    // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-    greetMsgEl.textContent = await invoke("greet", {
-      name: greetInputEl.value,
-    });
+/** Estado inicial: la ventana se ve completa aunque el backend aún no haya contestado. */
+const EMPTY_STATE: UiState = { pcName: "", peers: [], history: [], transfers: [], clipboardError: null, clipNotice: null };
+
+const app = document.getElementById("app")!;
+const toastEl = document.getElementById("toast")!;
+let state: UiState = EMPTY_STATE;
+
+function apply(next: UiState): void {
+  state = next;
+  render(app, next);
+}
+
+let toastTimer: number | undefined;
+function toast(message: string): void {
+  toastEl.textContent = message;
+  toastEl.classList.add("show");
+  window.clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), 1800);
+}
+
+/** Los errores de `send_files` llegan como código; el resto (arboard, etc.) ya viene en texto. */
+function errorMessage(e: unknown): string {
+  const code = e instanceof Error ? e.message : String(e);
+  if (code === "no_peer") return NO_PEER_TEXT;
+  if (code === "read_error") return "No se pudo leer el archivo";
+  return code;
+}
+
+async function sendFiles(paths: string[]): Promise<void> {
+  if (paths.length === 0) return;
+  if (state.peers.length === 0) {
+    toast(NO_PEER_TEXT);
+    return;
+  }
+  try {
+    await invoke("send_files", { paths });
+  } catch (e) {
+    toast(errorMessage(e));
   }
 }
 
-window.addEventListener("DOMContentLoaded", () => {
-  greetInputEl = document.querySelector("#greet-input");
-  greetMsgEl = document.querySelector("#greet-msg");
-  document.querySelector("#greet-form")?.addEventListener("submit", (e) => {
-    e.preventDefault();
-    greet();
-  });
+async function pickFiles(): Promise<void> {
+  const picked = await open({ multiple: true });
+  const paths = picked == null ? [] : Array.isArray(picked) ? picked : [picked];
+  await sendFiles(paths);
+}
+
+async function onAction(action: string, el: HTMLElement): Promise<void> {
+  const item = state.history.find((h) => String(h.id) === el.dataset.historyId);
+  try {
+    switch (action) {
+      case "pick-files":
+        await pickFiles();
+        break;
+      case "cancel":
+        await invoke("cancel_transfer", { transferId: el.dataset.transferId });
+        break;
+      case "copy":
+        if (item?.text != null) {
+          await invoke("copy_text", { text: item.text });
+          toast("Copiado");
+        }
+        break;
+      case "reveal":
+        if (item?.location) await revealItemInDir(item.location);
+        break;
+    }
+  } catch (e) {
+    toast(errorMessage(e));
+  }
+}
+
+// Un solo oyente: render reutiliza los botones, así que sobrevive a cada pintado.
+app.addEventListener("click", (ev) => {
+  if (!(ev.target instanceof Element)) return;
+  const el = ev.target.closest<HTMLElement>("[data-action]");
+  if (!el || (el instanceof HTMLButtonElement && el.disabled)) return;
+  void onAction(el.dataset.action!, el);
 });
+
+async function watchDrops(): Promise<void> {
+  await getCurrentWebview().onDragDropEvent((event) => {
+    const zone = app.querySelector(".drop");
+    const enabled = state.peers.length > 0;
+    const p = event.payload;
+    if (p.type === "enter" || p.type === "over") {
+      zone?.classList.toggle("is-over", enabled);
+    } else {
+      zone?.classList.remove("is-over");
+      if (p.type === "drop") void sendFiles(p.paths);
+    }
+  });
+}
+
+async function main(): Promise<void> {
+  render(app, EMPTY_STATE);
+
+  // Primero el oyente y después `get_state`: no hay evento inicial, y si llega
+  // uno mientras se pide el estado, el evento es más reciente y gana.
+  let gotEvent = false;
+  await listen<UiState>("ui-state", (e) => {
+    gotEvent = true;
+    apply(e.payload);
+  });
+  const initial = await invoke<UiState>("get_state");
+  if (!gotEvent) apply(initial);
+
+  await watchDrops();
+}
+
+main().catch((e) => console.error("ClipSync: no se pudo iniciar la interfaz", e));

@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test": "vitest run --environment happy-dom"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -16,7 +17,9 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
+    "happy-dom": "^21.0.3",
     "typescript": "~6.0.3",
-    "vite": "^8.0.16"
+    "vite": "^8.0.16",
+    "vitest": "^5.0.5"
   }
 }
