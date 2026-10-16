@@ -1,3 +1,6 @@
+// TODO(Tarea 8): quitar cuando el Hub use el módulo
+#[allow(dead_code)]
+mod core;
 mod discovery;
 // TODO(Tarea 10): quitar cuando el Hub use el módulo
 #[allow(dead_code)]
