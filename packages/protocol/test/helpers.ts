@@ -12,19 +12,33 @@ import {
   type Timers,
 } from '../src/index';
 
-/** Dos extremos de un enlace en memoria: entrega asíncrona y cerrar uno cierra el otro. */
+/**
+ * Dos extremos de un enlace en memoria: entrega asíncrona y cerrar uno cierra el otro.
+ * Como en TCP, lo escrito antes de close() llega antes del aviso de cierre.
+ */
 export function linkPair(): [Link, Link] {
-  type End = { data: ((b: Uint8Array) => void)[]; close: ((e?: Error) => void)[]; closed: boolean };
+  type End = {
+    data: ((b: Uint8Array) => void)[];
+    close: ((e?: Error) => void)[];
+    /** ya no admite escrituras */
+    closed: boolean;
+    /** ya se avisó del cierre: no recibe nada más */
+    gone: boolean;
+  };
   const ends: [End, End] = [
-    { data: [], close: [], closed: false },
-    { data: [], close: [], closed: false },
+    { data: [], close: [], closed: false, gone: false },
+    { data: [], close: [], closed: false, gone: false },
   ];
 
   const closeBoth = () => {
     for (const end of ends) {
       if (end.closed) continue;
       end.closed = true;
-      queueMicrotask(() => end.close.forEach((cb) => cb()));
+      // las microtareas van en orden: las entregas pendientes salen antes que el aviso
+      queueMicrotask(() => {
+        end.gone = true;
+        end.close.forEach((cb) => cb());
+      });
     }
   };
 
@@ -33,7 +47,7 @@ export function linkPair(): [Link, Link] {
       if (me.closed) throw new Error('enlace cerrado');
       const copy = bytes.slice();
       queueMicrotask(() => {
-        if (!other.closed) other.data.forEach((cb) => cb(copy));
+        if (!other.gone) other.data.forEach((cb) => cb(copy));
       });
     },
     close: closeBoth,

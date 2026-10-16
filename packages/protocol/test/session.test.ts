@@ -40,7 +40,8 @@ function makeSession(link: Link, side: Side) {
     getLocalClip: async () => side.local ?? null,
     openSink: async (meta) => memorySink(meta.name),
     newTransferId: newId,
-    timers: side.timers,
+    // sin temporizadores reales: ningún test deja un intervalo vivo
+    timers: side.timers ?? fakeTimers(),
   };
   const session = new Session(link, opts);
   const ev = { ready: [] as PeerInfo[], clip: [] as string[], superseded: [] as string[], closed: [] as string[] };
@@ -74,6 +75,18 @@ async function clientAgainstRaw(opts: { answerHello?: boolean; answerPings?: boo
   await c.session.start();
   await flush();
   return { c, raw, timers };
+}
+
+/** Enlace que lanza a partir de la escritura número `ok + 1`. */
+function failAfter(link: Link, ok: number): Link {
+  let n = 0;
+  return {
+    ...link,
+    write(bytes) {
+      if (++n > ok) throw new Error('enlace roto');
+      link.write(bytes);
+    },
+  };
 }
 
 /** Servidor de sesión real contra un cliente «a mano». */
@@ -234,6 +247,37 @@ describe('regla de inicio', () => {
     expect(pc.s.sync.lastSyncedHash).toBeNull();
   });
 
+  test('inicio: si falla el envío del clip del cliente, no emite ready tras closed', async () => {
+    const [a, b] = linkPair();
+    const c = makeSession(failAfter(a, 1), { role: 'client', local: 'móvil' }); // pasa el hello, falla el clip
+    const s = makeSession(b, { role: 'server' });
+    await Promise.all([s.session.start(), c.session.start()]);
+    await flush();
+    expect(c.ev.closed).toEqual(['link_closed']);
+    expect(c.ev.ready).toEqual([]);
+  });
+
+  test('inicio: si falla el envío del clip del servidor, no emite ready tras closed', async () => {
+    const [a, b] = linkPair();
+    const c = makeSession(a, { role: 'client' });
+    const s = makeSession(failAfter(b, 1), { role: 'server', local: 'pc' });
+    await Promise.all([s.session.start(), c.session.start()]);
+    await flush();
+    expect(s.ev.closed).toEqual(['link_closed']);
+    expect(s.ev.ready).toEqual([]);
+  });
+
+  test('inicio: si la app cierra en ready, no se emite localClipSuperseded', async () => {
+    const [a, b] = linkPair();
+    const c = makeSession(a, { role: 'client', local: 'móvil' });
+    const s = makeSession(b, { role: 'server', local: 'pc' });
+    s.session.on('ready', () => s.session.close());
+    await Promise.all([s.session.start(), c.session.start()]);
+    await flush();
+    expect(s.ev.closed).toEqual(['closed']);
+    expect(s.ev.superseded).toEqual([]);
+  });
+
   test('inicio: nada cambió desde la última sincronización → nadie envía', async () => {
     const h = sha256Hex('igual');
     const { c, s } = await connect(
@@ -335,6 +379,15 @@ describe('errores y cierre', () => {
     expect(c.ev.closed).toEqual(['closed']);
     expect(s.ev.closed).toEqual(['link_closed']);
     expect(() => c.session.sendClip('hola')).toThrow();
+  });
+
+  test('lo enviado justo antes de close() llega y se procesa antes del cierre', async () => {
+    const { c, s } = await connect();
+    expect(c.session.sendClip('adiós')).toBe('send');
+    c.session.close();
+    await flush();
+    expect(s.ev.clip).toEqual(['adiós']);
+    expect(s.ev.closed).toEqual(['link_closed']);
   });
 
   test('on() devuelve una función para darse de baja', async () => {
