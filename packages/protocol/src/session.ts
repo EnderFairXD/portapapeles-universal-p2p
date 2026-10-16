@@ -1,14 +1,28 @@
 import { ClipboardSync, type ClipDecision } from './clipSync';
-import { HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES, PROTOCOL_VERSION } from './constants';
+import {
+  FILE_ACK_EVERY_BYTES,
+  FILE_CHUNK_BYTES,
+  FILE_WINDOW_BYTES,
+  HEARTBEAT_INTERVAL_MS,
+  HEARTBEAT_TIMEOUT_MS,
+  MAX_CLIP_BYTES,
+  PROTOCOL_VERSION,
+} from './constants';
 import { FrameDecoder, encodeFrame } from './framing';
-import { sha256Hex } from './hash';
+import { createSha256, sha256Hex } from './hash';
 import {
   MessageDecoder,
   ProtocolError,
   encodeControl,
+  encodeFileData,
   type ClipMsg,
   type ControlMessage,
   type DecodedMessage,
+  type FileAckMsg,
+  type FileCancelMsg,
+  type FileEndMsg,
+  type FileResultMsg,
+  type FileStartMsg,
   type HelloMsg,
 } from './messages';
 
@@ -48,7 +62,10 @@ export interface FileSink {
   write(bytes: Uint8Array): Promise<void>;
   /** Cierra el archivo y devuelve dónde quedó guardado. */
   finish(): Promise<string>;
-  /** Descarta el parcial. */
+  /**
+   * Descarta el parcial. La sesión nunca lo llama a la vez que otra operación del sink, pero
+   * puede llamarlo después de finish() si la sesión cae antes de confirmar: entonces borra el archivo.
+   */
   abort(): Promise<void>;
 }
 
@@ -95,6 +112,38 @@ export type SessionEvents = {
 
 type Listeners = { [E in keyof SessionEvents]: SessionEvents[E][] };
 
+/** Motivo de file_cancel cuando lo pide el usuario; cualquier otro motivo es un fallo. */
+const CANCEL_REASON = 'cancelled';
+
+/** Archivo saliente: en cola o activo (solo uno activo a la vez). */
+interface OutTransfer {
+  id: string;
+  src: FileSource;
+  sent: number;
+  acked: number;
+  /** file_end enviado: ya solo falta file_result y no se puede cancelar */
+  endSent: boolean;
+  ended: boolean;
+  /** despierta al emisor (ack, resultado o fin) */
+  wake: (() => void) | null;
+}
+
+/** Archivo entrante activo. */
+interface InTransfer {
+  id: string;
+  meta: FileMeta;
+  received: number;
+  hash: ReturnType<typeof createSha256>;
+  sink: FileSink | null;
+  /** cadena de operaciones del sink, para no solaparlas nunca */
+  io: Promise<unknown>;
+  /** file_end en proceso: ya no se puede cancelar */
+  ending: boolean;
+  ended: boolean;
+}
+
+const ignore = () => {};
+
 const defaultTimers: Timers = {
   setInterval: (cb, ms) => setInterval(cb, ms),
   clearInterval: (h) => clearInterval(h as ReturnType<typeof setInterval>),
@@ -123,6 +172,12 @@ export class Session {
   private heartbeat: unknown = null;
   private lastRx = 0;
 
+  private outQueue: OutTransfer[] = [];
+  private out: OutTransfer | null = null;
+  private inc: InTransfer | null = null;
+  /** transferId entrantes ya terminados: sus datos rezagados se descartan */
+  private readonly endedIn = new Set<string>();
+
   constructor(
     private readonly link: Link,
     private readonly opts: SessionOptions,
@@ -148,7 +203,8 @@ export class Session {
     this.started = true;
 
     this.link.onData((bytes) => this.onData(bytes));
-    this.link.onClose(() => this.close('link_closed'));
+    // tras procesar lo que ya llegó, como haría un bucle de lectura sobre TCP
+    this.link.onClose(() => void this.enqueue(() => this.close('link_closed')));
     // el plazo del latido cuenta desde ya, también durante el saludo
     this.lastRx = this.timers.now();
     this.heartbeat = this.timers.setInterval(() => this.tick(), HEARTBEAT_INTERVAL_MS);
@@ -166,12 +222,49 @@ export class Session {
     return this.pushClip(text);
   }
 
-  sendFile(_src: FileSource): string {
-    throw new Error('not implemented');
+  /**
+   * Pone un archivo en la cola de salida y devuelve su transferId. Se emite 'queued' al momento;
+   * si no hay otro en curso, también 'active'. Lanza si la sesión no está lista o ya se cerró.
+   */
+  sendFile(src: FileSource): string {
+    if (this.closed || !this.ready) throw new Error('La sesión no está lista');
+    if (!Number.isSafeInteger(src.size) || src.size < 0) throw new RangeError('Tamaño de archivo inválido');
+    const t: OutTransfer = {
+      id: this.opts.newTransferId(),
+      src,
+      sent: 0,
+      acked: 0,
+      endSent: false,
+      ended: false,
+      wake: null,
+    };
+    this.outQueue.push(t);
+    this.emitOut(t, 'queued');
+    this.pumpOut();
+    return t.id;
   }
 
-  cancelTransfer(_transferId: string): void {
-    throw new Error('not implemented');
+  /** Cancela un archivo en cola o en curso, en cualquier sentido; si no existe o ya acabó, no hace nada. */
+  cancelTransfer(transferId: string): void {
+    if (this.closed) return;
+    const i = this.outQueue.findIndex((t) => t.id === transferId);
+    if (i >= 0) {
+      // aún no empezó: el otro lado no sabe nada de él
+      const [t] = this.outQueue.splice(i, 1);
+      t.ended = true;
+      this.emitOut(t, 'cancelled');
+      void t.src.close().catch(ignore);
+      return;
+    }
+    const out = this.out;
+    if (out && out.id === transferId && !out.endSent) {
+      this.endOut(out, 'cancelled', undefined, CANCEL_REASON);
+      return;
+    }
+    const inc = this.inc;
+    if (inc && inc.id === transferId && !inc.ending) {
+      this.endIn(inc, 'cancelled', { cancel: CANCEL_REASON, abort: true });
+    }
   }
 
   close(reason = 'closed'): void {
@@ -183,6 +276,14 @@ export class Session {
     } catch {
       // el enlace ya estaba cerrado
     }
+    // las transferencias terminan antes de avisar del cierre
+    if (this.out) this.endOut(this.out, 'failed', reason);
+    for (const t of this.outQueue.splice(0)) {
+      t.ended = true;
+      this.emitOut(t, 'failed', reason);
+      void t.src.close().catch(ignore);
+    }
+    if (this.inc) this.endIn(this.inc, 'failed', { error: reason, abort: true });
     this.emit('closed', reason);
   }
 
@@ -259,6 +360,7 @@ export class Session {
     const text = this.startClip;
     this.startClip = null;
     if (text !== null) this.pushClip(text); // antes de ready, igual que el servidor
+    if (this.closed) return; // falló la escritura del clip
     this.becomeReady(msg);
   }
 
@@ -280,7 +382,9 @@ export class Session {
         superseded = local;
       }
     }
+    if (this.closed) return; // falló la escritura del clip
     this.becomeReady(msg);
+    if (this.closed) return; // la app cerró desde ready
     if (superseded !== null) this.emit('localClipSuperseded', superseded);
   }
 
@@ -327,14 +431,257 @@ export class Session {
     this.emit('clip', msg.text);
   }
 
-  // --- archivos (Tarea 5) ---
+  // --- archivos: control ---
 
   private onFileControl(msg: ControlMessage): void | Promise<void> {
-    throw new ProtocolError(`'${msg.kind}' aún no está soportado`);
+    switch (msg.kind) {
+      case 'file_start':
+        return this.onFileStart(msg);
+      case 'file_end':
+        return this.onFileEnd(msg);
+      case 'file_ack':
+        return this.onFileAck(msg);
+      case 'file_result':
+        return this.onFileResult(msg);
+      case 'file_cancel':
+        return this.onFileCancel(msg);
+      default:
+        throw new ProtocolError(`'${msg.kind}' inesperado`);
+    }
   }
 
-  private onFileData(_transferId: string, _bytes: Uint8Array): void | Promise<void> {
-    throw new ProtocolError('datos de archivo aún no soportados');
+  /** Un file_cancel del otro lado: 'cancelled' si lo pidió el usuario; si no, fallo con ese motivo. */
+  private onFileCancel(msg: FileCancelMsg): void {
+    const cancelled = msg.reason === CANCEL_REASON;
+    const state = cancelled ? 'cancelled' : 'failed';
+    const error = cancelled ? undefined : msg.reason;
+    const out = this.out;
+    if (out && out.id === msg.transferId && !out.ended) {
+      this.endOut(out, state, error);
+      return;
+    }
+    const inc = this.inc;
+    if (inc && inc.id === msg.transferId) this.endIn(inc, state, { error, abort: true });
+    // si no, ya terminó aquí (los dos cancelaron a la vez): se ignora
+  }
+
+  // --- archivos: emisor ---
+
+  private pumpOut(): void {
+    if (this.closed || this.out) return;
+    const t = this.outQueue.shift();
+    if (!t) return;
+    this.out = t;
+    void this.runOut(t)
+      .catch(() => this.endOut(t, 'failed', 'internal_error', 'internal_error'))
+      .then(() => t.src.close())
+      .catch(ignore)
+      .then(() => {
+        this.out = null;
+        this.pumpOut();
+      });
+  }
+
+  private async runOut(t: OutTransfer): Promise<void> {
+    const { name, size, mime } = t.src;
+    this.emitOut(t, 'active');
+    this.send({ kind: 'file_start', transferId: t.id, name, size, mime });
+    const hash = createSha256();
+    for (;;) {
+      let chunk: Uint8Array;
+      try {
+        chunk = await t.src.read(FILE_CHUNK_BYTES);
+      } catch {
+        this.endOut(t, 'failed', 'read_error', 'read_error');
+        return;
+      }
+      if (t.ended) return;
+      if (chunk.length === 0) break;
+      if (t.sent + chunk.length > size) {
+        // el archivo creció mientras se enviaba: nunca se manda más de lo anunciado
+        this.endOut(t, 'failed', 'size_mismatch', 'size_mismatch');
+        return;
+      }
+      // el trozo sale solo si cabe entero en la ventana (como mucho uno leído de más en memoria)
+      while (!t.ended && t.sent - t.acked + chunk.length > FILE_WINDOW_BYTES) await this.waitOut(t);
+      if (t.ended) return;
+      hash.update(chunk);
+      t.sent += chunk.length;
+      this.write([encodeFileData(t.id, chunk)]);
+    }
+    if (t.sent !== size) {
+      this.endOut(t, 'failed', 'size_mismatch', 'size_mismatch');
+      return;
+    }
+    t.endSent = true;
+    this.send({ kind: 'file_end', transferId: t.id, sha256: hash.digestHex() });
+    while (!t.ended) await this.waitOut(t); // hasta file_result, file_cancel o cierre
+  }
+
+  private waitOut(t: OutTransfer): Promise<void> {
+    return new Promise((resolve) => (t.wake = resolve));
+  }
+
+  private onFileAck(msg: FileAckMsg): void {
+    const t = this.out;
+    if (!t || t.id !== msg.transferId || t.ended) return; // rezagado
+    if (msg.received > t.sent) throw new ProtocolError('file_ack de más bytes de los enviados');
+    if (msg.received <= t.acked) return;
+    const before = t.acked;
+    t.acked = msg.received;
+    if (crossesMiB(before, t.acked)) this.emitOut(t, 'active');
+    this.wakeOut(t);
+  }
+
+  private onFileResult(msg: FileResultMsg): void {
+    const t = this.out;
+    if (!t || t.id !== msg.transferId || t.ended) return;
+    if (!t.endSent) throw new ProtocolError('file_result antes de file_end');
+    if (msg.ok) this.endOut(t, 'done');
+    else this.endOut(t, 'failed', msg.error ?? 'remote_error');
+  }
+
+  /** Termina el saliente activo; con `cancel`, avisa al otro lado con ese motivo. El emisor cierra el origen. */
+  private endOut(t: OutTransfer, state: TransferState, error?: string, cancel?: string): void {
+    if (t.ended) return;
+    t.ended = true;
+    // se emite antes de escribir: si la escritura falla, 'closed' llega después
+    this.emitOut(t, state, error);
+    if (cancel) this.send({ kind: 'file_cancel', transferId: t.id, reason: cancel });
+    this.wakeOut(t);
+  }
+
+  private wakeOut(t: OutTransfer): void {
+    const wake = t.wake;
+    t.wake = null;
+    wake?.();
+  }
+
+  private emitOut(t: OutTransfer, state: TransferState, error?: string): void {
+    const bytes = state === 'done' ? t.src.size : t.acked;
+    this.emitTransfer({ transferId: t.id, direction: 'out', name: t.src.name, size: t.src.size, bytes, state }, error);
+  }
+
+  // --- archivos: receptor ---
+
+  private async onFileStart(msg: FileStartMsg): Promise<void> {
+    if (this.inc) throw new ProtocolError('file_start con otro archivo entrante en curso');
+    if (this.endedIn.has(msg.transferId)) throw new ProtocolError('transferId repetido');
+    const meta: FileMeta = { name: msg.name, size: msg.size, mime: msg.mime };
+    const t: InTransfer = {
+      id: msg.transferId,
+      meta,
+      received: 0,
+      hash: createSha256(),
+      sink: null,
+      io: Promise.resolve(),
+      ending: false,
+      ended: false,
+    };
+    this.inc = t;
+    t.io = this.opts.openSink(meta).then((sink) => {
+      t.sink = sink;
+    });
+    try {
+      await t.io;
+    } catch {
+      this.endIn(t, 'failed', { error: 'write_error', cancel: 'write_error' });
+      return;
+    }
+    if (t.ended) return; // cancelado o cerrado mientras se abría; endIn ya encadenó abort()
+    this.emitIn(t, 'active');
+  }
+
+  private async onFileData(transferId: string, bytes: Uint8Array): Promise<void> {
+    const t = this.inc;
+    if (!t || t.id !== transferId) {
+      if (this.endedIn.has(transferId)) return; // en vuelo cuando terminó: se descarta
+      throw new ProtocolError('datos de archivo para un transferId desconocido');
+    }
+    if (t.ending) throw new ProtocolError('datos de archivo después de file_end');
+    if (t.received + bytes.length > t.meta.size) throw new ProtocolError('más datos de archivo de los anunciados');
+    const sink = t.sink!;
+    t.io = t.io.then(() => sink.write(bytes));
+    try {
+      await t.io;
+    } catch {
+      this.endIn(t, 'failed', { error: 'write_error', cancel: 'write_error', abort: true });
+      return;
+    }
+    if (t.ended) return;
+    const before = t.received;
+    t.received += bytes.length;
+    t.hash.update(bytes);
+    if (crossesMiB(before, t.received)) {
+      this.send({ kind: 'file_ack', transferId: t.id, received: t.received });
+      if (t.ended) return; // la escritura falló y cerró la sesión
+      this.emitIn(t, 'active');
+    }
+  }
+
+  private async onFileEnd(msg: FileEndMsg): Promise<void> {
+    const t = this.inc;
+    if (!t || t.id !== msg.transferId) {
+      if (this.endedIn.has(msg.transferId)) return;
+      throw new ProtocolError('file_end para un transferId desconocido');
+    }
+    if (t.received !== t.meta.size) throw new ProtocolError('file_end con un tamaño distinto del anunciado');
+    t.ending = true;
+    // ack final: el emisor de un archivo pequeño no se queda esperando a la ventana
+    this.send({ kind: 'file_ack', transferId: t.id, received: t.received });
+    if (t.ended) return; // la escritura falló y cerró la sesión
+    if (t.hash.digestHex() !== msg.sha256) {
+      this.send({ kind: 'file_result', transferId: t.id, ok: false, error: 'checksum_mismatch' });
+      this.endIn(t, 'failed', { error: 'checksum_mismatch', abort: true });
+      return;
+    }
+    const sink = t.sink!;
+    const finishing = t.io.then(() => sink.finish());
+    t.io = finishing;
+    let location: string;
+    try {
+      location = await finishing;
+    } catch {
+      if (t.ended) return;
+      this.send({ kind: 'file_result', transferId: t.id, ok: false, error: 'write_error' });
+      this.endIn(t, 'failed', { error: 'write_error', abort: true });
+      return;
+    }
+    if (t.ended) return; // la sesión cayó durante finish(): endIn ya encadenó abort()
+    this.send({ kind: 'file_result', transferId: t.id, ok: true });
+    this.endIn(t, 'done', { location });
+  }
+
+  /** Termina el entrante activo; `abort` descarta el parcial tras la operación del sink en curso. */
+  private endIn(
+    t: InTransfer,
+    state: TransferState,
+    o: { error?: string; location?: string; cancel?: string; abort?: boolean } = {},
+  ): void {
+    if (t.ended) return;
+    t.ended = true;
+    if (this.inc === t) this.inc = null;
+    this.endedIn.add(t.id);
+    if (o.abort) {
+      t.io = t.io
+        .catch(ignore)
+        .then(() => t.sink?.abort())
+        .catch(ignore);
+    }
+    // se emite antes de escribir: si la escritura falla, 'closed' llega después
+    this.emitIn(t, state, o.error, o.location);
+    if (o.cancel) this.send({ kind: 'file_cancel', transferId: t.id, reason: o.cancel });
+  }
+
+  private emitIn(t: InTransfer, state: TransferState, error?: string, location?: string): void {
+    const { name, size } = t.meta;
+    this.emitTransfer({ transferId: t.id, direction: 'in', name, size, bytes: t.received, state }, error, location);
+  }
+
+  private emitTransfer(u: TransferUpdate, error?: string, location?: string): void {
+    if (error !== undefined) u.error = error;
+    if (location !== undefined) u.location = location;
+    this.emit('transfer', u);
   }
 
   // --- latido ---
@@ -372,4 +719,9 @@ export class Session {
       }
     }
   }
+}
+
+/** true si `after` alcanza otro múltiplo de 1 MiB que `before` no alcanzaba. */
+function crossesMiB(before: number, after: number): boolean {
+  return Math.floor(after / FILE_ACK_EVERY_BYTES) > Math.floor(before / FILE_ACK_EVERY_BYTES);
 }
