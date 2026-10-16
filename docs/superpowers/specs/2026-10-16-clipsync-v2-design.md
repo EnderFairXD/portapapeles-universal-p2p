@@ -119,17 +119,23 @@ Tras el handshake, cada trama cifrada contiene 1 byte de tipo y el contenido:
 
 | Tipo | Contenido | Dirección |
 |---|---|---|
-| `0x01` JSON | mensaje de control (abajo) | ambas |
+| `0x01` JSON | mensaje de control (abajo), último o único fragmento | ambas |
+| `0x03` JSON (continúa) | fragmento de un mensaje de control que sigue en la próxima trama | ambas |
 | `0x02` datos de archivo | `transferId` (16 bytes) + bytes crudos (≤ 48 KiB) | emisor → receptor |
+
+Un mensaje de control que no cabe en una trama (p. ej. un texto de 1 MiB) se trocea en bytes:
+tramas `0x03` seguidas de una `0x01` final; el receptor concatena y decodifica el JSON al final
+(máximo 2 MiB reensamblados).
 
 Mensajes de control (`kind`):
 
 | `kind` | Campos | Uso |
 |---|---|---|
 | `clip` | `id`, `text` (≤ 1 MiB UTF-8), `hash` | nuevo texto copiado |
-| `file_start` | `transferId`, `name`, `size`, `mime`, `sha256` | empieza un archivo |
+| `hello` | `v`, `deviceId`, `deviceName`, `willSendClip?` | solo en la fase 1, en claro; desde la fase 2 viaja como carga del handshake Noise |
+| `file_start` | `transferId`, `name`, `size`, `mime` | empieza un archivo |
 | `file_ack` | `transferId`, `received` | el receptor confirma cada 1 MiB |
-| `file_end` | `transferId` | el emisor terminó de enviar |
+| `file_end` | `transferId`, `sha256` | el emisor terminó; el hash se calcula mientras se envía, sin leer el archivo dos veces |
 | `file_result` | `transferId`, `ok`, `error?` | el receptor verificó el SHA-256 y guardó (o no) |
 | `file_cancel` | `transferId`, `reason` | cualquiera de los dos cancela |
 | `ping` / `pong` | — | latido cada 10 s; sin respuesta en 30 s → sesión caída |
