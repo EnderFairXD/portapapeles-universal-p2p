@@ -3,11 +3,7 @@
 
 mod messages;
 
-// TODO(Tarea 10): quitar cuando el Hub use el módulo
-#[allow(unused_imports)]
-pub use messages::{
-    encode_control, encode_file_data, ControlMessage, Decoded, MessageDecoder, ProtocolError,
-};
+pub use messages::{encode_control, encode_file_data, ControlMessage, Decoded, MessageDecoder};
 
 use tokio_util::codec::LengthDelimitedCodec;
 
@@ -33,7 +29,10 @@ pub const MAX_CONTROL_BYTES: usize = 2_097_152;
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const HEARTBEAT_TIMEOUT_MS: u64 = 30_000;
+// Solo los usa el móvil; se mantienen como espejo de las constantes de TS.
+#[allow(dead_code)]
 pub const RECONNECT_INTERVAL_MS: u64 = 5_000;
+#[allow(dead_code)]
 pub const CONNECT_TIMEOUT_MS: u64 = 2_000;
 
 /// Elementos del historial de portapapeles.

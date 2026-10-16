@@ -1,52 +1,126 @@
 // Público para que el ejemplo `headless` (Tarea 9) y la app usen el Hub.
 pub mod core;
+mod app;
 mod discovery;
-// TODO(Tarea 10): quitar cuando el Hub use el módulo
-#[allow(dead_code)]
 mod protocol;
 mod usb;
 
 use std::io::Write;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
+use tauri::Manager;
+
+use app::Ctx;
+use core::{Hub, HubConfig};
 use protocol::DEFAULT_TCP_PORT;
 
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
+fn log(msg: &str) {
+    // writeln no hace panic si stderr no está disponible (panic = "abort")
+    let _ = writeln!(std::io::stderr(), "{msg}");
+}
+
+/// UUID guardado en `app_data_dir/device_id`; si no se puede guardar, vale para esta ejecución.
+fn load_device_id(dir: Option<&Path>) -> String {
+    let Some(dir) = dir else {
+        log("[App] sin carpeta de datos: device_id temporal");
+        return uuid::Uuid::new_v4().to_string();
+    };
+    let path = dir.join("device_id");
+    if let Ok(s) = std::fs::read_to_string(&path) {
+        if let Ok(id) = uuid::Uuid::parse_str(s.trim()) {
+            return id.to_string();
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    if let Err(e) = std::fs::create_dir_all(dir).and_then(|_| std::fs::write(&path, &id)) {
+        log(&format!(
+            "[App] no se pudo guardar {}: {e}",
+            path.display()
+        ));
+    }
+    id
+}
+
+fn pc_name() -> String {
+    hostname::get()
+        .map(|h| h.to_string_lossy().into_owned())
+        .ok()
+        .filter(|h| !h.is_empty())
+        .unwrap_or_else(|| "PC".to_string())
+}
+
+fn download_dir() -> PathBuf {
+    dirs::download_dir()
+        .or_else(dirs::home_dir)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+async fn serve(hub: Hub) {
+    let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_TCP_PORT));
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => {
+            log(&format!("[TCP] Escuchando en {addr}"));
+            hub.serve_tcp(listener).await;
+        }
+        Err(e) => log(&format!("[TCP] No se pudo escuchar en {addr}: {e}")),
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let result = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .invoke_handler(tauri::generate_handler![greet])
-        .setup(|_app| {
+        .plugin(tauri_plugin_dialog::init())
+        .invoke_handler(tauri::generate_handler![
+            app::get_state,
+            app::send_files,
+            app::cancel_transfer,
+            app::copy_text
+        ])
+        .setup(|tauri_app| {
+            let data_dir = tauri_app.path().app_data_dir().ok();
+            let local_clip = Arc::new(Mutex::new(None::<String>));
+            let local_read = local_clip.clone();
+            let pc_name = pc_name();
+            let (hub, events) = Hub::new(HubConfig {
+                device_id: load_device_id(data_dir.as_deref()),
+                pc_name: pc_name.clone(),
+                download_dir: download_dir(),
+                // solo lee la copia en memoria: nunca toca arboard
+                local_clip: Arc::new(move || match local_read.lock() {
+                    Ok(g) => g.clone(),
+                    Err(p) => p.into_inner().clone(),
+                }),
+            });
+            let (clipboard, clipboard_worker) = app::clipboard::channel();
+            let ctx = Arc::new(Ctx::new(hub.clone(), pc_name, local_clip, clipboard));
+            tauri_app.manage(ctx.clone());
+
+            tauri::async_runtime::spawn(ctx.clone().run_emitter(tauri_app.handle().clone()));
+            tauri::async_runtime::spawn(ctx.clone().run_events(events));
+            tauri::async_runtime::spawn(serve(hub));
+
             // El ServiceDaemon debe seguir vivo mientras la app corra; Box::leak lo mantiene
-            // anunciado hasta que el proceso termine (en Fase 2 no hay un ciclo de vida más
-            // fino que gestionar).
+            // anunciado hasta que el proceso termine.
             match discovery::advertise(DEFAULT_TCP_PORT) {
                 Ok(daemon) => {
                     Box::leak(Box::new(daemon));
                 }
-                Err(err) => {
-                    // writeln no hace panic si stdout/stderr no están disponibles (panic = "abort")
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "[mDNS] No se pudo anunciar el servicio: {err}"
-                    );
-                }
+                Err(err) => log(&format!("[mDNS] No se pudo anunciar el servicio: {err}")),
             }
-
-            // El servidor TCP v2 se cablea en la Tarea 10; de momento solo mDNS y USB.
 
             // Sondeo periódico en background: detecta un móvil por USB y establece
             // `adb reverse` de la sesión. Si `adb` no está instalado, el
             // watcher lo loguea una vez y sigue reintentando sin tumbar la app.
             usb::spawn_reverse_tunnel_watcher();
 
+            clipboard_worker.spawn(ctx);
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .run(tauri::generate_context!());
+    if let Err(e) = result {
+        log(&format!("[App] Error al ejecutar la aplicación: {e}"));
+    }
 }
