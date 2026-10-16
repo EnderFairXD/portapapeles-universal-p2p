@@ -15,6 +15,7 @@
 //! idempotente — repetirlo con la misma pareja de puertos no rompe nada — así que un
 //! sondeo simple es suficiente sin necesitar detectar hotplug de verdad.
 
+use std::io::Write;
 use std::time::Duration;
 
 use tokio::process::Command;
@@ -49,7 +50,9 @@ pub async fn list_devices() -> Result<Vec<UsbDevice>, String> {
         ));
     }
 
-    Ok(parse_adb_devices_output(&String::from_utf8_lossy(&output.stdout)))
+    Ok(parse_adb_devices_output(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
 }
 
 fn parse_adb_devices_output(stdout: &str) -> Vec<UsbDevice> {
@@ -144,9 +147,10 @@ pub fn spawn_reverse_tunnel_watcher() {
 
                     match devices.first() {
                         Some(device) => {
-                            let is_new = last_tunneled_serial.as_deref() != Some(device.serial.as_str());
+                            let is_new =
+                                last_tunneled_serial.as_deref() != Some(device.serial.as_str());
                             if is_new {
-                                println!("[USB] Dispositivo detectado: {} — estableciendo túneles reverse", device.serial);
+                                let _ = writeln!(std::io::stderr(), "[USB] Dispositivo detectado: {} — estableciendo túneles reverse", device.serial);
                             }
 
                             let results = establish_all_reverse_tunnels(device).await;
@@ -154,13 +158,16 @@ pub fn spawn_reverse_tunnel_watcher() {
                             for (port, result) in &results {
                                 if let Err(err) = result {
                                     all_ok = false;
-                                    println!("[USB] No se pudo establecer el túnel en el puerto {port}: {err}");
+                                    let _ = writeln!(std::io::stderr(), "[USB] No se pudo establecer el túnel en el puerto {port}: {err}");
                                 }
                             }
 
                             if all_ok {
                                 if is_new {
-                                    println!("[USB] Túnel activo: 127.0.0.1:{DEFAULT_TCP_PORT}");
+                                    let _ = writeln!(
+                                        std::io::stderr(),
+                                        "[USB] Túnel activo: 127.0.0.1:{DEFAULT_TCP_PORT}"
+                                    );
                                 }
                                 last_tunneled_serial = Some(device.serial.clone());
                             } else {
@@ -174,7 +181,7 @@ pub fn spawn_reverse_tunnel_watcher() {
                     // Lo más común: `adb` no está instalado o no está en PATH — no es
                     // fatal, USB simplemente no está disponible en esta máquina.
                     if last_list_error.as_deref() != Some(err.as_str()) {
-                        println!("[USB] {err}");
+                        let _ = writeln!(std::io::stderr(), "[USB] {err}");
                         last_list_error = Some(err);
                     }
                     last_tunneled_serial = None;
@@ -192,10 +199,16 @@ mod tests {
 
     #[test]
     fn parses_only_authorized_devices() {
-        let sample = "List of devices attached\nABC123\tdevice\nXYZ999\tunauthorized\nQWE111\toffline\n\n";
+        let sample =
+            "List of devices attached\nABC123\tdevice\nXYZ999\tunauthorized\nQWE111\toffline\n\n";
         let devices = parse_adb_devices_output(sample);
 
-        assert_eq!(devices, vec![UsbDevice { serial: "ABC123".to_string() }]);
+        assert_eq!(
+            devices,
+            vec![UsbDevice {
+                serial: "ABC123".to_string()
+            }]
+        );
     }
 
     #[test]

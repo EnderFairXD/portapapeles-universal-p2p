@@ -6,6 +6,8 @@ mod discovery;
 mod protocol;
 mod usb;
 
+use std::io::Write;
+
 use protocol::DEFAULT_TCP_PORT;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -27,7 +29,13 @@ pub fn run() {
                 Ok(daemon) => {
                     Box::leak(Box::new(daemon));
                 }
-                Err(err) => println!("[mDNS] No se pudo anunciar el servicio: {err}"),
+                Err(err) => {
+                    // writeln no hace panic si stdout/stderr no están disponibles (panic = "abort")
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[mDNS] No se pudo anunciar el servicio: {err}"
+                    );
+                }
             }
 
             // El servidor TCP v2 se cablea en la Tarea 10; de momento solo mDNS y USB.
