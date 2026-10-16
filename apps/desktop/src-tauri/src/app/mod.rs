@@ -145,7 +145,14 @@ impl AppState {
                 self.peers.retain(|p| p.session_id != session_id)
             }
             HubEvent::ClipReceived { text, .. } => self.add_text(DIR_IN, text, now_ms),
-            HubEvent::LocalClipSuperseded { text } => self.add_text(DIR_LOCAL, text, now_ms),
+            HubEvent::LocalClipSuperseded { text } => {
+                // se emite en cada reconexión en la que gana el móvil: sin esto el mismo
+                // texto llenaría el historial
+                let newest_text = self.history.iter().find_map(|i| i.text.as_deref());
+                if newest_text != Some(text.as_str()) {
+                    self.add_text(DIR_LOCAL, text, now_ms);
+                }
+            }
             HubEvent::Transfer(u) => self.on_transfer(u, now_ms),
         }
     }
@@ -206,6 +213,14 @@ impl AppState {
         self.next_id += 1;
         self.history.push_front(item);
         self.history.truncate(MAX_HISTORY);
+    }
+
+    /// Texto copiado en el PC y entregado al Hub. Sin móvil conectado no se anota: no salió
+    /// a ningún sitio (la regla de inicio lo enviará al conectar, sin item propio).
+    pub fn add_sent_text(&mut self, text: String, now_ms: u64) {
+        if !self.peers.is_empty() {
+            self.add_text(DIR_OUT, text, now_ms);
+        }
     }
 
     pub fn add_text(&mut self, direction: &str, text: String, now_ms: u64) {
@@ -340,7 +355,7 @@ impl Ctx {
             LocalClip::Send => {
                 self.set_local(Some(text.clone()));
                 self.hub.broadcast_clip(&text);
-                lock(&self.state).add_text(DIR_OUT, text, now_ms());
+                lock(&self.state).add_sent_text(text, now_ms());
                 self.notify();
             }
         }
@@ -571,6 +586,73 @@ mod tests {
         assert!(t.iter().any(|t| t.transfer_id == "viva"));
         assert!(t.iter().any(|t| t.transfer_id == "f19"));
         assert!(!t.iter().any(|t| t.transfer_id == "f0"));
+    }
+
+    #[test]
+    fn local_clip_superseded_repetido_no_duplica() {
+        let mut s = st();
+        s.add_text(DIR_OUT, "A".into(), 1);
+        // cada reconexión en la que gana el móvil vuelve a emitir el mismo texto local
+        for i in 0..60 {
+            s.apply(HubEvent::LocalClipSuperseded { text: "A".into() }, 2 + i);
+        }
+        let h = s.snapshot(0).history;
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].direction, "out");
+    }
+
+    #[test]
+    fn local_clip_superseded_tras_el_mismo_texto_local_no_duplica() {
+        let mut s = st();
+        s.apply(HubEvent::LocalClipSuperseded { text: "A".into() }, 1);
+        s.apply(HubEvent::LocalClipSuperseded { text: "A".into() }, 2);
+        assert_eq!(s.snapshot(0).history.len(), 1);
+    }
+
+    #[test]
+    fn local_clip_superseded_con_otro_texto_si_se_anade() {
+        let mut s = st();
+        s.add_text(DIR_OUT, "A".into(), 1);
+        s.apply(HubEvent::LocalClipSuperseded { text: "B".into() }, 2);
+        let h = s.snapshot(0).history;
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].direction, "local");
+        assert_eq!(h[0].text.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn solo_se_compara_con_el_texto_mas_reciente() {
+        let mut s = st();
+        s.add_text(DIR_OUT, "A".into(), 1);
+        s.add_text(DIR_IN, "B".into(), 2);
+        s.apply(HubEvent::LocalClipSuperseded { text: "A".into() }, 3);
+        let h = s.snapshot(0).history;
+        assert_eq!(h.len(), 3);
+        assert_eq!(h[0].direction, "local");
+    }
+
+    #[test]
+    fn local_clip_superseded_ignora_archivos_al_buscar_el_ultimo_texto() {
+        let mut s = st();
+        s.add_text(DIR_OUT, "A".into(), 1);
+        let mut done = tu("t1", Direction::In, TransferState::Done, 100);
+        done.location = Some("/d/t1.bin".into());
+        s.apply(HubEvent::Transfer(done), 2);
+        s.apply(HubEvent::LocalClipSuperseded { text: "A".into() }, 3);
+        assert_eq!(s.snapshot(0).history.len(), 2);
+    }
+
+    #[test]
+    fn texto_copiado_sin_movil_no_se_anota_como_enviado() {
+        let mut s = st();
+        s.add_sent_text("A".into(), 1);
+        assert!(s.snapshot(0).history.is_empty());
+        s.apply(connected(1, "movil"), 2);
+        s.add_sent_text("B".into(), 3);
+        let h = s.snapshot(0).history;
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].direction, "out");
+        assert_eq!(h[0].text.as_deref(), Some("B"));
     }
 
     #[test]
