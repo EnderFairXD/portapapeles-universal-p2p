@@ -24,7 +24,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 arboard = "3.6.1"
 mdns-sd = "0.21.4"
-btleplug = "0.13.2"
 tokio = { version = "1.53.1", features = ["full"] }
 sha2 = "0.11.0"
 hostname = "0.4.2"
@@ -32,6 +31,9 @@ hex = "0.4.3"
 base64 = "0.23.1"
 dirs = "7.0.0"
 uuid = "1.26.1"
+tokio-util = { version = "0.7.20", features = ["codec"] }
+futures = "0.3.34"
+thiserror = "2.0.21"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
@@ -41,3 +43,7 @@ lto = true
 opt-level = 3
 panic = "abort"
 strip = true
+
+[dev-dependencies]
+bytes = "1.12.1"
+tempfile = "3.27.0"

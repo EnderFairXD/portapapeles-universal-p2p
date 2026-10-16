@@ -1,4 +1,4 @@
-//! Anuncio mDNS del servicio `_p2pclip._tcp.local.` para que el móvil nos descubra en la LAN.
+//! Anuncio mDNS del servicio `_clipsync._tcp.local.` para que el móvil nos descubra en la LAN.
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 
@@ -15,7 +15,7 @@ pub fn advertise(port: u16) -> Result<ServiceDaemon, mdns_sd::Error> {
 
     // "" + enable_addr_auto(): mdns-sd detecta y mantiene actualizadas las IPs
     // de las interfaces de red del host, sin que tengamos que enumerarlas a mano.
-    let properties = [("protocolVersion", PROTOCOL_VERSION)];
+    let properties = [("v", PROTOCOL_VERSION)];
     let service_info = ServiceInfo::new(
         MDNS_FULL_SERVICE_TYPE,
         &instance_name,

@@ -1,7 +1,7 @@
-mod bluetooth;
 mod discovery;
+// Las constantes y el protocolo v2 se consumen desde las tareas siguientes (sesión, Tarea 10).
+#[allow(dead_code, unused_imports)]
 mod protocol;
-mod transport;
 mod usb;
 
 use protocol::DEFAULT_TCP_PORT;
@@ -28,14 +28,10 @@ pub fn run() {
                 Err(err) => println!("[mDNS] No se pudo anunciar el servicio: {err}"),
             }
 
-            tauri::async_runtime::spawn(async move {
-                if let Err(err) = transport::run_server(DEFAULT_TCP_PORT).await {
-                    println!("[TCP] El servidor terminó con error: {err}");
-                }
-            });
+            // El servidor TCP v2 se cablea en la Tarea 10; de momento solo mDNS y USB.
 
             // Sondeo periódico en background: detecta un móvil por USB y establece
-            // `adb reverse` para P2P y Modo Invitado. Si `adb` no está instalado, el
+            // `adb reverse` de la sesión. Si `adb` no está instalado, el
             // watcher lo loguea una vez y sigue reintentando sin tumbar la app.
             usb::spawn_reverse_tunnel_watcher();
 
