@@ -1,0 +1,410 @@
+[
+  {
+    "name": "hello con willSendClip",
+    "framesHex": [
+      "017b226b696e64223a2268656c6c6f222c2276223a322c226465766963654964223a226465762d31222c226465766963654e616d65223a22506978656c2038222c2277696c6c53656e64436c6970223a747275657d"
+    ],
+    "expect": {
+      "kind": "hello",
+      "v": 2,
+      "deviceId": "dev-1",
+      "deviceName": "Pixel 8",
+      "willSendClip": true
+    }
+  },
+  {
+    "name": "hello sin willSendClip",
+    "framesHex": [
+      "017b226b696e64223a2268656c6c6f222c2276223a322c226465766963654964223a226465762d32222c226465766963654e616d65223a225043206465204a6176696572227d"
+    ],
+    "expect": {
+      "kind": "hello",
+      "v": 2,
+      "deviceId": "dev-2",
+      "deviceName": "PC de Javier"
+    }
+  },
+  {
+    "name": "clip simple",
+    "framesHex": [
+      "017b226b696e64223a22636c6970222c226964223a22632d31222c2274657874223a22686f6c61206d756e646f222c2268617368223a2230623839343136366433333336343335633830306265613336666632316232396561613830316135326635383463303036633439323839613064636636653266227d"
+    ],
+    "expect": {
+      "kind": "clip",
+      "id": "c-1",
+      "text": "hola mundo",
+      "hash": "0b894166d3336435c800bea36ff21b29eaa801a52f584c006c49289a0dcf6e2f"
+    }
+  },
+  {
+    "name": "clip con unicode y escapes",
+    "framesHex": [
+      "017b226b696e64223a22636c6970222c226964223a22632d32222c2274657874223a2261c3b1c3a120f09f9880205c22785c225c6e222c2268617368223a2237633164653030346238633032316333303065653137396466613533373833613339326136333236366261343161343165636664626563636633613635316638227d"
+    ],
+    "expect": {
+      "kind": "clip",
+      "id": "c-2",
+      "text": "añá 😀 \"x\"\n",
+      "hash": "7c1de004b8c021c300ee179dfa53783a392a63266ba41a41ecfdbeccf3a651f8"
+    }
+  },
+  {
+    "name": "file_start",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f7374617274222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a22666f746f2e6a7067222c2273697a65223a3132333435362c226d696d65223a22696d6167652f6a706567227d"
+    ],
+    "expect": {
+      "kind": "file_start",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "name": "foto.jpg",
+      "size": 123456,
+      "mime": "image/jpeg"
+    }
+  },
+  {
+    "name": "file_start de archivo vacío",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f7374617274222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a22766163c3ad6f2e747874222c2273697a65223a302c226d696d65223a22746578742f706c61696e227d"
+    ],
+    "expect": {
+      "kind": "file_start",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "name": "vacío.txt",
+      "size": 0,
+      "mime": "text/plain"
+    }
+  },
+  {
+    "name": "file_ack",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f61636b222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c227265636569766564223a313034383537367d"
+    ],
+    "expect": {
+      "kind": "file_ack",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "received": 1048576
+    }
+  },
+  {
+    "name": "file_end",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f656e64222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c22736861323536223a2236663935363665663436333836623863663337323637316362396564646666353438383235366566663565613566623939653130343163336532373038326266227d"
+    ],
+    "expect": {
+      "kind": "file_end",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "sha256": "6f9566ef46386b8cf372671cb9eddff5488256eff5ea5fb99e1041c3e27082bf"
+    }
+  },
+  {
+    "name": "file_result correcto",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f726573756c74222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c226f6b223a747275657d"
+    ],
+    "expect": {
+      "kind": "file_result",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "ok": true
+    }
+  },
+  {
+    "name": "file_result con error",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f726573756c74222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c226f6b223a66616c73652c226572726f72223a22686173685f6d69736d61746368227d"
+    ],
+    "expect": {
+      "kind": "file_result",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "ok": false,
+      "error": "hash_mismatch"
+    }
+  },
+  {
+    "name": "file_cancel",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f63616e63656c222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c22726561736f6e223a2275736572227d"
+    ],
+    "expect": {
+      "kind": "file_cancel",
+      "transferId": "00112233445566778899aabbccddeeff",
+      "reason": "user"
+    }
+  },
+  {
+    "name": "ping",
+    "framesHex": [
+      "017b226b696e64223a2270696e67227d"
+    ],
+    "expect": {
+      "kind": "ping"
+    }
+  },
+  {
+    "name": "pong",
+    "framesHex": [
+      "017b226b696e64223a22706f6e67227d"
+    ],
+    "expect": {
+      "kind": "pong"
+    }
+  },
+  {
+    "name": "campos desconocidos se ignoran",
+    "framesHex": [
+      "017b226b696e64223a2270696e67222c226578747261223a317d"
+    ],
+    "expect": {
+      "kind": "ping"
+    }
+  },
+  {
+    "name": "datos de archivo",
+    "framesHex": [
+      "0200112233445566778899aabbccddeeffdeadbeef"
+    ],
+    "expect": {
+      "data": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "bytesHex": "deadbeef"
+      }
+    }
+  },
+  {
+    "name": "datos de archivo sin bytes",
+    "framesHex": [
+      "02a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    ],
+    "expect": {
+      "data": {
+        "transferId": "a1b2c3d4e5f60718293a4b5c6d7e8f90",
+        "bytesHex": ""
+      }
+    }
+  },
+  {
+    "name": "clip fragmentado en 2 tramas (corte dentro de un carácter UTF-8)",
+    "framesHex": [
+      "037b226b696e64223a22636c6970222c226964223a22632d32222c2274657874223a2261c3b1c3a120f09f",
+      "019880205c22785c225c6e222c2268617368223a2237633164653030346238633032316333303065653137396466613533373833613339326136333236366261343161343165636664626563636633613635316638227d"
+    ],
+    "expect": {
+      "kind": "clip",
+      "id": "c-2",
+      "text": "añá 😀 \"x\"\n",
+      "hash": "7c1de004b8c021c300ee179dfa53783a392a63266ba41a41ecfdbeccf3a651f8"
+    }
+  },
+  {
+    "name": "clip fragmentado en 3 tramas",
+    "framesHex": [
+      "037b226b696e64223a2263",
+      "036c6970222c226964223a",
+      "0122632d31222c2274657874223a22686f6c61206d756e646f222c2268617368223a2230623839343136366433333336343335633830306265613336666632316232396561613830316135326635383463303036633439323839613064636636653266227d"
+    ],
+    "expect": {
+      "kind": "clip",
+      "id": "c-1",
+      "text": "hola mundo",
+      "hash": "0b894166d3336435c800bea36ff21b29eaa801a52f584c006c49289a0dcf6e2f"
+    }
+  },
+  {
+    "name": "JSON inválido",
+    "framesHex": [
+      "017b226b696e64223a202270696e6722"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "JSON que no es un objeto",
+    "framesHex": [
+      "015b5d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "kind desconocido",
+    "framesHex": [
+      "017b226b696e64223a226578706c6f7461227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "sin kind",
+    "framesHex": [
+      "017b2274657874223a2278227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "transferId de 31 hex",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f7374617274222c227472616e736665724964223a2230313132323333343435353636373738383939616162626363646465656666222c226e616d65223a22666f746f2e6a7067222c2273697a65223a3132333435362c226d696d65223a22696d6167652f6a706567227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "transferId en mayúsculas",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f7374617274222c227472616e736665724964223a223030313132323333343435353636373738383939414142424343444445454646222c226e616d65223a22666f746f2e6a7067222c2273697a65223a3132333435362c226d696d65223a22696d6167652f6a706567227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "hash de 63 hex",
+    "framesHex": [
+      "017b226b696e64223a22636c6970222c226964223a22632d31222c2274657874223a22686f6c61206d756e646f222c2268617368223a22643731313634326237323662303434303136323763613966626163333266356338353330666231393033636334646230323235383731373932316134383831227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "sha256 con caracteres no hex",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f656e64222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c22736861323536223a227a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a7a227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "hello con v distinta de 2",
+    "framesHex": [
+      "017b226b696e64223a2268656c6c6f222c2276223a312c226465766963654964223a226465762d31222c226465766963654e616d65223a22506978656c2038222c2277696c6c53656e64436c6970223a747275657d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "hello sin deviceName",
+    "framesHex": [
+      "017b226b696e64223a2268656c6c6f222c2276223a322c226465766963654964223a2264227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "hello con willSendClip no booleano",
+    "framesHex": [
+      "017b226b696e64223a2268656c6c6f222c2276223a322c226465766963654964223a226465762d31222c226465766963654e616d65223a22506978656c2038222c2277696c6c53656e64436c6970223a227369227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "file_start con size negativo",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f7374617274222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a22666f746f2e6a7067222c2273697a65223a2d312c226d696d65223a22696d6167652f6a706567227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "file_start con size decimal",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f7374617274222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c226e616d65223a22666f746f2e6a7067222c2273697a65223a312e352c226d696d65223a22696d6167652f6a706567227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "file_ack con received como texto",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f61636b222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c227265636569766564223a223130227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "file_result sin ok",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f726573756c74222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666227d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "file_result con error no textual",
+    "framesHex": [
+      "017b226b696e64223a2266696c655f726573756c74222c227472616e736665724964223a223030313132323333343435353636373738383939616162626363646465656666222c226f6b223a747275652c226572726f72223a357d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "byte de tipo 0x07",
+    "framesHex": [
+      "077b7d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "byte de tipo 0x00",
+    "framesHex": [
+      "00"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "trama vacía",
+    "framesHex": [
+      ""
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "datos de archivo con transferId truncado",
+    "framesHex": [
+      "0200112233445566778899aabbccddee"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "UTF-8 inválido en control",
+    "framesHex": [
+      "01ff7b7d"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "datos de archivo en mitad de un fragmentado",
+    "framesHex": [
+      "037b226b696e64223a2263",
+      "0200112233445566778899aabbccddeeffaa"
+    ],
+    "expect": {
+      "error": true
+    }
+  }
+]

@@ -1,144 +1,108 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://portapapeles-universal-p2p/schema/sync-message.schema.json",
-  "title": "SyncMessage",
-  "description": "Mensaje único intercambiado entre el cliente móvil y el cliente de escritorio, independiente del transporte (LAN, USB o Bluetooth). Es el contrato compartido: cualquier cambio aquí debe versionarse y respetarse por igual en ambos clientes.",
-  "type": "object",
-  "required": ["protocolVersion", "id", "deviceId", "type", "timestamp", "checksum", "payload"],
-  "additionalProperties": false,
-  "properties": {
-    "protocolVersion": {
-      "type": "string",
-      "description": "Versión semver del protocolo, ej. \"1.0.0\". Permite detectar incompatibilidades entre un móvil y un escritorio desactualizados.",
-      "pattern": "^\\d+\\.\\d+\\.\\d+$"
-    },
-    "id": {
-      "type": "string",
-      "format": "uuid",
-      "description": "Identificador único de este mensaje (UUID v4). Usado para deduplicar reintentos y para referenciar chunks del mismo archivo."
-    },
-    "deviceId": {
-      "type": "string",
-      "format": "uuid",
-      "description": "Identificador estable del dispositivo emisor, generado una vez en el primer emparejamiento."
-    },
-    "type": {
-      "type": "string",
-      "enum": ["text", "file", "token"],
-      "description": "Discrimina la forma del campo payload."
-    },
-    "timestamp": {
-      "type": "integer",
-      "minimum": 0,
-      "description": "Marca de tiempo Unix en milisegundos en el momento en que el emisor generó el mensaje (no de envío ni de recepción)."
-    },
-    "checksum": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$",
-      "description": "SHA-256 en hexadecimal minúscula del contenido completo (para 'file', del archivo reensamblado completo, no del chunk individual)."
-    },
-    "payload": {
-      "description": "Forma exacta condicionada por el campo 'type'.",
-      "oneOf": [
-        { "$ref": "#/$defs/textPayload" },
-        { "$ref": "#/$defs/filePayload" },
-        { "$ref": "#/$defs/tokenPayload" }
-      ]
-    }
-  },
-  "allOf": [
-    {
-      "if": { "properties": { "type": { "const": "text" } } },
-      "then": { "properties": { "payload": { "$ref": "#/$defs/textPayload" } } }
-    },
-    {
-      "if": { "properties": { "type": { "const": "file" } } },
-      "then": { "properties": { "payload": { "$ref": "#/$defs/filePayload" } } }
-    },
-    {
-      "if": { "properties": { "type": { "const": "token" } } },
-      "then": { "properties": { "payload": { "$ref": "#/$defs/tokenPayload" } } }
-    }
+  "title": "ControlMessage",
+  "description": "Mensajes de control del protocolo v2 (JSON en UTF-8, tramas 0x01/0x03). Los datos de archivo (trama 0x02) son binarios y no se describen aquí. Cualquier cambio debe respetarse por igual en el móvil (TypeScript) y en el PC (Rust).",
+  "oneOf": [
+    { "$ref": "#/$defs/hello" },
+    { "$ref": "#/$defs/clip" },
+    { "$ref": "#/$defs/file_start" },
+    { "$ref": "#/$defs/file_ack" },
+    { "$ref": "#/$defs/file_end" },
+    { "$ref": "#/$defs/file_result" },
+    { "$ref": "#/$defs/file_cancel" },
+    { "$ref": "#/$defs/ping" },
+    { "$ref": "#/$defs/pong" }
   ],
   "$defs": {
-    "textPayload": {
+    "transferId": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "Identificador de transferencia: 16 bytes en hex minúscula (en las tramas 0x02 viaja como 16 bytes crudos)."
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "SHA-256 en hex minúscula."
+    },
+    "hello": {
       "type": "object",
-      "required": ["content"],
-      "additionalProperties": false,
+      "required": ["kind", "v", "deviceId", "deviceName"],
       "properties": {
-        "content": {
-          "type": "string",
-          "description": "Texto plano copiado al portapapeles.",
-          "maxLength": 1048576
-        }
+        "kind": { "const": "hello" },
+        "v": { "const": 2 },
+        "deviceId": { "type": "string" },
+        "deviceName": { "type": "string" },
+        "willSendClip": { "type": "boolean" }
       }
     },
-    "tokenPayload": {
+    "clip": {
       "type": "object",
-      "required": ["content"],
-      "additionalProperties": false,
+      "required": ["kind", "id", "text", "hash"],
       "properties": {
-        "content": {
-          "type": "string",
-          "description": "Cadena sensible (API key, OTP, contraseña de un solo uso, etc.). Se envía cifrada a nivel de transporte; los clientes deben evitar loggear este campo y expirarlo de la vista tras un tiempo corto.",
-          "maxLength": 8192
-        },
-        "label": {
-          "type": "string",
-          "description": "Etiqueta opcional para mostrar en UI sin revelar el contenido, ej. \"Código 2FA de GitHub\".",
-          "maxLength": 128
-        },
-        "expiresAt": {
-          "type": "integer",
-          "description": "Unix ms opcional tras el cual el receptor debe descartar/ocultar el token de su historial."
-        }
+        "kind": { "const": "clip" },
+        "id": { "type": "string" },
+        "text": { "type": "string", "description": "Texto copiado, máximo 1 MiB (1 048 576 bytes) en UTF-8." },
+        "hash": { "$ref": "#/$defs/sha256", "description": "SHA-256 de `text` codificado en UTF-8." }
       }
     },
-    "filePayload": {
+    "file_start": {
       "type": "object",
-      "required": ["fileName", "mimeType", "size", "chunkIndex", "chunkTotal", "chunkData"],
-      "additionalProperties": false,
+      "required": ["kind", "transferId", "name", "size", "mime"],
       "properties": {
-        "fileName": {
-          "type": "string",
-          "maxLength": 255
-        },
-        "mimeType": {
-          "type": "string",
-          "description": "Tipo MIME declarado por el emisor, ej. \"application/pdf\"."
-        },
-        "size": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Tamaño total del archivo en bytes (no del chunk)."
-        },
-        "chunkIndex": {
-          "type": "integer",
-          "minimum": 0,
-          "description": "Índice de este fragmento, base 0."
-        },
-        "chunkTotal": {
-          "type": "integer",
-          "minimum": 1,
-          "description": "Número total de fragmentos en los que se dividió el archivo."
-        },
-        "chunkData": {
-          "type": "string",
-          "contentEncoding": "base64",
-          "description": "Bytes del fragmento, codificados en base64. El tamaño de fragmento lo decide cada Transport según sus límites (ej. MTU de BLE vs buffer de TCP)."
-        }
+        "kind": { "const": "file_start" },
+        "transferId": { "$ref": "#/$defs/transferId" },
+        "name": { "type": "string" },
+        "size": { "type": "integer", "minimum": 0 },
+        "mime": { "type": "string" }
       }
+    },
+    "file_ack": {
+      "type": "object",
+      "required": ["kind", "transferId", "received"],
+      "properties": {
+        "kind": { "const": "file_ack" },
+        "transferId": { "$ref": "#/$defs/transferId" },
+        "received": { "type": "integer", "minimum": 0, "description": "Bytes recibidos hasta ahora." }
+      }
+    },
+    "file_end": {
+      "type": "object",
+      "required": ["kind", "transferId", "sha256"],
+      "properties": {
+        "kind": { "const": "file_end" },
+        "transferId": { "$ref": "#/$defs/transferId" },
+        "sha256": { "$ref": "#/$defs/sha256", "description": "SHA-256 del archivo completo." }
+      }
+    },
+    "file_result": {
+      "type": "object",
+      "required": ["kind", "transferId", "ok"],
+      "properties": {
+        "kind": { "const": "file_result" },
+        "transferId": { "$ref": "#/$defs/transferId" },
+        "ok": { "type": "boolean" },
+        "error": { "type": "string" }
+      }
+    },
+    "file_cancel": {
+      "type": "object",
+      "required": ["kind", "transferId", "reason"],
+      "properties": {
+        "kind": { "const": "file_cancel" },
+        "transferId": { "$ref": "#/$defs/transferId" },
+        "reason": { "type": "string" }
+      }
+    },
+    "ping": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "const": "ping" } }
+    },
+    "pong": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": { "kind": { "const": "pong" } }
     }
-  },
-  "examples": [
-    {
-      "protocolVersion": "1.0.0",
-      "id": "b3f6c9de-2f2e-4b7a-9b6b-5b6a8f5b6a8f",
-      "deviceId": "a1a1a1a1-b2b2-4c4c-9d9d-e5e5e5e5e5e5",
-      "type": "text",
-      "timestamp": 1732300800000,
-      "checksum": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-      "payload": { "content": "https://example.com/pedido/12345" }
-    }
-  ]
+  }
 }
