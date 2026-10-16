@@ -1,6 +1,6 @@
 mod discovery;
-// Las constantes y el protocolo v2 se consumen desde las tareas siguientes (sesión, Tarea 10).
-#[allow(dead_code, unused_imports)]
+// TODO(Tarea 10): quitar cuando el Hub use el módulo
+#[allow(dead_code)]
 mod protocol;
 mod usb;
 

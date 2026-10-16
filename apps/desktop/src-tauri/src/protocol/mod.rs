@@ -3,9 +3,10 @@
 
 mod messages;
 
+// TODO(Tarea 10): quitar cuando el Hub use el módulo
+#[allow(unused_imports)]
 pub use messages::{
-    encode_control, encode_file_data, try_encode_control, ControlMessage, Decoded, MessageDecoder,
-    ProtocolError,
+    encode_control, encode_file_data, ControlMessage, Decoded, MessageDecoder, ProtocolError,
 };
 
 use tokio_util::codec::LengthDelimitedCodec;
