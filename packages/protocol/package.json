@@ -2,11 +2,24 @@
   "name": "@clipsync/protocol",
   "version": "0.1.0",
   "private": true,
-  "description": "Definición compartida del protocolo de sincronización (SyncMessage) entre el cliente móvil y el cliente de escritorio.",
+  "type": "module",
+  "description": "Protocolo v2 compartido entre el cliente móvil y el cliente de escritorio: framing, mensajes y sincronización de portapapeles.",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "files": [
     "schema",
-    "src"
-  ]
+    "src",
+    "test-vectors"
+  ],
+  "scripts": {
+    "test": "vitest run -c vitest.config.ts",
+    "test:e2e": "vitest run -c vitest.e2e.config.ts"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.5",
+    "vitest": "^5.0.5"
+  }
 }
