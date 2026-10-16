@@ -178,7 +178,7 @@ export class MessageDecoder {
 
     switch (type) {
       case TYPE_FILE_DATA: {
-        if (this.pendingBytes > 0) fail('datos de archivo en mitad de un mensaje fragmentado');
+        if (this.pending.length > 0) fail('datos de archivo en mitad de un mensaje fragmentado');
         if (body.length < TRANSFER_ID_BYTES) fail('datos de archivo sin transferId completo');
         const bytes = body.slice(TRANSFER_ID_BYTES);
         if (bytes.length > FILE_CHUNK_BYTES) fail(`datos de archivo de más de ${FILE_CHUNK_BYTES} bytes`);
@@ -186,6 +186,8 @@ export class MessageDecoder {
       }
       case TYPE_CONTROL_MORE:
       case TYPE_CONTROL_LAST: {
+        // un 0x03 sin contenido no hace avanzar el mensaje: el emisor nunca lo genera
+        if (type === TYPE_CONTROL_MORE && body.length === 0) fail('fragmento de control vacío');
         if (this.pendingBytes + body.length > MAX_CONTROL_BYTES) {
           fail(`mensaje de control de más de ${MAX_CONTROL_BYTES} bytes`);
         }
