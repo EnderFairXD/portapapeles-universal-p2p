@@ -11,7 +11,7 @@
 //!
 //! Enlazado a `lib.rs`: `spawn_reverse_tunnel_watcher()` corre en background desde
 //! `setup()`, sondeando cada POLL_INTERVAL por un dispositivo autorizado y
-//! (re)estableciendo `adb reverse` para los dos puertos del sistema. `adb reverse` es
+//! (re)estableciendo `adb reverse` para el puerto de la sesión. `adb reverse` es
 //! idempotente — repetirlo con la misma pareja de puertos no rompe nada — así que un
 //! sondeo simple es suficiente sin necesitar detectar hotplug de verdad.
 
@@ -20,13 +20,12 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::time::sleep;
 
-use crate::protocol::{DEFAULT_TCP_PORT, GUEST_MODE_PORT};
+use crate::protocol::DEFAULT_TCP_PORT;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Los dos puertos que ClipSync necesita re-exponer por USB: LanTransport (P2P) y el
-/// servidor del Modo Invitado.
-pub const REVERSE_PORTS: [u16; 2] = [DEFAULT_TCP_PORT, GUEST_MODE_PORT];
+/// Puertos que ClipSync necesita re-exponer por USB: solo el servidor TCP de la sesión v2.
+pub const REVERSE_PORTS: [u16; 1] = [DEFAULT_TCP_PORT];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsbDevice {
@@ -161,9 +160,7 @@ pub fn spawn_reverse_tunnel_watcher() {
 
                             if all_ok {
                                 if is_new {
-                                    println!(
-                                        "[USB] Túneles activos: 127.0.0.1:{DEFAULT_TCP_PORT} (P2P) y 127.0.0.1:{GUEST_MODE_PORT} (Modo Invitado)"
-                                    );
+                                    println!("[USB] Túnel activo: 127.0.0.1:{DEFAULT_TCP_PORT}");
                                 }
                                 last_tunneled_serial = Some(device.serial.clone());
                             } else {
@@ -208,9 +205,7 @@ mod tests {
     }
 
     #[test]
-    fn reverse_ports_cover_p2p_and_guest_mode() {
-        assert!(REVERSE_PORTS.contains(&DEFAULT_TCP_PORT));
-        assert!(REVERSE_PORTS.contains(&GUEST_MODE_PORT));
-        assert_ne!(DEFAULT_TCP_PORT, GUEST_MODE_PORT);
+    fn reverse_ports_is_only_the_session_port() {
+        assert_eq!(REVERSE_PORTS, [DEFAULT_TCP_PORT]);
     }
 }
