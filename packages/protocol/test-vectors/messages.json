@@ -406,5 +406,24 @@
     "expect": {
       "error": true
     }
+  },
+  {
+    "name": "fragmento 0x03 vacío",
+    "framesHex": [
+      "03"
+    ],
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "fragmento 0x03 vacío seguido de datos de archivo",
+    "framesHex": [
+      "03",
+      "0200112233445566778899aabbccddeeffaa"
+    ],
+    "expect": {
+      "error": true
+    }
   }
 ]
