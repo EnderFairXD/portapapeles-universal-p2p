@@ -217,7 +217,12 @@ fn with_type(type_byte: u8, body: &[u8]) -> Vec<u8> {
 
 /// Codifica un mensaje de control en payloads de trama (sin la longitud u16).
 /// El JSON se trocea en bytes: tramas 0x03 y una 0x01 final.
-pub fn try_encode_control(msg: &ControlMessage) -> Result<Vec<Vec<u8>>, ProtocolError> {
+///
+/// Devuelve `Err` (nunca hace panic) si el mensaje no cumple las reglas del protocolo o si su
+/// JSON supera `MAX_CONTROL_BYTES`. Esto último puede pasar con contenido del usuario: un clip
+/// de 1 MiB de saltos de línea ocupa unos 2 MiB al escaparse, así que el emisor debe tratar el
+/// error (descartar el envío), no darlo por imposible.
+pub fn encode_control(msg: &ControlMessage) -> Result<Vec<Vec<u8>>, ProtocolError> {
     check_message(msg)?;
     let json = serde_json::to_vec(msg).map_err(|e| ProtocolError::Invalid(e.to_string()))?;
     if json.len() > MAX_CONTROL_BYTES {
@@ -233,14 +238,10 @@ pub fn try_encode_control(msg: &ControlMessage) -> Result<Vec<Vec<u8>>, Protocol
         .collect())
 }
 
-/// Como [`try_encode_control`], pero con un mensaje inválido hace panic: pensado para
-/// mensajes que construye el propio programa (los de usuario se comprueban antes).
-pub fn encode_control(msg: &ControlMessage) -> Vec<Vec<u8>> {
-    try_encode_control(msg).unwrap_or_else(|e| panic!("{e}"))
-}
-
 /// Payload de trama 0x02: transferId (16 bytes) + bytes de archivo (≤ 48 KiB).
-/// Hace panic si `bytes` supera `FILE_CHUNK_BYTES`: el emisor trocea siempre antes.
+///
+/// Hace panic si `bytes` supera `FILE_CHUNK_BYTES`. Es una invariante interna, no una entrada
+/// de usuario: el emisor de archivos siempre trocea en bloques de `FILE_CHUNK_BYTES` antes.
 pub fn encode_file_data(transfer_id: &[u8; 16], bytes: &[u8]) -> Vec<u8> {
     assert!(
         bytes.len() <= FILE_CHUNK_BYTES,
@@ -323,6 +324,8 @@ fn parse_control(json: &[u8]) -> Result<ControlMessage, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::MAX_CLIP_BYTES;
+    use sha2::{Digest, Sha256};
     const TID: &str = "00112233445566778899aabbccddeeff";
     const HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
@@ -406,7 +409,7 @@ mod tests {
             ControlMessage::Pong,
         ];
         for msg in messages {
-            let frames = encode_control(&msg);
+            let frames = encode_control(&msg).unwrap();
             assert_eq!(frames.len(), 1, "{msg:?}");
             assert_eq!(frames[0][0], 0x01);
             assert_eq!(decode_all(&frames).unwrap(), vec![Decoded::Control(msg)]);
@@ -415,12 +418,12 @@ mod tests {
 
     #[test]
     fn json_usa_kind_en_snake_case_y_campos_en_camel_case() {
-        let frames = encode_control(&ControlMessage::FileAck { transfer_id: TID.into(), received: 5 });
+        let frames = encode_control(&ControlMessage::FileAck { transfer_id: TID.into(), received: 5 }).unwrap();
         let json: Value = serde_json::from_slice(&frames[0][1..]).unwrap();
         assert_eq!(json, serde_json::json!({ "kind": "file_ack", "transferId": TID, "received": 5 }));
 
         let hello = ControlMessage::Hello { v: 2, device_id: "a".into(), device_name: "b".into(), will_send_clip: None };
-        let json: Value = serde_json::from_slice(&encode_control(&hello)[0][1..]).unwrap();
+        let json: Value = serde_json::from_slice(&encode_control(&hello).unwrap()[0][1..]).unwrap();
         assert!(json.get("willSendClip").is_none());
         assert_eq!(json["deviceName"], "b");
     }
@@ -430,7 +433,7 @@ mod tests {
         let text = "😀".repeat(262_144); // 1 MiB en UTF-8
         assert_eq!(text.len(), 1_048_576);
         let msg = clip(&text);
-        let frames = encode_control(&msg);
+        let frames = encode_control(&msg).unwrap();
         assert!(frames.len() > 16);
         assert!(frames.iter().all(|f| f.len() <= MAX_FRAME_BYTES));
         let (last, more) = frames.split_last().unwrap();
@@ -441,10 +444,10 @@ mod tests {
     #[test]
     fn json_de_65534_bytes_cabe_en_una_trama_y_65535_se_trocea() {
         let overhead = serde_json::to_vec(&clip("")).unwrap().len();
-        let exact = encode_control(&clip(&"x".repeat(65534 - overhead)));
+        let exact = encode_control(&clip(&"x".repeat(65534 - overhead))).unwrap();
         assert_eq!(exact.len(), 1);
         assert_eq!(exact[0].len(), 65535);
-        let over = encode_control(&clip(&"x".repeat(65535 - overhead)));
+        let over = encode_control(&clip(&"x".repeat(65535 - overhead))).unwrap();
         assert_eq!(over.iter().map(|f| f[0]).collect::<Vec<_>>(), vec![0x03, 0x01]);
     }
 
@@ -471,7 +474,7 @@ mod tests {
         let mut d = MessageDecoder::new();
         assert_eq!(d.push(&[0x03, 0x7b]), Ok(None));
         assert!(d.push(&[0x07]).is_err());
-        let ping = &encode_control(&ControlMessage::Ping)[0];
+        let ping = &encode_control(&ControlMessage::Ping).unwrap()[0];
         assert_eq!(d.push(ping), Ok(Some(Decoded::Control(ControlMessage::Ping))));
     }
 
@@ -524,19 +527,38 @@ mod tests {
     #[test]
     fn encode_control_rechaza_mensajes_con_forma_invalida() {
         let bad_id = ControlMessage::FileAck { transfer_id: "corto".into(), received: 1 };
-        assert!(matches!(try_encode_control(&bad_id), Err(ProtocolError::Invalid(_))));
+        assert!(matches!(encode_control(&bad_id), Err(ProtocolError::Invalid(_))));
         let bad_v = ControlMessage::Hello { v: 1, device_id: "a".into(), device_name: "b".into(), will_send_clip: None };
-        assert!(try_encode_control(&bad_v).is_err());
+        assert!(encode_control(&bad_v).is_err());
         let upper = ControlMessage::FileEnd { transfer_id: TID.to_uppercase(), sha256: HASH.into() };
-        assert!(try_encode_control(&upper).is_err());
+        assert!(encode_control(&upper).is_err());
         let bad_hash = ControlMessage::Clip { id: "a".into(), text: "".into(), hash: "ab".into() };
-        assert!(try_encode_control(&bad_hash).is_err());
+        assert!(encode_control(&bad_hash).is_err());
     }
 
     #[test]
     fn encode_control_rechaza_un_mensaje_de_mas_de_2_mib() {
         let msg = clip(&"x".repeat(MAX_CONTROL_BYTES));
-        assert!(matches!(try_encode_control(&msg), Err(ProtocolError::Invalid(_))));
+        assert!(matches!(encode_control(&msg), Err(ProtocolError::Invalid(_))));
+    }
+
+    /// Clip con texto dentro del límite de 1 MiB cuyo JSON escapado supera los 2 MiB.
+    fn clip_con_hash_valido(text: String) -> ControlMessage {
+        let hash = hex::encode(Sha256::digest(text.as_bytes()));
+        ControlMessage::Clip { id: "a".into(), text, hash }
+    }
+
+    #[test]
+    fn clip_de_1_mib_de_saltos_de_linea_da_error_y_no_panica() {
+        let text = "\n".repeat(MAX_CLIP_BYTES);
+        assert_eq!(text.len(), MAX_CLIP_BYTES); // pasa el tope de texto de ClipboardSync
+        assert!(matches!(encode_control(&clip_con_hash_valido(text)), Err(ProtocolError::Invalid(_))));
+    }
+
+    #[test]
+    fn clip_de_1_mib_de_caracteres_de_control_da_error_y_no_panica() {
+        let text = "\u{1}".repeat(MAX_CLIP_BYTES); // cada uno se escapa a 6 bytes (\u0001)
+        assert!(matches!(encode_control(&clip_con_hash_valido(text)), Err(ProtocolError::Invalid(_))));
     }
 
     #[test]
