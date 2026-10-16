@@ -19,9 +19,9 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 use super::clip_sync::{sha256_hex, ClipDecision, ClipboardSync};
 use super::files::FileReceiver;
 use crate::protocol::{
-    encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder, FILE_ACK_EVERY_BYTES,
-    FILE_CHUNK_BYTES, FILE_WINDOW_BYTES, HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES,
-    PROTOCOL_VERSION,
+    encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder,
+    FILE_ACK_EVERY_BYTES, FILE_CHUNK_BYTES, FILE_WINDOW_BYTES, HEARTBEAT_INTERVAL_MS,
+    HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES, PROTOCOL_VERSION,
 };
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
@@ -86,7 +86,10 @@ pub(super) struct OutMeta {
 
 /// Lo que la sesión comunica al Hub.
 pub(super) enum SessionEvent {
-    Ready { device_id: String, device_name: String },
+    Ready {
+        device_id: String,
+        device_name: String,
+    },
     Clip(String),
     LocalClipSuperseded(String),
     Transfer(TransferUpdate),
@@ -117,6 +120,10 @@ pub(super) fn new_id() -> (String, [u8; 16]) {
     let id = uuid::Uuid::new_v4();
     (id.simple().to_string(), *id.as_bytes())
 }
+
+/// Límites de lo que el móvil envía en su hello y se guarda en memoria.
+const MAX_DEVICE_ID_BYTES: usize = 128;
+const MAX_DEVICE_NAME_CHARS: usize = 64;
 
 const PROTOCOL_ERROR: &str = "protocol_error";
 const INTERNAL_ERROR: &str = "internal_error";
@@ -151,7 +158,11 @@ impl OutTransfer {
             direction: Direction::Out,
             name: self.f.name.clone(),
             size: self.f.size,
-            bytes: if state == TransferState::Done { self.f.size } else { self.acked },
+            bytes: if state == TransferState::Done {
+                self.f.size
+            } else {
+                self.acked
+            },
             state,
             error: error.map(String::from),
             location: None,
@@ -161,7 +172,10 @@ impl OutTransfer {
     /// Puede leer el siguiente trozo, o enviar el leído porque ya cabe en la ventana.
     fn can_step(&self) -> bool {
         !self.end_sent
-            && self.pending.as_ref().is_none_or(|c| self.sent - self.acked + c.len() as u64 <= FILE_WINDOW_BYTES)
+            && self
+                .pending
+                .as_ref()
+                .is_none_or(|c| self.sent - self.acked + c.len() as u64 <= FILE_WINDOW_BYTES)
     }
 }
 
@@ -196,7 +210,12 @@ struct InTransfer {
 }
 
 impl InTransfer {
-    fn update(&self, state: TransferState, error: Option<&str>, location: Option<String>) -> TransferUpdate {
+    fn update(
+        &self,
+        state: TransferState,
+        error: Option<&str>,
+        location: Option<String>,
+    ) -> TransferUpdate {
         TransferUpdate {
             transfer_id: self.id.clone(),
             direction: Direction::In,
@@ -208,6 +227,14 @@ impl InTransfer {
             location,
         }
     }
+}
+
+/// Recorta a `max` caracteres (nunca en mitad de uno).
+fn truncate_chars(mut s: String, max: usize) -> String {
+    if let Some((i, _)) = s.char_indices().nth(max) {
+        s.truncate(i);
+    }
+    s
 }
 
 /// true si `after` alcanza otro múltiplo de 1 MiB que `before` no alcanzaba.
@@ -389,7 +416,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     async fn tick(&mut self) {
-        if Instant::now().duration_since(self.last_rx) >= Duration::from_millis(HEARTBEAT_TIMEOUT_MS) {
+        if Instant::now().duration_since(self.last_rx)
+            >= Duration::from_millis(HEARTBEAT_TIMEOUT_MS)
+        {
             self.close(HEARTBEAT_TIMEOUT);
         } else if self.ready {
             self.send(ControlMessage::Ping).await;
@@ -415,7 +444,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     hasher: sha2::Digest::new(),
                     pending: None,
                 };
-                self.emit_transfer(t.update(TransferState::Queued, None));
+                // 'queued' ya lo emitió el Hub al aceptar el archivo
                 self.out_queue.push_back(t);
             }
             Command::Cancel(id) => self.cancel_transfer(&id).await,
@@ -432,10 +461,16 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             }
             return;
         }
-        if self.out.as_ref().is_some_and(|t| t.f.id == id && !t.end_sent) {
-            self.end_out(TransferState::Cancelled, None, Some(CANCEL_REASON)).await;
+        if self
+            .out
+            .as_ref()
+            .is_some_and(|t| t.f.id == id && !t.end_sent)
+        {
+            self.end_out(TransferState::Cancelled, None, Some(CANCEL_REASON))
+                .await;
         } else if self.inc.as_ref().is_some_and(|t| t.id == id) {
-            self.end_in(TransferState::Cancelled, None, None, Some(CANCEL_REASON)).await;
+            self.end_in(TransferState::Cancelled, None, None, Some(CANCEL_REASON))
+                .await;
         }
     }
 
@@ -463,11 +498,22 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             Decoded::Control(msg) => msg,
         };
         if !self.hello_received {
-            let ControlMessage::Hello { device_id, device_name, will_send_clip, .. } = msg else {
+            let ControlMessage::Hello {
+                device_id,
+                device_name,
+                will_send_clip,
+                ..
+            } = msg
+            else {
                 return Err(PROTOCOL_ERROR);
             };
             self.hello_received = true;
-            self.on_client_hello(device_id, device_name, will_send_clip == Some(true)).await;
+            if device_id.len() > MAX_DEVICE_ID_BYTES {
+                return Err(PROTOCOL_ERROR);
+            }
+            let device_name = truncate_chars(device_name, MAX_DEVICE_NAME_CHARS);
+            self.on_client_hello(device_id, device_name, will_send_clip == Some(true))
+                .await;
             return Ok(());
         }
         match msg {
@@ -478,15 +524,29 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             }
             ControlMessage::Pong => Ok(()), // basta con haber recibido tráfico
             ControlMessage::Clip { text, hash, .. } => self.on_clip(text, &hash),
-            ControlMessage::FileStart { transfer_id, name, size, .. } => {
-                self.on_file_start(transfer_id, name, size).await
-            }
-            ControlMessage::FileEnd { transfer_id, sha256 } => self.on_file_end(transfer_id, sha256).await,
-            ControlMessage::FileAck { transfer_id, received } => self.on_file_ack(&transfer_id, received),
-            ControlMessage::FileResult { transfer_id, ok, error } => {
-                self.on_file_result(&transfer_id, ok, error).await
-            }
-            ControlMessage::FileCancel { transfer_id, reason } => {
+            ControlMessage::FileStart {
+                transfer_id,
+                name,
+                size,
+                ..
+            } => self.on_file_start(transfer_id, name, size).await,
+            ControlMessage::FileEnd {
+                transfer_id,
+                sha256,
+            } => self.on_file_end(transfer_id, sha256).await,
+            ControlMessage::FileAck {
+                transfer_id,
+                received,
+            } => self.on_file_ack(&transfer_id, received),
+            ControlMessage::FileResult {
+                transfer_id,
+                ok,
+                error,
+            } => self.on_file_result(&transfer_id, ok, error).await,
+            ControlMessage::FileCancel {
+                transfer_id,
+                reason,
+            } => {
                 self.on_file_cancel(&transfer_id, &reason).await;
                 Ok(())
             }
@@ -495,7 +555,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     // --- saludo y regla de inicio ---
 
-    async fn on_client_hello(&mut self, device_id: String, device_name: String, will_send_clip: bool) {
+    async fn on_client_hello(
+        &mut self,
+        device_id: String,
+        device_name: String,
+        will_send_clip: bool,
+    ) {
         self.sync = self.host.clip_sync_for(&device_id);
         self.send(ControlMessage::Hello {
             v: PROTOCOL_VERSION,
@@ -522,7 +587,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             return; // falló la escritura del clip
         }
         self.ready = true;
-        self.emit(SessionEvent::Ready { device_id, device_name });
+        self.emit(SessionEvent::Ready {
+            device_id,
+            device_name,
+        });
         if let Some(text) = superseded {
             self.emit(SessionEvent::LocalClipSuperseded(text));
         }
@@ -536,7 +604,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if decision != ClipDecision::Send {
             return Err(decision);
         }
-        let msg = ControlMessage::Clip { id: new_id().0, text: text.to_string(), hash: sha256_hex(text) };
+        let msg = ControlMessage::Clip {
+            id: new_id().0,
+            text: text.to_string(),
+            hash: sha256_hex(text),
+        };
         encode_control(&msg).map_err(|_| ClipDecision::TooLarge)
     }
 
@@ -547,7 +619,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             Err(d) => return d,
         };
         self.write_frames(frames).await;
-        lock(&self.sync).mark_synced(text);
+        // si la escritura falló, el texto no llegó: no se marca (la sincronía es del dispositivo)
+        if !self.closed {
+            lock(&self.sync).mark_synced(text);
+        }
         ClipDecision::Send
     }
 
@@ -567,7 +642,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if self.closed || !self.ready || self.out.is_some() {
             return;
         }
-        let Some(t) = self.out_queue.pop_front() else { return };
+        let Some(t) = self.out_queue.pop_front() else {
+            return;
+        };
         let msg = ControlMessage::FileStart {
             transfer_id: t.f.id.clone(),
             name: t.f.name.clone(),
@@ -588,28 +665,49 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if t.pending.is_none() {
             let chunk = match read_chunk(&mut t.file).await {
                 Ok(c) => c,
-                Err(_) => return self.end_out(TransferState::Failed, Some(READ_ERROR), Some(READ_ERROR)).await,
+                Err(_) => {
+                    return self
+                        .end_out(TransferState::Failed, Some(READ_ERROR), Some(READ_ERROR))
+                        .await
+                }
             };
             if chunk.is_empty() {
                 if t.sent != t.f.size {
-                    return self.end_out(TransferState::Failed, Some(SIZE_MISMATCH), Some(SIZE_MISMATCH)).await;
+                    return self
+                        .end_out(
+                            TransferState::Failed,
+                            Some(SIZE_MISMATCH),
+                            Some(SIZE_MISMATCH),
+                        )
+                        .await;
                 }
                 t.end_sent = true;
                 let sha256 = hex::encode(sha2::Digest::finalize_reset(&mut t.hasher));
-                let msg = ControlMessage::FileEnd { transfer_id: t.f.id.clone(), sha256 };
+                let msg = ControlMessage::FileEnd {
+                    transfer_id: t.f.id.clone(),
+                    sha256,
+                };
                 // hasta file_result, file_cancel o cierre
                 return self.send(msg).await;
             }
             if t.sent + chunk.len() as u64 > t.f.size {
                 // el archivo creció: nunca se manda más de lo anunciado
-                return self.end_out(TransferState::Failed, Some(SIZE_MISMATCH), Some(SIZE_MISMATCH)).await;
+                return self
+                    .end_out(
+                        TransferState::Failed,
+                        Some(SIZE_MISMATCH),
+                        Some(SIZE_MISMATCH),
+                    )
+                    .await;
             }
             t.pending = Some(chunk);
         }
         if !t.can_step() {
             return; // espera a un file_ack
         }
-        let Some(chunk) = t.pending.take() else { return };
+        let Some(chunk) = t.pending.take() else {
+            return;
+        };
         sha2::Digest::update(&mut t.hasher, &chunk);
         t.sent += chunk.len() as u64;
         let frame = encode_file_data(&t.f.id_bytes, &chunk);
@@ -622,12 +720,18 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // se emite antes de escribir: si la escritura falla, 'closed' llega después
         self.emit_transfer(t.update(state, error));
         if let Some(reason) = cancel {
-            self.send(ControlMessage::FileCancel { transfer_id: t.f.id, reason: reason.to_string() }).await;
+            self.send(ControlMessage::FileCancel {
+                transfer_id: t.f.id,
+                reason: reason.to_string(),
+            })
+            .await;
         }
     }
 
     fn on_file_ack(&mut self, id: &str, received: u64) -> Res {
-        let Some(t) = self.out.as_mut().filter(|t| t.f.id == id) else { return Ok(()) }; // rezagado
+        let Some(t) = self.out.as_mut().filter(|t| t.f.id == id) else {
+            return Ok(());
+        }; // rezagado
         if received > t.sent {
             return Err(PROTOCOL_ERROR);
         }
@@ -644,7 +748,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     async fn on_file_result(&mut self, id: &str, ok: bool, error: Option<String>) -> Res {
-        let Some(t) = self.out.as_ref().filter(|t| t.f.id == id) else { return Ok(()) };
+        let Some(t) = self.out.as_ref().filter(|t| t.f.id == id) else {
+            return Ok(());
+        };
         if !t.end_sent {
             return Err(PROTOCOL_ERROR);
         }
@@ -652,7 +758,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             self.end_out(TransferState::Done, None, None).await;
         } else {
             let error = error.unwrap_or_else(|| "remote_error".to_string());
-            self.end_out(TransferState::Failed, Some(&error), None).await;
+            self.end_out(TransferState::Failed, Some(&error), None)
+                .await;
         }
         Ok(())
     }
@@ -678,7 +785,13 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if self.inc.is_some() || self.ended_in.contains(&id) {
             return Err(PROTOCOL_ERROR);
         }
-        self.inc = Some(InTransfer { id, name: name.clone(), size, received: 0, sink: Sink::Pending });
+        self.inc = Some(InTransfer {
+            id,
+            name: name.clone(),
+            size,
+            received: 0,
+            sink: Sink::Pending,
+        });
         let dir = self.cfg.download_dir.clone();
         match tokio::task::spawn_blocking(move || FileReceiver::create(&dir, &name)).await {
             Ok(Ok(rx)) => {
@@ -688,7 +801,15 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     self.emit_transfer(u);
                 }
             }
-            _ => self.end_in(TransferState::Failed, Some(WRITE_ERROR), None, Some(WRITE_ERROR)).await,
+            _ => {
+                self.end_in(
+                    TransferState::Failed,
+                    Some(WRITE_ERROR),
+                    None,
+                    Some(WRITE_ERROR),
+                )
+                .await
+            }
         }
         Ok(())
     }
@@ -703,7 +824,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     async fn on_file_data(&mut self, id: String, bytes: Vec<u8>) -> Res {
-        let Some(t) = self.incoming(&id)? else { return Ok(()) };
+        let Some(t) = self.incoming(&id)? else {
+            return Ok(());
+        };
         let len = bytes.len() as u64;
         if t.received + len > t.size {
             return Err(PROTOCOL_ERROR);
@@ -721,21 +844,39 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             Ok((rx, Ok(()))) => rx,
             Ok((rx, Err(_))) => {
                 rx.abort();
-                self.end_in(TransferState::Failed, Some(WRITE_ERROR), None, Some(WRITE_ERROR)).await;
+                self.end_in(
+                    TransferState::Failed,
+                    Some(WRITE_ERROR),
+                    None,
+                    Some(WRITE_ERROR),
+                )
+                .await;
                 return Ok(());
             }
             Err(_) => {
-                self.end_in(TransferState::Failed, Some(WRITE_ERROR), None, Some(WRITE_ERROR)).await;
+                self.end_in(
+                    TransferState::Failed,
+                    Some(WRITE_ERROR),
+                    None,
+                    Some(WRITE_ERROR),
+                )
+                .await;
                 return Ok(());
             }
         };
-        let Some(t) = self.inc.as_mut() else { return Ok(()) };
+        let Some(t) = self.inc.as_mut() else {
+            return Ok(());
+        };
         t.sink = Sink::Open(rx);
         let before = t.received;
         t.received += len;
         if crosses_mib(before, t.received) {
             let (id, received) = (t.id.clone(), t.received);
-            self.send(ControlMessage::FileAck { transfer_id: id, received }).await;
+            self.send(ControlMessage::FileAck {
+                transfer_id: id,
+                received,
+            })
+            .await;
             if let Some(t) = self.inc.as_ref() {
                 self.emit_transfer(t.update(TransferState::Active, None, None));
             }
@@ -744,7 +885,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     async fn on_file_end(&mut self, id: String, sha256: String) -> Res {
-        let Some(t) = self.incoming(&id)? else { return Ok(()) };
+        let Some(t) = self.incoming(&id)? else {
+            return Ok(());
+        };
         if t.received != t.size {
             return Err(PROTOCOL_ERROR);
         }
@@ -753,7 +896,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             return Err(INTERNAL_ERROR);
         };
         // ack final: el emisor de un archivo pequeño no se queda esperando a la ventana
-        self.send(ControlMessage::FileAck { transfer_id: id.clone(), received }).await;
+        self.send(ControlMessage::FileAck {
+            transfer_id: id.clone(),
+            received,
+        })
+        .await;
         if self.closed {
             rx.abort(); // close() ya emitió failed
             return Ok(());
@@ -764,23 +911,41 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 if let Some(t) = self.inc.as_mut() {
                     t.sink = Sink::Saved(path.clone());
                 }
-                self.send(ControlMessage::FileResult { transfer_id: id, ok: true, error: None }).await;
+                self.send(ControlMessage::FileResult {
+                    transfer_id: id,
+                    ok: true,
+                    error: None,
+                })
+                .await;
                 // si la sesión cayó aquí, close() ya borró el archivo y emitió failed
                 let location = path.to_string_lossy().into_owned();
-                self.end_in(TransferState::Done, None, Some(location), None).await;
+                self.end_in(TransferState::Done, None, Some(location), None)
+                    .await;
                 return Ok(());
             }
             Ok(Err(e)) if e == CHECKSUM_MISMATCH => CHECKSUM_MISMATCH,
             _ => WRITE_ERROR,
         };
         // finish() ya borró el parcial
-        self.send(ControlMessage::FileResult { transfer_id: id, ok: false, error: Some(error.to_string()) }).await;
-        self.end_in(TransferState::Failed, Some(error), None, None).await;
+        self.send(ControlMessage::FileResult {
+            transfer_id: id,
+            ok: false,
+            error: Some(error.to_string()),
+        })
+        .await;
+        self.end_in(TransferState::Failed, Some(error), None, None)
+            .await;
         Ok(())
     }
 
     /// Termina el entrante activo; salvo `done`, descarta lo recibido o guardado.
-    async fn end_in(&mut self, state: TransferState, error: Option<&str>, location: Option<String>, cancel: Option<&str>) {
+    async fn end_in(
+        &mut self,
+        state: TransferState,
+        error: Option<&str>,
+        location: Option<String>,
+        cancel: Option<&str>,
+    ) {
         let Some(t) = self.inc.take() else { return };
         self.ended_in.insert(t.id.clone());
         let u = t.update(state, error, location);
@@ -790,7 +955,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         // se emite antes de escribir: si la escritura falla, 'closed' llega después
         self.emit_transfer(u);
         if let Some(reason) = cancel {
-            self.send(ControlMessage::FileCancel { transfer_id: t.id, reason: reason.to_string() }).await;
+            self.send(ControlMessage::FileCancel {
+                transfer_id: t.id,
+                reason: reason.to_string(),
+            })
+            .await;
         }
     }
 }

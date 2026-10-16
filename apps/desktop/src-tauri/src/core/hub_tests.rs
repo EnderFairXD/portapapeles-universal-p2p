@@ -2,12 +2,14 @@
 
 use super::*;
 use crate::protocol::{
-    encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder, FILE_CHUNK_BYTES,
+    encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder,
+    FILE_CHUNK_BYTES,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::pin::Pin;
+use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, DuplexStream, ReadBuf, WriteHalf};
@@ -36,23 +38,40 @@ struct Setup {
     hub: Hub,
     events: UnboundedReceiver<HubEvent>,
     dir: tempfile::TempDir,
+    /// lo que devuelve `local_clip` (el último texto del portapapeles del PC)
+    local: Arc<Mutex<Option<String>>>,
 }
 
 fn setup(local: Option<&str>) -> Setup {
     let dir = tempfile::tempdir().unwrap();
-    let local = local.map(String::from);
+    let local = Arc::new(Mutex::new(local.map(String::from)));
+    let l = local.clone();
     let (hub, events) = Hub::new(HubConfig {
         device_id: "pc-1".into(),
         pc_name: "PC de prueba".into(),
         download_dir: dir.path().to_path_buf(),
-        local_clip: Arc::new(move || local.clone()),
+        local_clip: Arc::new(move || l.lock().unwrap().clone()),
     });
-    Setup { hub, events, dir }
+    Setup {
+        hub,
+        events,
+        dir,
+        local,
+    }
 }
 
 impl Setup {
+    /// El PC copia un texto: se actualiza `local_clip` y luego se difunde, como hará la app.
+    fn copy(&self, text: &str) {
+        *self.local.lock().unwrap() = Some(text.to_string());
+        self.hub.broadcast_clip(text);
+    }
+
     async fn event(&mut self) -> Value {
-        js(&timeout(WAIT, self.events.recv()).await.expect("sin evento").expect("canal cerrado"))
+        js(&timeout(WAIT, self.events.recv())
+            .await
+            .expect("sin evento")
+            .expect("canal cerrado"))
     }
 
     /// Eventos de transferencia hasta el estado final (incluido).
@@ -95,11 +114,20 @@ fn hello(device_id: &str, will_send_clip: Option<bool>) -> ControlMessage {
 }
 
 fn clip(text: &str) -> ControlMessage {
-    ControlMessage::Clip { id: "c".repeat(32), text: text.into(), hash: sha(text.as_bytes()) }
+    ControlMessage::Clip {
+        id: "c".repeat(32),
+        text: text.into(),
+        hash: sha(text.as_bytes()),
+    }
 }
 
 fn server_hello() -> ControlMessage {
-    ControlMessage::Hello { v: 2, device_id: "pc-1".into(), device_name: "PC de prueba".into(), will_send_clip: None }
+    ControlMessage::Hello {
+        v: 2,
+        device_id: "pc-1".into(),
+        device_name: "PC de prueba".into(),
+        will_send_clip: None,
+    }
 }
 
 fn peer_connected(session_id: u64, device_id: &str, transport: &str) -> Value {
@@ -130,24 +158,27 @@ fn connect(hub: &Hub) -> Client<WriteHalf<DuplexStream>> {
 }
 
 fn over<S: AsyncRead + AsyncWrite + Send + 'static>(s: S) -> Client<WriteHalf<S>> {
-        let (r, w) = tokio::io::split(s);
-        let (tx, rx) = mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut frames = FramedRead::new(r, frame_codec());
-            let mut dec = MessageDecoder::new();
-            while let Some(Ok(f)) = frames.next().await {
-                match dec.push(&f) {
-                    Ok(Some(d)) => {
-                        if tx.send(d).is_err() {
-                            break;
-                        }
+    let (r, w) = tokio::io::split(s);
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut frames = FramedRead::new(r, frame_codec());
+        let mut dec = MessageDecoder::new();
+        while let Some(Ok(f)) = frames.next().await {
+            match dec.push(&f) {
+                Ok(Some(d)) => {
+                    if tx.send(d).is_err() {
+                        break;
                     }
-                    Ok(None) => {}
-                    Err(e) => panic!("el servidor envió algo inválido: {e}"),
                 }
+                Ok(None) => {}
+                Err(e) => panic!("el servidor envió algo inválido: {e}"),
             }
-        });
-        Client { w: FramedWrite::new(w, frame_codec()), rx }
+        }
+    });
+    Client {
+        w: FramedWrite::new(w, frame_codec()),
+        rx,
+    }
 }
 
 impl<W: AsyncWrite + Unpin> Client<W> {
@@ -159,11 +190,16 @@ impl<W: AsyncWrite + Unpin> Client<W> {
 
     async fn send_data(&mut self, id: &str, bytes: &[u8]) {
         let id: [u8; 16] = hex::decode(id).unwrap().try_into().unwrap();
-        self.w.send(Bytes::from(encode_file_data(&id, bytes))).await.unwrap();
+        self.w
+            .send(Bytes::from(encode_file_data(&id, bytes)))
+            .await
+            .unwrap();
     }
 
     async fn recv(&mut self) -> Option<Decoded> {
-        timeout(WAIT, self.rx.recv()).await.expect("el servidor no envió nada")
+        timeout(WAIT, self.rx.recv())
+            .await
+            .expect("el servidor no envió nada")
     }
 
     /// Siguiente mensaje de control, saltando los ping.
@@ -221,7 +257,10 @@ async fn saludo_emite_peer_connected() {
     c.send(hello("m1", Some(false))).await;
     assert_eq!(c.ctrl().await, server_hello());
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
-    assert!(c.sync().await.is_empty(), "sin texto local no se envía clip");
+    assert!(
+        c.sync().await.is_empty(),
+        "sin texto local no se envía clip"
+    );
     s.no_events();
 }
 
@@ -232,7 +271,10 @@ async fn clip_entrante_emite_evento_y_no_rebota() {
     c.hello("m1", Some(false)).await;
     s.event().await;
     c.send(clip("hola")).await;
-    assert_eq!(s.event().await, json!({"type": "clipReceived", "sessionId": 1, "text": "hola"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "clipReceived", "sessionId": 1, "text": "hola"})
+    );
     s.hub.broadcast_clip("hola");
     s.hub.broadcast_clip("otro");
     match c.ctrl().await {
@@ -257,7 +299,10 @@ async fn clip_de_un_movil_se_reenvia_al_otro_y_no_vuelve() {
     assert_eq!(s.event().await, peer_connected(2, "m2", "wifi"));
 
     a.send(clip("x")).await;
-    assert_eq!(s.event().await, json!({"type": "clipReceived", "sessionId": 1, "text": "x"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "clipReceived", "sessionId": 1, "text": "x"})
+    );
     assert!(matches!(b.ctrl().await, ControlMessage::Clip { text, .. } if text == "x"));
     assert!(a.sync().await.is_empty(), "no vuelve al origen");
 
@@ -267,7 +312,10 @@ async fn clip_de_un_movil_se_reenvia_al_otro_y_no_vuelve() {
     assert!(b.sync().await.is_empty());
 
     b.send(clip("y")).await;
-    assert_eq!(s.event().await, json!({"type": "clipReceived", "sessionId": 2, "text": "y"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "clipReceived", "sessionId": 2, "text": "y"})
+    );
     assert!(matches!(a.ctrl().await, ControlMessage::Clip { text, .. } if text == "y"));
     assert!(b.sync().await.is_empty());
 }
@@ -280,8 +328,14 @@ async fn regla_inicio_ambos_cambiaron_gana_movil() {
     c.send(clip("móvil")).await;
     assert!(c.sync().await.is_empty(), "el PC cede: no envía su texto");
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
-    assert_eq!(s.event().await, json!({"type": "localClipSuperseded", "text": "pc"}));
-    assert_eq!(s.event().await, json!({"type": "clipReceived", "sessionId": 1, "text": "móvil"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "localClipSuperseded", "text": "pc"})
+    );
+    assert_eq!(
+        s.event().await,
+        json!({"type": "clipReceived", "sessionId": 1, "text": "móvil"})
+    );
 }
 
 #[tokio::test]
@@ -326,7 +380,10 @@ async fn regla_inicio_texto_que_no_cabe_no_se_envia_ni_cede() {
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
     s.no_events();
     s.hub.broadcast_clip(&comillas);
-    assert!(c.sync().await.is_empty(), "too_large: no se envía ni se cierra");
+    assert!(
+        c.sync().await.is_empty(),
+        "too_large: no se envía ni se cierra"
+    );
 }
 
 #[tokio::test]
@@ -335,8 +392,16 @@ async fn clip_con_hash_erroneo_cierra_con_protocol_error() {
     let mut c = connect(&s.hub);
     c.hello("m1", Some(false)).await;
     s.event().await;
-    c.send(ControlMessage::Clip { id: "c".repeat(32), text: "hola".into(), hash: sha(b"otro") }).await;
-    assert_eq!(s.event().await, json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"}));
+    c.send(ControlMessage::Clip {
+        id: "c".repeat(32),
+        text: "hola".into(),
+        hash: sha(b"otro"),
+    })
+    .await;
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
+    );
     c.closed().await;
 }
 
@@ -347,7 +412,10 @@ async fn clip_de_mas_de_1_mib_cierra_con_protocol_error() {
     c.hello("m1", Some(false)).await;
     s.event().await;
     c.send(clip(&"a".repeat(MIB as usize + 1))).await;
-    assert_eq!(s.event().await, json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
+    );
     c.closed().await;
 }
 
@@ -368,7 +436,10 @@ async fn hello_repetido_es_protocol_error() {
     c.hello("m1", Some(false)).await;
     s.event().await;
     c.send(hello("m1", Some(false))).await;
-    assert_eq!(s.event().await, json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
+    );
 }
 
 #[tokio::test]
@@ -380,12 +451,18 @@ async fn hello_duplicado_reemplaza_la_sesion_vieja() {
     let mut b = connect(&s.hub);
     b.hello("m1", Some(false)).await;
     assert_eq!(s.event().await, peer_connected(2, "m1", "wifi"));
-    assert_eq!(s.event().await, json!({"type": "peerDisconnected", "sessionId": 1, "reason": "replaced"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "replaced"})
+    );
     a.closed().await;
     assert!(b.sync().await.is_empty(), "la sesión nueva sigue viva");
     // la nueva comparte el anti-rebote del dispositivo
     b.send(clip("z")).await;
-    assert_eq!(s.event().await, json!({"type": "clipReceived", "sessionId": 2, "text": "z"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "clipReceived", "sessionId": 2, "text": "z"})
+    );
     s.hub.broadcast_clip("z");
     assert!(b.sync().await.is_empty());
 }
@@ -412,10 +489,19 @@ async fn latido_30s_sin_trafico_desconecta() {
     c.hello("m1", Some(false)).await;
     let t0 = Instant::now();
     s.event().await;
-    let e = timeout(Duration::from_secs(60), s.events.recv()).await.unwrap().unwrap();
+    let e = timeout(Duration::from_secs(60), s.events.recv())
+        .await
+        .unwrap()
+        .unwrap();
     let dt = t0.elapsed();
-    assert_eq!(js(&e), json!({"type": "peerDisconnected", "sessionId": 1, "reason": "heartbeat_timeout"}));
-    assert!(dt >= Duration::from_secs(30) && dt <= Duration::from_secs(40), "{dt:?}");
+    assert_eq!(
+        js(&e),
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "heartbeat_timeout"})
+    );
+    assert!(
+        dt >= Duration::from_secs(30) && dt <= Duration::from_secs(40),
+        "{dt:?}"
+    );
     // ping a los 10 y 20 s; a los 30 s se cierra
     let mut pings = 0;
     while let Some(d) = c.rx.recv().await {
@@ -442,7 +528,12 @@ async fn latido_con_trafico_no_desconecta() {
 // --- archivos entrantes ---
 
 /// Envía un archivo completo desde el cliente y devuelve los file_ack y el file_result recibidos.
-async fn enviar_archivo<W: AsyncWrite + Unpin>(c: &mut Client<W>, name: &str, data: &[u8], hash: &str) -> Vec<ControlMessage> {
+async fn enviar_archivo<W: AsyncWrite + Unpin>(
+    c: &mut Client<W>,
+    name: &str,
+    data: &[u8],
+    hash: &str,
+) -> Vec<ControlMessage> {
     c.send(ControlMessage::FileStart {
         transfer_id: TID.into(),
         name: name.into(),
@@ -453,7 +544,11 @@ async fn enviar_archivo<W: AsyncWrite + Unpin>(c: &mut Client<W>, name: &str, da
     for chunk in data.chunks(FILE_CHUNK_BYTES) {
         c.send_data(TID, chunk).await;
     }
-    c.send(ControlMessage::FileEnd { transfer_id: TID.into(), sha256: hash.into() }).await;
+    c.send(ControlMessage::FileEnd {
+        transfer_id: TID.into(),
+        sha256: hash.into(),
+    })
+    .await;
     let mut v = Vec::new();
     loop {
         let m = c.ctrl().await;
@@ -466,7 +561,10 @@ async fn enviar_archivo<W: AsyncWrite + Unpin>(c: &mut Client<W>, name: &str, da
 }
 
 fn ack(received: u64) -> ControlMessage {
-    ControlMessage::FileAck { transfer_id: TID.into(), received }
+    ControlMessage::FileAck {
+        transfer_id: TID.into(),
+        received,
+    }
 }
 
 #[tokio::test]
@@ -481,14 +579,26 @@ async fn archivo_entrante_se_guarda_en_download_dir() {
     let marcas = [1_081_344, 2_113_536, 3 * MIB, 4_227_072, n];
     let mut esperado: Vec<ControlMessage> = marcas.iter().map(|&b| ack(b)).collect();
     esperado.push(ack(n)); // ack final en file_end
-    esperado.push(ControlMessage::FileResult { transfer_id: TID.into(), ok: true, error: None });
+    esperado.push(ControlMessage::FileResult {
+        transfer_id: TID.into(),
+        ok: true,
+        error: None,
+    });
     assert_eq!(msgs, esperado);
 
     let ev = s.transfer_until_end().await;
     let destino = s.dir.path().join("foto.bin");
     let mut esp = vec![transfer(TID, "in", "foto.bin", n, 0, "active")];
-    esp.extend(marcas.iter().map(|&b| transfer(TID, "in", "foto.bin", n, b, "active")));
-    esp.push(with(transfer(TID, "in", "foto.bin", n, n, "done"), "location", json!(destino.to_string_lossy())));
+    esp.extend(
+        marcas
+            .iter()
+            .map(|&b| transfer(TID, "in", "foto.bin", n, b, "active")),
+    );
+    esp.push(with(
+        transfer(TID, "in", "foto.bin", n, n, "done"),
+        "location",
+        json!(destino.to_string_lossy()),
+    ));
     assert_eq!(ev, esp);
     assert_eq!(std::fs::read(&destino).unwrap(), data);
     assert_eq!(s.files(), vec!["foto.bin"]);
@@ -503,17 +613,42 @@ async fn archivo_entrante_vacio_y_multiplo_exacto_de_48k() {
     for (i, n) in [0usize, FILE_CHUNK_BYTES * 3].into_iter().enumerate() {
         let data = datos(n);
         let id = format!("{i:032x}");
-        c.send(ControlMessage::FileStart { transfer_id: id.clone(), name: format!("f{i}.bin"), size: n as u64, mime: "x/y".into() })
-            .await;
+        c.send(ControlMessage::FileStart {
+            transfer_id: id.clone(),
+            name: format!("f{i}.bin"),
+            size: n as u64,
+            mime: "x/y".into(),
+        })
+        .await;
         for chunk in data.chunks(FILE_CHUNK_BYTES) {
             c.send_data(&id, chunk).await;
         }
-        c.send(ControlMessage::FileEnd { transfer_id: id.clone(), sha256: sha(&data) }).await;
-        assert_eq!(c.ctrl().await, ControlMessage::FileAck { transfer_id: id.clone(), received: n as u64 });
-        assert_eq!(c.ctrl().await, ControlMessage::FileResult { transfer_id: id.clone(), ok: true, error: None });
+        c.send(ControlMessage::FileEnd {
+            transfer_id: id.clone(),
+            sha256: sha(&data),
+        })
+        .await;
+        assert_eq!(
+            c.ctrl().await,
+            ControlMessage::FileAck {
+                transfer_id: id.clone(),
+                received: n as u64
+            }
+        );
+        assert_eq!(
+            c.ctrl().await,
+            ControlMessage::FileResult {
+                transfer_id: id.clone(),
+                ok: true,
+                error: None
+            }
+        );
         let ev = s.transfer_until_end().await;
         assert_eq!(ev.last().unwrap()["state"], "done");
-        assert_eq!(std::fs::read(s.dir.path().join(format!("f{i}.bin"))).unwrap(), data);
+        assert_eq!(
+            std::fs::read(s.dir.path().join(format!("f{i}.bin"))).unwrap(),
+            data
+        );
     }
 }
 
@@ -527,12 +662,23 @@ async fn archivo_entrante_con_hash_erroneo_no_deja_nada() {
     let msgs = enviar_archivo(&mut c, "a.txt", &data, &sha(b"otra cosa")).await;
     assert_eq!(
         msgs,
-        vec![ack(1000), ControlMessage::FileResult { transfer_id: TID.into(), ok: false, error: Some("checksum_mismatch".into()) }]
+        vec![
+            ack(1000),
+            ControlMessage::FileResult {
+                transfer_id: TID.into(),
+                ok: false,
+                error: Some("checksum_mismatch".into())
+            }
+        ]
     );
     let ev = s.transfer_until_end().await;
     assert_eq!(
         ev.last().unwrap(),
-        &with(transfer(TID, "in", "a.txt", 1000, 1000, "failed"), "error", json!("checksum_mismatch"))
+        &with(
+            transfer(TID, "in", "a.txt", 1000, 1000, "failed"),
+            "error",
+            json!("checksum_mismatch")
+        )
     );
     assert!(s.files().is_empty());
     assert!(c.sync().await.is_empty(), "la sesión sigue");
@@ -557,36 +703,64 @@ async fn corte_a_mitad_borra_part_y_emite_failed() {
     c.hello("m1", Some(false)).await;
     s.event().await;
     let n = 2 * MIB;
-    c.send(ControlMessage::FileStart { transfer_id: TID.into(), name: "x.bin".into(), size: n, mime: "x/y".into() }).await;
+    c.send(ControlMessage::FileStart {
+        transfer_id: TID.into(),
+        name: "x.bin".into(),
+        size: n,
+        mime: "x/y".into(),
+    })
+    .await;
     let data = datos(22 * FILE_CHUNK_BYTES);
     for chunk in data.chunks(FILE_CHUNK_BYTES) {
         c.send_data(TID, chunk).await;
     }
     assert_eq!(c.ctrl().await, ack(1_081_344));
-    assert_eq!(s.event().await, transfer(TID, "in", "x.bin", n, 0, "active"));
-    assert_eq!(s.event().await, transfer(TID, "in", "x.bin", n, 1_081_344, "active"));
+    assert_eq!(
+        s.event().await,
+        transfer(TID, "in", "x.bin", n, 0, "active")
+    );
+    assert_eq!(
+        s.event().await,
+        transfer(TID, "in", "x.bin", n, 1_081_344, "active")
+    );
     assert_eq!(s.files(), vec!["x.bin.part"]);
     c.cut().await;
     assert_eq!(
         s.event().await,
-        with(transfer(TID, "in", "x.bin", n, 1_081_344, "failed"), "error", json!("link_closed"))
+        with(
+            transfer(TID, "in", "x.bin", n, 1_081_344, "failed"),
+            "error",
+            json!("link_closed")
+        )
     );
-    assert_eq!(s.event().await, json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"})
+    );
     assert!(s.files().is_empty());
 }
 
-/// Enlace que falla al escribir un `file_result`: la sesión cae tras `finish()` y antes de confirmar.
-struct FallaEnFileResult(DuplexStream);
+/// Enlace que falla al escribir un mensaje de control con ese `kind`.
+struct FallaAlEscribir(DuplexStream, &'static str);
 
-impl AsyncRead for FallaEnFileResult {
-    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+impl AsyncRead for FallaAlEscribir {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Pin::new(&mut self.0).poll_read(cx, buf)
     }
 }
 
-impl AsyncWrite for FallaEnFileResult {
-    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
-        if buf.windows(20).any(|w| w == b"\"kind\":\"file_result\"") {
+impl AsyncWrite for FallaAlEscribir {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let marca = format!("\"kind\":\"{}\"", self.1);
+        if buf.windows(marca.len()).any(|w| w == marca.as_bytes()) {
             return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
         }
         Pin::new(&mut self.0).poll_write(cx, buf)
@@ -603,19 +777,44 @@ impl AsyncWrite for FallaEnFileResult {
 async fn si_cae_antes_de_file_result_se_borra_el_archivo_guardado() {
     let mut s = setup(None);
     let (a, b) = tokio::io::duplex(256 * 1024);
-    s.hub.accept_stream(FallaEnFileResult(b), Transport::Wifi);
+    // la sesión cae tras `finish()` y antes de confirmar
+    s.hub
+        .accept_stream(FallaAlEscribir(b, "file_result"), Transport::Wifi);
     let mut c = over(a);
     c.hello("m1", Some(false)).await;
     s.event().await;
     let data = datos(1000);
-    c.send(ControlMessage::FileStart { transfer_id: TID.into(), name: "a.txt".into(), size: 1000, mime: "x/y".into() }).await;
+    c.send(ControlMessage::FileStart {
+        transfer_id: TID.into(),
+        name: "a.txt".into(),
+        size: 1000,
+        mime: "x/y".into(),
+    })
+    .await;
     c.send_data(TID, &data).await;
-    c.send(ControlMessage::FileEnd { transfer_id: TID.into(), sha256: sha(&data) }).await;
+    c.send(ControlMessage::FileEnd {
+        transfer_id: TID.into(),
+        sha256: sha(&data),
+    })
+    .await;
     assert_eq!(c.ctrl().await, ack(1000));
     c.closed().await;
-    assert_eq!(s.event().await, transfer(TID, "in", "a.txt", 1000, 0, "active"));
-    assert_eq!(s.event().await, with(transfer(TID, "in", "a.txt", 1000, 1000, "failed"), "error", json!("link_closed")));
-    assert_eq!(s.event().await, json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"}));
+    assert_eq!(
+        s.event().await,
+        transfer(TID, "in", "a.txt", 1000, 0, "active")
+    );
+    assert_eq!(
+        s.event().await,
+        with(
+            transfer(TID, "in", "a.txt", 1000, 1000, "failed"),
+            "error",
+            json!("link_closed")
+        )
+    );
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"})
+    );
     assert!(s.files().is_empty(), "{:?}", s.files());
 }
 
@@ -625,18 +824,46 @@ async fn datos_rezagados_tras_cancelar_se_descartan() {
     let mut c = connect(&s.hub);
     c.hello("m1", Some(false)).await;
     s.event().await;
-    c.send(ControlMessage::FileStart { transfer_id: TID.into(), name: "a.txt".into(), size: 10, mime: "x/y".into() }).await;
-    assert_eq!(s.event().await, transfer(TID, "in", "a.txt", 10, 0, "active"));
+    c.send(ControlMessage::FileStart {
+        transfer_id: TID.into(),
+        name: "a.txt".into(),
+        size: 10,
+        mime: "x/y".into(),
+    })
+    .await;
+    assert_eq!(
+        s.event().await,
+        transfer(TID, "in", "a.txt", 10, 0, "active")
+    );
     s.hub.cancel_transfer(TID);
-    assert_eq!(c.ctrl().await, ControlMessage::FileCancel { transfer_id: TID.into(), reason: "cancelled".into() });
-    assert_eq!(s.event().await, transfer(TID, "in", "a.txt", 10, 0, "cancelled"));
+    assert_eq!(
+        c.ctrl().await,
+        ControlMessage::FileCancel {
+            transfer_id: TID.into(),
+            reason: "cancelled".into()
+        }
+    );
+    assert_eq!(
+        s.event().await,
+        transfer(TID, "in", "a.txt", 10, 0, "cancelled")
+    );
     c.send_data(TID, &datos(10)).await;
-    c.send(ControlMessage::FileEnd { transfer_id: TID.into(), sha256: sha(&datos(10)) }).await;
-    assert!(c.sync().await.is_empty(), "lo rezagado se descarta sin cerrar");
+    c.send(ControlMessage::FileEnd {
+        transfer_id: TID.into(),
+        sha256: sha(&datos(10)),
+    })
+    .await;
+    assert!(
+        c.sync().await.is_empty(),
+        "lo rezagado se descarta sin cerrar"
+    );
     assert!(s.files().is_empty());
     // un id nunca visto sí es un error de protocolo
     c.send_data(&"f".repeat(32), b"x").await;
-    assert_eq!(s.event().await, json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"}));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
+    );
 }
 
 // --- archivos salientes ---
@@ -678,7 +905,10 @@ async fn send_file_de_un_archivo_inexistente_es_read_error() {
     let mut c = connect(&s.hub);
     c.hello("m1", Some(false)).await;
     s.event().await;
-    assert_eq!(s.hub.send_file(Path::new("/no/existe/x.bin")), Err("read_error".to_string()));
+    assert_eq!(
+        s.hub.send_file(Path::new("/no/existe/x.bin")),
+        Err("read_error".to_string())
+    );
 }
 
 #[tokio::test]
@@ -692,30 +922,58 @@ async fn archivo_saliente_respeta_ventana_de_2_mib() {
     let data = datos(n as usize);
     let p = archivo_local(src.path(), "grande.bin", &data);
     let id = s.hub.send_file(&p).unwrap();
-    assert!(id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "{id}");
-    assert_eq!(s.event().await, transfer(&id, "out", "grande.bin", n, 0, "queued"));
-    assert_eq!(s.event().await, transfer(&id, "out", "grande.bin", n, 0, "active"));
+    assert!(
+        id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "{id}"
+    );
+    assert_eq!(
+        s.event().await,
+        transfer(&id, "out", "grande.bin", n, 0, "queued")
+    );
+    assert_eq!(
+        s.event().await,
+        transfer(&id, "out", "grande.bin", n, 0, "active")
+    );
     assert_eq!(
         c.ctrl().await,
-        ControlMessage::FileStart { transfer_id: id.clone(), name: "grande.bin".into(), size: n, mime: "application/octet-stream".into() }
+        ControlMessage::FileStart {
+            transfer_id: id.clone(),
+            name: "grande.bin".into(),
+            size: n,
+            mime: "application/octet-stream".into()
+        }
     );
 
     // sin confirmaciones salen exactamente 42 trozos (2 064 384 bytes)
     let mut recibido = recibir_datos(&mut c, &id, 42).await;
     assert!(c.sync().await.is_empty(), "nada más sin ack");
     // con 1 MiB confirmado caben 22 más (hasta 3 MiB enviados)
-    c.send(ControlMessage::FileAck { transfer_id: id.clone(), received: MIB }).await;
+    c.send(ControlMessage::FileAck {
+        transfer_id: id.clone(),
+        received: MIB,
+    })
+    .await;
     recibido.extend(recibir_datos(&mut c, &id, 22).await);
     assert_eq!(recibido.len() as u64, 3 * MIB);
     assert!(c.sync().await.is_empty(), "ventana llena otra vez");
-    assert_eq!(s.event().await, transfer(&id, "out", "grande.bin", n, MIB, "active"));
+    assert_eq!(
+        s.event().await,
+        transfer(&id, "out", "grande.bin", n, MIB, "active")
+    );
 
     // a partir de aquí se confirma cada trozo hasta file_end
     loop {
-        c.send(ControlMessage::FileAck { transfer_id: id.clone(), received: recibido.len() as u64 }).await;
+        c.send(ControlMessage::FileAck {
+            transfer_id: id.clone(),
+            received: recibido.len() as u64,
+        })
+        .await;
         match c.recv().await {
             Some(Decoded::Data { bytes, .. }) => recibido.extend(bytes),
-            Some(Decoded::Control(ControlMessage::FileEnd { transfer_id, sha256 })) => {
+            Some(Decoded::Control(ControlMessage::FileEnd {
+                transfer_id,
+                sha256,
+            })) => {
                 assert_eq!(transfer_id, id);
                 assert_eq!(sha256, sha(&data));
                 break;
@@ -724,9 +982,17 @@ async fn archivo_saliente_respeta_ventana_de_2_mib() {
         }
     }
     assert_eq!(recibido, data);
-    c.send(ControlMessage::FileResult { transfer_id: id.clone(), ok: true, error: None }).await;
+    c.send(ControlMessage::FileResult {
+        transfer_id: id.clone(),
+        ok: true,
+        error: None,
+    })
+    .await;
     let ev = s.transfer_until_end().await;
-    assert_eq!(ev.last().unwrap(), &transfer(&id, "out", "grande.bin", n, n, "done"));
+    assert_eq!(
+        ev.last().unwrap(),
+        &transfer(&id, "out", "grande.bin", n, n, "done")
+    );
 }
 
 #[tokio::test]
@@ -736,13 +1002,37 @@ async fn archivo_saliente_vacio() {
     c.hello("m1", Some(false)).await;
     s.event().await;
     let src = tempfile::tempdir().unwrap();
-    let id = s.hub.send_file(&archivo_local(src.path(), "vacio.txt", b"")).unwrap();
-    assert!(matches!(c.ctrl().await, ControlMessage::FileStart { size: 0, .. }));
-    assert_eq!(c.ctrl().await, ControlMessage::FileEnd { transfer_id: id.clone(), sha256: sha(b"") });
-    c.send(ControlMessage::FileAck { transfer_id: id.clone(), received: 0 }).await;
-    c.send(ControlMessage::FileResult { transfer_id: id.clone(), ok: true, error: None }).await;
+    let id = s
+        .hub
+        .send_file(&archivo_local(src.path(), "vacio.txt", b""))
+        .unwrap();
+    assert!(matches!(
+        c.ctrl().await,
+        ControlMessage::FileStart { size: 0, .. }
+    ));
+    assert_eq!(
+        c.ctrl().await,
+        ControlMessage::FileEnd {
+            transfer_id: id.clone(),
+            sha256: sha(b"")
+        }
+    );
+    c.send(ControlMessage::FileAck {
+        transfer_id: id.clone(),
+        received: 0,
+    })
+    .await;
+    c.send(ControlMessage::FileResult {
+        transfer_id: id.clone(),
+        ok: true,
+        error: None,
+    })
+    .await;
     let ev = s.transfer_until_end().await;
-    assert_eq!(ev.last().unwrap(), &transfer(&id, "out", "vacio.txt", 0, 0, "done"));
+    assert_eq!(
+        ev.last().unwrap(),
+        &transfer(&id, "out", "vacio.txt", 0, 0, "done")
+    );
 }
 
 #[tokio::test]
@@ -755,16 +1045,34 @@ async fn archivos_salientes_van_en_cola_y_a_la_sesion_mas_reciente() {
     b.hello("m2", Some(false)).await;
     s.event().await;
     let src = tempfile::tempdir().unwrap();
-    let id1 = s.hub.send_file(&archivo_local(src.path(), "uno.txt", b"1")).unwrap();
-    let id2 = s.hub.send_file(&archivo_local(src.path(), "dos.txt", b"22")).unwrap();
-    assert!(matches!(b.ctrl().await, ControlMessage::FileStart { transfer_id, .. } if transfer_id == id1));
+    let id1 = s
+        .hub
+        .send_file(&archivo_local(src.path(), "uno.txt", b"1"))
+        .unwrap();
+    let id2 = s
+        .hub
+        .send_file(&archivo_local(src.path(), "dos.txt", b"22"))
+        .unwrap();
+    assert!(
+        matches!(b.ctrl().await, ControlMessage::FileStart { transfer_id, .. } if transfer_id == id1)
+    );
     assert!(matches!(b.recv().await, Some(Decoded::Data { bytes, .. }) if bytes == b"1"));
     assert!(matches!(b.ctrl().await, ControlMessage::FileEnd { .. }));
     // el segundo espera en cola hasta el resultado del primero
     assert!(b.sync().await.is_empty());
-    b.send(ControlMessage::FileResult { transfer_id: id1.clone(), ok: false, error: None }).await;
-    assert!(matches!(b.ctrl().await, ControlMessage::FileStart { transfer_id, .. } if transfer_id == id2));
-    assert!(a.sync().await.is_empty(), "a la otra sesión no le llega nada");
+    b.send(ControlMessage::FileResult {
+        transfer_id: id1.clone(),
+        ok: false,
+        error: None,
+    })
+    .await;
+    assert!(
+        matches!(b.ctrl().await, ControlMessage::FileStart { transfer_id, .. } if transfer_id == id2)
+    );
+    assert!(
+        a.sync().await.is_empty(),
+        "a la otra sesión no le llega nada"
+    );
 
     let mut ev = Vec::new();
     for _ in 0..5 {
@@ -774,9 +1082,13 @@ async fn archivos_salientes_van_en_cola_y_a_la_sesion_mas_reciente() {
         ev,
         vec![
             transfer(&id1, "out", "uno.txt", 1, 0, "queued"),
-            transfer(&id1, "out", "uno.txt", 1, 0, "active"),
             transfer(&id2, "out", "dos.txt", 2, 0, "queued"),
-            with(transfer(&id1, "out", "uno.txt", 1, 0, "failed"), "error", json!("remote_error")),
+            transfer(&id1, "out", "uno.txt", 1, 0, "active"),
+            with(
+                transfer(&id1, "out", "uno.txt", 1, 0, "failed"),
+                "error",
+                json!("remote_error")
+            ),
             transfer(&id2, "out", "dos.txt", 2, 0, "active"),
         ]
     );
@@ -789,13 +1101,29 @@ async fn cancelar_saliente_envia_file_cancel() {
     c.hello("m1", Some(false)).await;
     s.event().await;
     let src = tempfile::tempdir().unwrap();
-    let id = s.hub.send_file(&archivo_local(src.path(), "g.bin", &datos(3 * MIB as usize))).unwrap();
+    let id = s
+        .hub
+        .send_file(&archivo_local(
+            src.path(),
+            "g.bin",
+            &datos(3 * MIB as usize),
+        ))
+        .unwrap();
     assert!(matches!(c.ctrl().await, ControlMessage::FileStart { .. }));
     recibir_datos(&mut c, &id, 42).await;
     s.hub.cancel_transfer(&id);
-    assert_eq!(c.ctrl().await, ControlMessage::FileCancel { transfer_id: id.clone(), reason: "cancelled".into() });
+    assert_eq!(
+        c.ctrl().await,
+        ControlMessage::FileCancel {
+            transfer_id: id.clone(),
+            reason: "cancelled".into()
+        }
+    );
     let ev = s.transfer_until_end().await;
-    assert_eq!(ev.last().unwrap(), &transfer(&id, "out", "g.bin", 3 * MIB, 0, "cancelled"));
+    assert_eq!(
+        ev.last().unwrap(),
+        &transfer(&id, "out", "g.bin", 3 * MIB, 0, "cancelled")
+    );
     assert!(c.sync().await.is_empty(), "la sesión sigue");
 }
 
@@ -806,8 +1134,18 @@ async fn cierre_con_archivos_salientes_los_marca_failed() {
     c.hello("m1", Some(false)).await;
     s.event().await;
     let src = tempfile::tempdir().unwrap();
-    let id1 = s.hub.send_file(&archivo_local(src.path(), "a.bin", &datos(3 * MIB as usize))).unwrap();
-    let id2 = s.hub.send_file(&archivo_local(src.path(), "b.bin", b"b")).unwrap();
+    let id1 = s
+        .hub
+        .send_file(&archivo_local(
+            src.path(),
+            "a.bin",
+            &datos(3 * MIB as usize),
+        ))
+        .unwrap();
+    let id2 = s
+        .hub
+        .send_file(&archivo_local(src.path(), "b.bin", b"b"))
+        .unwrap();
     assert!(matches!(c.ctrl().await, ControlMessage::FileStart { .. }));
     c.cut().await;
     let mut ev = Vec::new();
@@ -819,8 +1157,121 @@ async fn cierre_con_archivos_salientes_los_marca_failed() {
             break;
         }
     }
+    // queued se emite al llamar a send_file: nunca hay un failed sin queued antes
+    assert_eq!(ev[0], transfer(&id1, "out", "a.bin", 3 * MIB, 0, "queued"));
+    assert_eq!(ev[1], transfer(&id2, "out", "b.bin", 1, 0, "queued"));
     let n = ev.len();
-    assert_eq!(ev[n - 3], with(transfer(&id1, "out", "a.bin", 3 * MIB, 0, "failed"), "error", json!("link_closed")));
-    assert_eq!(ev[n - 2], with(transfer(&id2, "out", "b.bin", 1, 0, "failed"), "error", json!("link_closed")));
-    assert_eq!(ev[n - 1], json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"}));
+    assert_eq!(
+        ev[n - 3],
+        with(
+            transfer(&id1, "out", "a.bin", 3 * MIB, 0, "failed"),
+            "error",
+            json!("link_closed")
+        )
+    );
+    assert_eq!(
+        ev[n - 2],
+        with(
+            transfer(&id2, "out", "b.bin", 1, 0, "failed"),
+            "error",
+            json!("link_closed")
+        )
+    );
+    assert_eq!(
+        ev[n - 1],
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"})
+    );
+}
+
+// --- ronda de correcciones 1: clips no entregados y reconexión ---
+
+#[tokio::test]
+async fn clip_que_no_se_pudo_escribir_llega_al_reconectar() {
+    let mut s = setup(None);
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    s.hub
+        .accept_stream(FallaAlEscribir(b, "clip"), Transport::Wifi);
+    let mut c = over(a);
+    c.hello("m1", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    s.copy("texto");
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"})
+    );
+    c.closed().await;
+
+    let mut c = connect(&s.hub);
+    c.hello("m1", Some(false)).await;
+    assert!(matches!(c.ctrl().await, ControlMessage::Clip { text, .. } if text == "texto"));
+}
+
+#[tokio::test]
+async fn reconexion_con_la_sesion_vieja_medio_abierta_reenvia_el_texto_actual() {
+    let mut s = setup(None);
+    let mut viejo = connect(&s.hub);
+    viejo.hello("m1", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    // el clip "sale" por la sesión vieja, pero el móvil ya no lo recibe (TCP medio abierto)
+    s.copy("texto");
+    assert!(matches!(viejo.ctrl().await, ControlMessage::Clip { text, .. } if text == "texto"));
+
+    let mut nuevo = connect(&s.hub);
+    nuevo.hello("m1", Some(false)).await;
+    assert!(matches!(nuevo.ctrl().await, ControlMessage::Clip { text, .. } if text == "texto"));
+    assert_eq!(s.event().await, peer_connected(2, "m1", "wifi"));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "replaced"})
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn tras_caer_por_latido_la_reconexion_recibe_el_texto_actual() {
+    let mut s = setup(None);
+    let mut viejo = connect(&s.hub);
+    viejo.hello("m1", Some(false)).await;
+    s.event().await;
+    s.copy("texto");
+    assert!(matches!(viejo.ctrl().await, ControlMessage::Clip { text, .. } if text == "texto"));
+    let e = timeout(Duration::from_secs(60), s.events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        js(&e),
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "heartbeat_timeout"})
+    );
+
+    let mut nuevo = connect(&s.hub);
+    nuevo.hello("m1", Some(false)).await;
+    assert!(matches!(nuevo.ctrl().await, ControlMessage::Clip { text, .. } if text == "texto"));
+}
+
+#[tokio::test]
+async fn device_id_de_mas_de_128_bytes_es_protocol_error() {
+    let mut s = setup(None);
+    let mut ok = connect(&s.hub);
+    ok.hello(&"a".repeat(128), Some(false)).await;
+    assert_eq!(s.event().await["deviceId"], json!("a".repeat(128)));
+
+    let mut c = connect(&s.hub);
+    c.send(hello(&"b".repeat(129), Some(false))).await;
+    c.closed().await;
+    s.no_events();
+}
+
+#[tokio::test]
+async fn device_name_se_recorta_a_64_caracteres() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    c.send(ControlMessage::Hello {
+        v: 2,
+        device_id: "m1".into(),
+        device_name: "ñ".repeat(100),
+        will_send_clip: Some(false),
+    })
+    .await;
+    assert_eq!(c.ctrl().await, server_hello());
+    assert_eq!(s.event().await["deviceName"], json!("ñ".repeat(64)));
 }

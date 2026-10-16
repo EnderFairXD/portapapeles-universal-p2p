@@ -1,6 +1,7 @@
 //! Anuncio mDNS del servicio `_clipsync._tcp.local.` para que el móvil nos descubra en la LAN.
 
 use mdns_sd::{ServiceDaemon, ServiceInfo};
+use std::io::Write;
 
 use crate::protocol::{MDNS_FULL_SERVICE_TYPE, PROTOCOL_VERSION};
 
@@ -29,9 +30,12 @@ pub fn advertise(port: u16) -> Result<ServiceDaemon, mdns_sd::Error> {
 
     daemon.register(service_info)?;
 
-    println!(
+    let _ = writeln!(
+        std::io::stderr(),
         "[mDNS] Servicio anunciado: {} como \"{}\" en el puerto {}",
-        MDNS_FULL_SERVICE_TYPE, instance_name, port
+        MDNS_FULL_SERVICE_TYPE,
+        instance_name,
+        port
     );
 
     Ok(daemon)
