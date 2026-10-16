@@ -1,6 +1,5 @@
-// TODO(Tarea 8): quitar cuando el Hub use el módulo
-#[allow(dead_code)]
-mod core;
+// Público para que el ejemplo `headless` (Tarea 9) y la app usen el Hub.
+pub mod core;
 mod discovery;
 // TODO(Tarea 10): quitar cuando el Hub use el módulo
 #[allow(dead_code)]

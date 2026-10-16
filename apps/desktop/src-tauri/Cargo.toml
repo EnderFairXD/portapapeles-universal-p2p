@@ -30,7 +30,7 @@ hostname = "0.4.2"
 hex = "0.4.3"
 base64 = "0.23.1"
 dirs = "7.0.0"
-uuid = "1.26.1"
+uuid = { version = "1.26.1", features = ["v4"] }
 tokio-util = { version = "0.7.20", features = ["codec"] }
 futures = "0.3.34"
 thiserror = "2.0.21"
@@ -45,5 +45,6 @@ panic = "abort"
 strip = true
 
 [dev-dependencies]
+tokio = { version = "1.53.1", features = ["full", "test-util"] }
 bytes = "1.12.1"
 tempfile = "3.27.0"

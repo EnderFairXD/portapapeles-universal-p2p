@@ -21,7 +21,7 @@ fn es_espacio_js(c: char) -> bool {
     (c.is_whitespace() && c != '\u{85}') || c == '\u{FEFF}'
 }
 
-fn sha256_hex(text: &str) -> String {
+pub(super) fn sha256_hex(text: &str) -> String {
     hex::encode(Sha256::digest(text.as_bytes()))
 }
 
