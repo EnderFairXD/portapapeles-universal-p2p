@@ -9,6 +9,7 @@ use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -248,6 +249,32 @@ impl<W: AsyncWrite + Unpin> Client<W> {
     }
 }
 
+static FIN: AtomicU64 = AtomicU64::new(0);
+
+/// Barrera fiable tras `broadcast_clip`: difunde un texto nuevo (las órdenes de cada sesión van en
+/// orden) y devuelve, por cliente, los clips que llegaron antes. Un ping/pong no sirve aquí: la
+/// sesión puede atender el ping antes que las órdenes ya encoladas.
+async fn clips_antes_de_fin<W: AsyncWrite + Unpin>(
+    hub: &Hub,
+    cs: &mut [&mut Client<W>],
+) -> Vec<Vec<String>> {
+    let fin = format!("fin-{}", FIN.fetch_add(1, AtomicOrdering::Relaxed));
+    hub.broadcast_clip(&fin);
+    let mut out = Vec::new();
+    for c in cs.iter_mut() {
+        let mut v = Vec::new();
+        loop {
+            match c.ctrl().await {
+                ControlMessage::Clip { text, .. } if text == fin => break,
+                ControlMessage::Clip { text, .. } => v.push(text),
+                m => panic!("{m:?}"),
+            }
+        }
+        out.push(v);
+    }
+    out
+}
+
 // --- saludo y portapapeles ---
 
 #[tokio::test]
@@ -308,8 +335,10 @@ async fn clip_de_un_movil_se_reenvia_al_otro_y_no_vuelve() {
 
     // el PC escribe «x» en su portapapeles y el sondeo lo difunde: no sale hacia nadie
     s.hub.broadcast_clip("x");
-    assert!(a.sync().await.is_empty());
-    assert!(b.sync().await.is_empty());
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut a, &mut b]).await,
+        vec![Vec::<String>::new(), vec![]]
+    );
 
     b.send(clip("y")).await;
     assert_eq!(
@@ -346,7 +375,10 @@ async fn regla_inicio_al_ceder_marca_el_texto_local() {
     c.hello("m1", Some(true)).await;
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
     s.hub.broadcast_clip("pc");
-    assert!(c.sync().await.is_empty());
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
 }
 
 #[tokio::test]
@@ -364,7 +396,11 @@ async fn regla_inicio_solo_pc_cambio_envia_clip() {
         }
         assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
         s.hub.broadcast_clip("pc");
-        assert!(c.sync().await.is_empty(), "ya se envió al arrancar");
+        // ya se envió al arrancar
+        assert_eq!(
+            clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+            Vec::<Vec<String>>::from([vec![]])
+        );
         s.no_events();
     }
 }
@@ -380,9 +416,10 @@ async fn regla_inicio_texto_que_no_cabe_no_se_envia_ni_cede() {
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
     s.no_events();
     s.hub.broadcast_clip(&comillas);
-    assert!(
-        c.sync().await.is_empty(),
-        "too_large: no se envía ni se cierra"
+    // too_large: no se envía ni se cierra
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+        Vec::<Vec<String>>::from([vec![]])
     );
 }
 
@@ -464,7 +501,10 @@ async fn hello_duplicado_reemplaza_la_sesion_vieja() {
         json!({"type": "clipReceived", "sessionId": 2, "text": "z"})
     );
     s.hub.broadcast_clip("z");
-    assert!(b.sync().await.is_empty());
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut b]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
 }
 
 #[tokio::test]
@@ -740,8 +780,9 @@ async fn corte_a_mitad_borra_part_y_emite_failed() {
     assert!(s.files().is_empty());
 }
 
-/// Enlace que falla al escribir un mensaje de control con ese `kind`.
-struct FallaAlEscribir(DuplexStream, &'static str);
+/// Enlace que, al escribir un mensaje de control con ese `kind`, falla o (con `true`) se
+/// queda bloqueado para siempre, como un TCP medio abierto con el búfer lleno.
+struct FallaAlEscribir(DuplexStream, &'static str, bool);
 
 impl AsyncRead for FallaAlEscribir {
     fn poll_read(
@@ -761,6 +802,9 @@ impl AsyncWrite for FallaAlEscribir {
     ) -> Poll<std::io::Result<usize>> {
         let marca = format!("\"kind\":\"{}\"", self.1);
         if buf.windows(marca.len()).any(|w| w == marca.as_bytes()) {
+            if self.2 {
+                return Poll::Pending;
+            }
             return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
         }
         Pin::new(&mut self.0).poll_write(cx, buf)
@@ -779,7 +823,7 @@ async fn si_cae_antes_de_file_result_se_borra_el_archivo_guardado() {
     let (a, b) = tokio::io::duplex(256 * 1024);
     // la sesión cae tras `finish()` y antes de confirmar
     s.hub
-        .accept_stream(FallaAlEscribir(b, "file_result"), Transport::Wifi);
+        .accept_stream(FallaAlEscribir(b, "file_result", false), Transport::Wifi);
     let mut c = over(a);
     c.hello("m1", Some(false)).await;
     s.event().await;
@@ -1190,7 +1234,7 @@ async fn clip_que_no_se_pudo_escribir_llega_al_reconectar() {
     let mut s = setup(None);
     let (a, b) = tokio::io::duplex(256 * 1024);
     s.hub
-        .accept_stream(FallaAlEscribir(b, "clip"), Transport::Wifi);
+        .accept_stream(FallaAlEscribir(b, "clip", false), Transport::Wifi);
     let mut c = over(a);
     c.hello("m1", Some(false)).await;
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
@@ -1274,4 +1318,55 @@ async fn device_name_se_recorta_a_64_caracteres() {
     .await;
     assert_eq!(c.ctrl().await, server_hello());
     assert_eq!(s.event().await["deviceName"], json!("ñ".repeat(64)));
+}
+
+// --- ronda de correcciones 2: una sesión vieja que cae tarde no borra lo de la nueva ---
+
+#[tokio::test(start_paused = true)]
+async fn sesion_vieja_que_cae_tarde_no_borra_la_sincronia_de_la_nueva() {
+    let mut s = setup(None);
+    // la vieja se queda bloqueada al escribir un clip: no verá su Close("replaced")
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    s.hub
+        .accept_stream(FallaAlEscribir(b, "clip", true), Transport::Wifi);
+    let mut viejo = over(a);
+    viejo.hello("m1", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    s.copy("pc");
+
+    // la nueva llega con un texto más reciente del móvil: el PC cede y marca "pc"
+    let mut nuevo = connect(&s.hub);
+    nuevo.hello("m1", Some(true)).await;
+    assert_eq!(s.event().await, peer_connected(2, "m1", "wifi"));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "localClipSuperseded", "text": "pc"})
+    );
+    nuevo.send(clip("móvil")).await;
+    assert_eq!(
+        s.event().await,
+        json!({"type": "clipReceived", "sessionId": 2, "text": "móvil"})
+    );
+
+    // 30 s después la vieja cae por el plazo de escritura; la nueva sigue con tráfico
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        nuevo.send(ControlMessage::Pong).await;
+    }
+    let e = timeout(Duration::from_secs(60), s.events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        js(&e),
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "heartbeat_timeout"})
+    );
+
+    // las marcas de la nueva siguen: el texto ya sincronizado no vuelve a salir hacia ella
+    s.hub.broadcast_clip("móvil");
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut nuevo]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
+    s.no_events();
 }
