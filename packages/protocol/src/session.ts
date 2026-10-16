@@ -28,6 +28,7 @@ import {
 
 /** Flujo de bytes fiable (TCP, USB…); la sesión le aplica el framing. */
 export interface Link {
+  /** Debe lanzar si el enlace ya está cerrado: la sesión lo trata como 'link_closed'. */
   write(bytes: Uint8Array): void;
   close(): void;
   onData(cb: (bytes: Uint8Array) => void): void;
@@ -224,7 +225,8 @@ export class Session {
 
   /**
    * Pone un archivo en la cola de salida y devuelve su transferId. Se emite 'queued' al momento;
-   * si no hay otro en curso, también 'active'. Lanza si la sesión no está lista o ya se cerró.
+   * si no hay otro en curso, también 'active'. Lanza Error si la sesión no está lista o ya se cerró,
+   * y RangeError si `src.size` no es un entero seguro ≥ 0.
    */
   sendFile(src: FileSource): string {
     if (this.closed || !this.ready) throw new Error('La sesión no está lista');
@@ -484,8 +486,11 @@ export class Session {
 
   private async runOut(t: OutTransfer): Promise<void> {
     const { name, size, mime } = t.src;
-    this.emitOut(t, 'active');
+    // file_start sale antes del aviso: si un oyente cancela en 'active', file_cancel va detrás
     this.send({ kind: 'file_start', transferId: t.id, name, size, mime });
+    if (t.ended) return; // la escritura falló y cerró la sesión
+    this.emitOut(t, 'active');
+    if (t.ended) return; // un oyente canceló o cerró
     const hash = createSha256();
     for (;;) {
       let chunk: Uint8Array;

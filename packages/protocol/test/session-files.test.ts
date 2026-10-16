@@ -298,6 +298,16 @@ describe('cola', () => {
     expect(s.sinks[1].bytes()).toEqual(pattern(200));
   });
 
+  test('sendFile con un tamaño inválido lanza RangeError sin emitir nada', async () => {
+    const { c } = await connect();
+    for (const size of [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      const src = memorySource(pattern(1), 'x');
+      src.size = size;
+      expect(() => c.session.sendFile(src)).toThrow(RangeError);
+    }
+    expect(c.ev.transfers).toEqual([]);
+  });
+
   test('sendFile antes de ready o tras cerrar lanza un error', async () => {
     const [a] = linkPair();
     const { session } = makeSession(a, 'client');
@@ -491,6 +501,34 @@ describe('cancelar', () => {
     expect(c.ev.transfers.filter((u) => u.transferId === idB).map((u) => u.state)).toEqual(['queued', 'cancelled']);
     expect(last(c)).toMatchObject({ name: 'a', state: 'done' });
     expect(s.ev.transfers.some((u) => u.name === 'b')).toBe(false);
+  });
+
+  test('cancelar desde el evento active no desincroniza: file_start + file_cancel y la sesión sigue', async () => {
+    const outgoing: ControlMessage[] = [];
+    const { c, s } = await connect({
+      wrapClient: (l) => spyLink(l, (m) => m.type === 'control' && outgoing.push(m.msg)),
+    });
+    const off = c.session.on('transfer', (u) => {
+      if (u.direction === 'out' && u.state === 'active' && u.bytes === 0) c.session.cancelTransfer(u.transferId);
+    });
+    const src = memorySource(pattern(1000), 'reentrante');
+    const id = c.session.sendFile(src);
+    await flush();
+    off();
+    const forId = outgoing.filter((m) => 'transferId' in m && m.transferId === id).map((m) => m.kind);
+    expect(forId).toEqual(['file_start', 'file_cancel']);
+    expect(last(c)).toMatchObject({ transferId: id, state: 'cancelled' });
+    expect(src.closed).toBe(true);
+    expect(s.sinks[0].aborted).toBe(true);
+    expect(last(s)).toMatchObject({ transferId: id, state: 'cancelled' });
+
+    const data = pattern(2000);
+    c.session.sendFile(memorySource(data, 'siguiente'));
+    await flush();
+    expect(last(c)).toMatchObject({ name: 'siguiente', state: 'done' });
+    expect(s.sinks[1].bytes()).toEqual(data);
+    expect(c.ev.closed).toEqual([]);
+    expect(s.ev.closed).toEqual([]);
   });
 
   test('cancelar un id desconocido o ya terminado no hace nada', async () => {
