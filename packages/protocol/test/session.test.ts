@@ -133,6 +133,18 @@ describe('saludo y portapapeles', () => {
     expect(s.ev.clip).toEqual([]);
   });
 
+  test('sendClip de un texto cuyo JSON supera 2 MiB → too_large, sin marcar ni cerrar', async () => {
+    const { c, s } = await connect();
+    expect(c.session.sendClip('"'.repeat(MAX_CLIP_BYTES))).toBe('too_large');
+    expect(c.sync.lastSyncedHash).toBeNull();
+    await flush();
+    expect(s.ev.clip).toEqual([]);
+    expect(c.ev.closed).toEqual([]);
+    expect(c.session.sendClip('hola')).toBe('send');
+    await flush();
+    expect(s.ev.clip).toEqual(['hola']);
+  });
+
   test('sendClip antes del saludo lanza un error', () => {
     const [a] = linkPair();
     const { session } = makeSession(a, { role: 'client' });
@@ -188,6 +200,38 @@ describe('regla de inicio', () => {
     expect(s.ev.superseded).toEqual(['pc']);
     expect(c.sync.lastSyncedHash).toBe(sha256Hex('móvil'));
     expect(s.sync.lastSyncedHash).toBe(sha256Hex('móvil'));
+  });
+
+  test('inicio: el servidor no está ready hasta aplicar la regla (sendClip en ready no cruza clips)', async () => {
+    const [a, b] = linkPair();
+    const c = makeSession(a, { role: 'client', local: 'móvil' });
+    const s = makeSession(b, { role: 'server', local: 'pc' });
+    const onReady: string[] = [];
+    // la app del PC envía su portapapeles en cuanto ve ready
+    s.session.on('ready', () => onReady.push(s.session.sendClip('pc')));
+    await Promise.all([s.session.start(), c.session.start()]);
+    await flush();
+    expect(onReady).toEqual(['duplicate']);
+    expect(s.ev.superseded).toEqual(['pc']);
+    expect(s.ev.clip).toEqual(['móvil']);
+    expect(c.ev.clip).toEqual([]);
+    expect(c.sync.lastSyncedHash).toBe(sha256Hex('móvil'));
+    expect(s.sync.lastSyncedHash).toBe(sha256Hex('móvil'));
+  });
+
+  test('inicio: un clip que no cabe al codificarlo no se anuncia ni cierra la sesión', async () => {
+    const big = '"'.repeat(MAX_CLIP_BYTES); // pasa check(), pero su JSON supera 2 MiB
+    const movil = await connect({ local: big }, { local: 'pc' });
+    expect(movil.c.ev.closed).toEqual([]);
+    expect(movil.s.ev.closed).toEqual([]);
+    expect(movil.s.ev.superseded).toEqual([]); // el cliente no anunció willSendClip
+    expect(movil.c.ev.clip).toEqual(['pc']);
+
+    const pc = await connect({ local: null }, { local: big });
+    expect(pc.s.ev.closed).toEqual([]);
+    expect(pc.c.ev.closed).toEqual([]);
+    expect(pc.c.ev.clip).toEqual([]);
+    expect(pc.s.sync.lastSyncedHash).toBeNull();
   });
 
   test('inicio: nada cambió desde la última sincronización → nadie envía', async () => {
