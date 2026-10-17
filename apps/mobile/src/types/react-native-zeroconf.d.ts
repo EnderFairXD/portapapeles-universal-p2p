@@ -14,6 +14,8 @@ declare module 'react-native-zeroconf' {
     scan(type?: string, protocol?: string, domain?: string): void;
     stop(): void;
     on(event: 'resolved', handler: (service: ZeroconfService) => void): void;
+    on(event: 'remove', handler: (name: string) => void): void;
+    on(event: 'error', handler: (error: unknown) => void): void;
     removeListener(event: 'resolved', handler: (service: ZeroconfService) => void): void;
   }
 }

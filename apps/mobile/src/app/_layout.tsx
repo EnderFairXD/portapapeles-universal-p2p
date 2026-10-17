@@ -26,6 +26,13 @@ function ShareSender() {
   // por dónde va el intent actual, para no reenviar archivos si el efecto se repite
   const progress = useRef<ShareProgress | null>(null);
 
+  // con archivos por enviar, ir a segundo plano no corta la conexión (I1)
+  const pending = hasShareIntent && (shareIntent.files?.length ?? 0) > 0;
+  useEffect(() => {
+    connection.setSharePending(pending);
+  }, [pending]);
+  useEffect(() => () => connection.setSharePending(false), []);
+
   useEffect(() => {
     if (!error) return;
     connection.reportError(SHARE_FAILED);
