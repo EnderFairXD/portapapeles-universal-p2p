@@ -6,18 +6,32 @@ import {
   FILE_WINDOW_BYTES,
   FrameDecoder,
   MessageDecoder,
+  NoiseIK,
   Session,
   encodeFileData,
+  encodeFrame,
   sha256Hex,
+  type CipherState,
   type ControlMessage,
   type DecodedMessage,
   type FileMeta,
   type FileSink,
   type Link,
   type PeerInfo,
+  type RandomBytes,
   type TransferUpdate,
 } from '../src/index';
-import { fakeTimers, flush, linkPair, memorySink, memorySource, rawPeer, type MemorySink } from './helpers';
+import {
+  KEYS,
+  fakeTimers,
+  flush,
+  linkPair,
+  memorySink,
+  memorySource,
+  rawClient,
+  rawServer,
+  type MemorySink,
+} from './helpers';
 
 const MOVIL: PeerInfo = { deviceId: 'movil-1', deviceName: 'Pixel' };
 const PC: PeerInfo = { deviceId: 'pc-1', deviceName: 'PC' };
@@ -48,27 +62,66 @@ function gatedSink(name: string) {
   return { sink, release };
 }
 
-/** Enlace que decodifica lo que sale y lo que entra, sin alterarlo. */
-function spyLink(inner: Link, onOut: (m: DecodedMessage) => void, onIn: (m: DecodedMessage) => void = () => {}): Link {
-  const decode = (frames: FrameDecoder, messages: MessageDecoder, bytes: Uint8Array, cb: (m: DecodedMessage) => void) => {
-    for (const f of frames.push(bytes)) {
-      const m = messages.push(f);
-      if (m) cb(m);
-    }
-  };
+/** Aleatoriedad fija del cliente: su clave efímera es conocida y el espía puede seguir el cifrado. */
+const clientRandom: RandomBytes = (n) => new Uint8Array(n).fill(9);
+
+/**
+ * Enlace del cliente que ve en claro lo que sale y lo que entra. Repite el handshake con las
+ * mismas claves (las estáticas de prueba y la efímera fija del cliente), así que obtiene las
+ * mismas claves de transporte. `rewrite` puede cambiar un payload saliente antes de cifrarlo de
+ * nuevo; sin él, lo que se escribe es idéntico a lo que escribió la sesión.
+ */
+function spyLink(
+  inner: Link,
+  o: {
+    onOut?: (m: DecodedMessage) => void;
+    onIn?: (m: DecodedMessage) => void;
+    rewrite?: (payload: Uint8Array) => Uint8Array;
+  },
+): Link {
+  const mirror = () => NoiseIK.initiator({ s: KEYS.movil, rs: KEYS.pc.publicKey, randomBytes: clientRandom });
+  // uno descifra lo que sale y lo que entra; el otro vuelve a cifrar lo que sale
+  const reader = mirror();
+  const writer = mirror();
+  let rx: { send: CipherState; recv: CipherState } | null = null;
+  let tx: CipherState | null = null;
   const outF = new FrameDecoder();
   const outM = new MessageDecoder();
   const inF = new FrameDecoder();
   const inM = new MessageDecoder();
+  const emit = (messages: MessageDecoder, payload: Uint8Array, cb?: (m: DecodedMessage) => void) => {
+    const m = messages.push(payload);
+    if (m && cb) cb(m);
+  };
   return {
     write(bytes) {
-      decode(outF, outM, bytes, onOut);
-      inner.write(bytes);
+      for (const f of outF.push(bytes)) {
+        if (!rx) {
+          // mensaje 1: se lee con la clave del PC para repetirlo igual en los dos espejos
+          const hello = NoiseIK.responder({ s: KEYS.pc }).readMessage(f);
+          reader.writeMessage(hello);
+          writer.writeMessage(hello);
+          inner.write(encodeFrame(f));
+          continue;
+        }
+        const plain = rx.send.decrypt(f);
+        emit(outM, plain, o.onOut);
+        inner.write(encodeFrame(tx!.encrypt(o.rewrite ? o.rewrite(plain) : plain)));
+      }
     },
     close: () => inner.close(),
     onData(cb) {
       inner.onData((bytes) => {
-        decode(inF, inM, bytes, onIn);
+        for (const f of inF.push(bytes)) {
+          if (!rx) {
+            reader.readMessage(f);
+            writer.readMessage(f);
+            rx = reader.split();
+            tx = writer.split().send;
+          } else {
+            emit(inM, rx.recv.decrypt(f), o.onIn);
+          }
+        }
         cb(bytes);
       });
     },
@@ -82,6 +135,10 @@ function makeSession(link: Link, role: 'client' | 'server', openSink?: (meta: Fi
   const session = new Session(link, {
     role,
     self: role === 'client' ? MOVIL : PC,
+    identity: role === 'client' ? KEYS.movil : KEYS.pc,
+    randomBytes: role === 'client' ? clientRandom : undefined,
+    serverKey: KEYS.pc.publicKey,
+    authorize: async () => ({ accepted: true }),
     clipSyncFor: () => new ClipboardSync(),
     getLocalClip: async () => null,
     openSink:
@@ -128,21 +185,17 @@ function last(m: Made): TransferUpdate {
 async function serverAgainstRaw() {
   const [a, b] = linkPair();
   const s = makeSession(b, 'server');
-  const raw = rawPeer(a);
   await s.session.start();
-  raw.send({ kind: 'hello', v: 2, ...MOVIL });
+  const raw = await rawClient(a);
   await flush();
   return { s, raw };
 }
 
-/** Cliente real contra un servidor «a mano» que contesta al hello. */
+/** Cliente real contra un servidor «a mano» que acepta el handshake. */
 async function clientAgainstRaw() {
   const [a, b] = linkPair();
   const c = makeSession(a, 'client');
-  const raw = rawPeer(b);
-  raw.onMessage((m) => {
-    if (m.type === 'control' && m.msg.kind === 'hello') raw.send({ kind: 'hello', v: 2, ...PC });
-  });
+  const raw = rawServer(b);
   await c.session.start();
   await flush();
   return { c, raw };
@@ -237,17 +290,16 @@ describe('control de flujo', () => {
     const { c } = await connect({
       serverSink: async () => g.sink,
       wrapClient: (l) =>
-        spyLink(
-          l,
-          (m) => {
+        spyLink(l, {
+          onOut: (m) => {
             if (m.type !== 'data') return;
             sent += m.bytes.length;
             maxUnacked = Math.max(maxUnacked, sent - acked);
           },
-          (m) => {
+          onIn: (m) => {
             if (m.type === 'control' && m.msg.kind === 'file_ack') acked = m.msg.received;
           },
-        ),
+        }),
     });
     const data = pattern(5 * MiB + 7);
     c.session.sendFile(memorySource(data, 'grande'));
@@ -275,7 +327,8 @@ describe('control de flujo', () => {
     await flush();
     expect(dataBytes()).toBe(n); // quedaban menos de 2 MiB
     const kinds = raw.controls().map((m) => m.kind);
-    expect(kinds).toEqual(['hello', 'file_start', 'file_end']);
+    expect(raw.clientHello()).not.toBeNull();
+    expect(kinds).toEqual(['file_start', 'file_end']);
     expect(last(c).state).toBe('active');
 
     raw.send({ kind: 'file_result', transferId: id, ok: true });
@@ -321,18 +374,18 @@ describe('cola', () => {
 describe('errores', () => {
   test('hash distinto → receptor aborta el sink y ambos lados terminan failed/checksum_mismatch', async () => {
     let corrupted = false;
-    const corrupt = (l: Link): Link => ({
-      ...l,
-      write(bytes) {
-        if (!corrupted && bytes[2] === 0x02) {
+    // se altera el texto en claro del primer trozo de datos y se vuelve a cifrar: el cifrado
+    // no se queja y solo el hash del archivo puede detectarlo
+    const corrupt = (l: Link): Link =>
+      spyLink(l, {
+        rewrite(payload) {
+          if (corrupted || payload[0] !== 0x02) return payload;
           corrupted = true;
-          const copy = bytes.slice();
+          const copy = payload.slice();
           copy[copy.length - 1] ^= 0xff;
-          return l.write(copy);
-        }
-        l.write(bytes);
-      },
-    });
+          return copy;
+        },
+      });
     const { c, s } = await connect({ wrapClient: corrupt });
     const src = memorySource(pattern(3 * FILE_CHUNK_BYTES), 'roto');
     c.session.sendFile(src);
@@ -440,7 +493,7 @@ describe('cancelar', () => {
     const outgoing: ControlMessage[] = [];
     const { c, s } = await connect({
       serverSink: async () => g.sink,
-      wrapClient: (l) => spyLink(l, (m) => m.type === 'control' && outgoing.push(m.msg)),
+      wrapClient: (l) => spyLink(l, { onOut: (m) => m.type === 'control' && outgoing.push(m.msg) }),
     });
     const src = memorySource(pattern(4 * MiB), 'c');
     const id = c.session.sendFile(src);
@@ -487,7 +540,7 @@ describe('cancelar', () => {
     const outgoing: ControlMessage[] = [];
     const { c, s } = await connect({
       serverSink: async (meta) => (meta.name === 'a' ? g.sink : memorySink(meta.name)),
-      wrapClient: (l) => spyLink(l, (m) => m.type === 'control' && outgoing.push(m.msg)),
+      wrapClient: (l) => spyLink(l, { onOut: (m) => m.type === 'control' && outgoing.push(m.msg) }),
     });
     c.session.sendFile(memorySource(pattern(3 * MiB), 'a'));
     const srcB = memorySource(pattern(10), 'b');
@@ -506,7 +559,7 @@ describe('cancelar', () => {
   test('cancelar desde el evento active no desincroniza: file_start + file_cancel y la sesión sigue', async () => {
     const outgoing: ControlMessage[] = [];
     const { c, s } = await connect({
-      wrapClient: (l) => spyLink(l, (m) => m.type === 'control' && outgoing.push(m.msg)),
+      wrapClient: (l) => spyLink(l, { onOut: (m) => m.type === 'control' && outgoing.push(m.msg) }),
     });
     const off = c.session.on('transfer', (u) => {
       if (u.direction === 'out' && u.state === 'active' && u.bytes === 0) c.session.cancelTransfer(u.transferId);
@@ -588,7 +641,7 @@ describe('cierre y convivencia', () => {
   test('si falla el ack final de file_end, el sink se aborta y nunca se llama a finish()', async () => {
     const [a, b] = linkPair();
     let writes = 0;
-    // el servidor solo consigue escribir su hello
+    // el servidor solo consigue escribir su mensaje 2 del handshake
     const failing: Link = {
       ...b,
       write(bytes) {

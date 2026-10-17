@@ -6,10 +6,17 @@ import {
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_TIMEOUT_MS,
   MAX_CLIP_BYTES,
-  PROTOCOL_VERSION,
 } from './constants';
 import { FrameDecoder, encodeFrame } from './framing';
 import { createSha256, sha256Hex } from './hash';
+import {
+  decodeClientHello,
+  decodeServerHello,
+  encodeClientHello,
+  encodeServerHello,
+  type ClientHello,
+  type RejectReason,
+} from './hello';
 import {
   MessageDecoder,
   ProtocolError,
@@ -23,8 +30,8 @@ import {
   type FileEndMsg,
   type FileResultMsg,
   type FileStartMsg,
-  type HelloMsg,
 } from './messages';
+import { NoiseIK, type CipherState, type KeyPair, type RandomBytes } from './noise';
 import { toWellFormed } from './text';
 
 /** Flujo de bytes fiable (TCP, USB…); la sesión le aplica el framing. */
@@ -84,14 +91,27 @@ export interface TransferUpdate {
   location?: string;
 }
 
+/** Respuesta de `authorize` (servidor): se acepta al cliente o se rechaza con un motivo. */
+export type AuthDecision = { accepted: true } | { accepted: false; reason: RejectReason };
+
 export interface SessionOptions {
   role: 'client' | 'server';
   self: PeerInfo;
+  /** Clave estática Noise propia. */
+  identity: KeyPair;
+  /** Por defecto, la de @noble; el móvil pasa la de expo-crypto. */
+  randomBytes?: RandomBytes;
+  /** Cliente: clave pública del PC (del QR). Obligatoria con role 'client'. */
+  serverKey?: Uint8Array;
+  /** Cliente: token del QR mientras el emparejamiento no se ha completado. */
+  pairingToken?: string | null;
+  /** Servidor (solo pruebas en TS; el servidor real es Rust). Obligatoria con role 'server'. */
+  authorize?(req: { publicKey: Uint8Array; hello: ClientHello }): Promise<AuthDecision>;
   /**
    * ClipboardSync con el que se compara y marca lo sincronizado con este par.
-   * - Cliente: se llama con `null` en `start()`, antes de enviar su `hello`, para calcular
+   * - Cliente: se llama con `null` en `start()`, antes del mensaje 1 del handshake, para calcular
    *   `willSendClip` (aún no conoce al servidor; el móvil devuelve una única instancia).
-   * - Servidor: se llama con los datos del cliente al recibir su `hello`.
+   * - Servidor: se llama con los datos del cliente al leer su mensaje 1.
    */
   clipSyncFor(peer: PeerInfo | null): ClipboardSync;
   getLocalClip(): Promise<string | null>;
@@ -156,6 +176,8 @@ const defaultTimers: Timers = {
 
 /**
  * Sesión del protocolo v2 sobre un enlace, independiente del transporte.
+ * Empieza con un handshake Noise IK cuyos dos mensajes llevan el saludo (el móvil es el
+ * iniciador); después, cada trama es un mensaje Noise de transporte.
  * Los mensajes entrantes se atienden en orden, de uno en uno, aunque su manejo sea asíncrono.
  */
 export class Session {
@@ -174,7 +196,11 @@ export class Session {
   private queue: Promise<void> = Promise.resolve();
   private started = false;
   private closed = false;
-  private helloReceived = false;
+  private readonly hs: NoiseIK;
+  /** Mensajes del handshake escritos o leídos (0, 1 o 2). */
+  private hsStep = 0;
+  /** Cifrado de transporte, tras split(). */
+  private cipher: { send: CipherState; recv: CipherState } | null = null;
   private ready = false;
   private remote: PeerInfo | null = null;
   private sync: ClipboardSync | null = null;
@@ -201,6 +227,14 @@ export class Session {
     private readonly opts: SessionOptions,
   ) {
     this.timers = opts.timers ?? defaultTimers;
+    const { identity: s, randomBytes } = opts;
+    if (opts.role === 'client') {
+      if (!opts.serverKey) throw new Error('El cliente necesita serverKey');
+      this.hs = NoiseIK.initiator({ s, rs: opts.serverKey, randomBytes });
+    } else {
+      if (!opts.authorize) throw new Error('El servidor necesita authorize');
+      this.hs = NoiseIK.responder({ s, randomBytes });
+    }
   }
 
   on<E extends keyof SessionEvents>(event: E, cb: SessionEvents[E]): () => void {
@@ -222,8 +256,10 @@ export class Session {
 
     this.link.onData((bytes) => this.onData(bytes));
     // tras procesar lo que ya llegó, como haría un bucle de lectura sobre TCP
-    this.link.onClose(() => void this.enqueue(() => this.close('link_closed')));
-    // el plazo del latido cuenta desde ya, también durante el saludo
+    this.link.onClose(
+      () => void this.enqueue(() => this.close(this.awaitingServer() ? 'handshake_failed' : 'link_closed')),
+    );
+    // el plazo del latido cuenta desde ya, también durante el handshake
     this.lastRx = this.timers.now();
     this.heartbeat = this.timers.setInterval(() => this.tick(), HEARTBEAT_INTERVAL_MS);
 
@@ -312,11 +348,16 @@ export class Session {
     if (this.closed) return;
     this.lastRx = this.timers.now();
     for (const frame of this.frames.push(bytes)) {
+      if (!this.cipher) {
+        // se lee al momento: las tramas siguientes del mismo trozo ya se descifran en orden
+        if (!this.onHandshakeFrame(frame)) return;
+        continue;
+      }
       let decoded: DecodedMessage | null;
       try {
-        decoded = this.messages.push(frame);
+        decoded = this.messages.push(this.cipher.recv.decrypt(frame));
       } catch (e) {
-        this.fail(e);
+        this.fail(e); // también un fallo de descifrado: protocol_error
         return;
       }
       if (!decoded) continue;
@@ -334,7 +375,9 @@ export class Session {
   /** Pong fuera de la cola. Si el enlace cayó, se cierra por la cola: antes se atiende lo que ya llegó. */
   private pongNow(): void {
     try {
-      for (const payload of encodeControl({ kind: 'pong' })) this.link.write(encodeFrame(payload));
+      for (const payload of encodeControl({ kind: 'pong' })) {
+        this.link.write(encodeFrame(this.cipher!.send.encrypt(payload)));
+      }
     } catch {
       void this.enqueue(() => this.close('link_closed'));
     }
@@ -352,20 +395,13 @@ export class Session {
     this.close(e instanceof ProtocolError ? 'protocol_error' : 'internal_error');
   }
 
+  /** Las tramas de transporte solo se encolan tras el saludo, así que aquí la sesión ya está lista. */
   private dispatch(m: DecodedMessage): void | Promise<void> {
-    if (m.type === 'data') {
-      if (!this.ready) throw new ProtocolError('datos de archivo antes del saludo');
-      return this.onFileData(m.transferId, m.bytes);
-    }
+    if (m.type === 'data') return this.onFileData(m.transferId, m.bytes);
     const msg = m.msg;
-    if (!this.helloReceived) {
-      if (msg.kind !== 'hello') throw new ProtocolError(`'${msg.kind}' antes del hello`);
-      this.helloReceived = true;
-      return this.opts.role === 'server' ? this.onClientHello(msg) : this.onServerHello(msg);
-    }
     switch (msg.kind) {
       case 'hello':
-        throw new ProtocolError('hello repetido');
+        throw new ProtocolError('hello tras el handshake: el saludo va dentro del handshake');
       case 'ping':
         this.send({ kind: 'pong' });
         return;
@@ -379,7 +415,47 @@ export class Session {
     }
   }
 
-  // --- saludo y regla de inicio (spec §3.5) ---
+  // --- handshake Noise IK con el saludo dentro, y regla de inicio (spec §3.5) ---
+
+  /** Cliente: con el mensaje 1 ya enviado, espera el 2; si el enlace cae ahora, el handshake falló. */
+  private awaitingServer(): boolean {
+    return this.opts.role === 'client' && this.hsStep === 1;
+  }
+
+  /**
+   * Trama recibida antes del cifrado de transporte. Se lee al momento (el servidor solo el
+   * mensaje 1; el cliente, el 2 tras enviar el 1); el resto del saludo sigue por la cola.
+   * Devuelve false si la sesión se cerró.
+   */
+  private onHandshakeFrame(frame: Uint8Array): boolean {
+    const client = this.opts.role === 'client';
+    if (this.hsStep !== (client ? 1 : 0)) {
+      // cliente: antes de su mensaje 1; servidor: antes de contestar al 1
+      this.close('protocol_error');
+      return false;
+    }
+    this.hsStep++;
+    try {
+      const payload = this.hs.readMessage(frame);
+      if (!client) {
+        const hello = decodeClientHello(payload);
+        const publicKey = this.hs.remoteStatic!;
+        void this.enqueue(() => this.onClientHello(hello, publicKey));
+        return true;
+      }
+      const answer = decodeServerHello(payload);
+      this.cipher = this.hs.split();
+      if (!answer.accepted) {
+        this.close(answer.reason);
+        return false;
+      }
+      void this.enqueue(() => this.onServerHello({ deviceId: answer.deviceId, deviceName: answer.pcName }));
+      return true;
+    } catch {
+      this.close('handshake_failed');
+      return false;
+    }
+  }
 
   private async sendClientHello(): Promise<void> {
     this.sync = this.opts.clipSyncFor(null);
@@ -388,22 +464,47 @@ export class Session {
     // se anuncia solo lo que de verdad se podrá enviar (también si no cabe al codificarlo)
     const willSendClip = local !== null && this.prepareClip(local).decision === 'send';
     if (willSendClip) this.startClip = local;
-    this.send({ kind: 'hello', v: PROTOCOL_VERSION, ...this.self(), willSendClip });
+    const hello: ClientHello = { v: 2, ...this.self(), willSendClip };
+    if (this.opts.pairingToken != null) hello.pairingToken = this.opts.pairingToken;
+    const msg1 = this.hs.writeMessage(encodeClientHello(hello));
+    this.hsStep = 1;
+    this.writeFrame(msg1);
   }
 
-  private onServerHello(msg: HelloMsg): void {
+  private onServerHello(peer: PeerInfo): void {
     const text = this.startClip;
     this.startClip = null;
     if (text !== null) this.pushStartClip(text); // antes de ready, igual que el servidor
     if (this.closed) return; // falló la escritura del clip
-    this.becomeReady(msg);
+    this.becomeReady(peer);
   }
 
-  private async onClientHello(msg: HelloMsg): Promise<void> {
-    const peer = { deviceId: msg.deviceId, deviceName: msg.deviceName };
-    const sync = (this.sync = this.opts.clipSyncFor(peer));
-    this.send({ kind: 'hello', v: PROTOCOL_VERSION, ...this.self() });
+  private async onClientHello(hello: ClientHello, publicKey: Uint8Array): Promise<void> {
+    let decision: AuthDecision;
+    try {
+      decision = await this.opts.authorize!({ publicKey, hello });
+    } catch {
+      this.close('internal_error');
+      return;
+    }
+    if (this.closed) return;
+    const msg2 = this.hs.writeMessage(
+      encodeServerHello(
+        decision.accepted
+          ? { v: 2, accepted: true, deviceId: this.opts.self.deviceId, pcName: this.opts.self.deviceName }
+          : { v: 2, accepted: false, reason: decision.reason },
+      ),
+    );
+    this.hsStep = 2;
+    this.cipher = this.hs.split();
+    this.writeFrame(msg2);
+    if (!decision.accepted) {
+      this.close(decision.reason);
+      return;
+    }
 
+    const peer = { deviceId: hello.deviceId, deviceName: hello.deviceName };
+    const sync = (this.sync = this.opts.clipSyncFor(peer));
     // La regla se resuelve antes de ready: hasta entonces la app no puede llamar a sendClip.
     // La cola espera a esto, así que el clip del cliente aún no se ha procesado.
     const raw = await this.opts.getLocalClip();
@@ -411,7 +512,7 @@ export class Session {
     const local = raw === null ? null : toWellFormed(raw);
     let superseded: string | null = null;
     if (local !== null) {
-      if (!msg.willSendClip) this.pushStartClip(local);
+      if (!hello.willSendClip) this.pushStartClip(local);
       else if (this.prepareClip(local).decision === 'send') {
         // gana el móvil: el texto del PC se da por tratado para que no salga después y cruce
         sync.markSynced(local);
@@ -419,13 +520,13 @@ export class Session {
       }
     }
     if (this.closed) return; // falló la escritura del clip
-    this.becomeReady(msg);
+    this.becomeReady(peer);
     if (this.closed) return; // la app cerró desde ready
     if (superseded !== null) this.emit('localClipSuperseded', superseded);
   }
 
-  private becomeReady(msg: HelloMsg): void {
-    this.remote = { deviceId: msg.deviceId, deviceName: msg.deviceName };
+  private becomeReady(peer: PeerInfo): void {
+    this.remote = peer;
     this.ready = true;
     this.emit('ready', this.remote);
   }
@@ -750,10 +851,19 @@ export class Session {
     this.write(encodeControl(msg));
   }
 
+  /** Cifra cada payload y lo escribe en su trama. */
   private write(payloads: Uint8Array[]): void {
+    for (const payload of payloads) {
+      if (this.closed) return;
+      this.writeFrame(this.cipher!.send.encrypt(payload));
+    }
+  }
+
+  /** Escribe una trama tal cual (un mensaje del handshake o uno ya cifrado). */
+  private writeFrame(data: Uint8Array): void {
     if (this.closed) return;
     try {
-      for (const payload of payloads) this.link.write(encodeFrame(payload));
+      this.link.write(encodeFrame(data));
     } catch {
       this.close('link_closed'); // fallo de escritura: el enlace está caído
     }
