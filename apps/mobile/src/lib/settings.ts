@@ -3,6 +3,7 @@ import * as Crypto from 'expo-crypto';
 import { File, Paths } from 'expo-file-system';
 
 import { parseLastPc, type PcAddress } from './pcAddress';
+import { parsePairedPc, type PairedPc } from './pairing';
 
 export interface Settings {
   /** Carpeta SAF elegida para guardar los archivos recibidos. */
@@ -11,6 +12,8 @@ export interface Settings {
   lastSyncedHash: string | null;
   /** Última dirección WiFi del PC con la que se conectó. */
   lastPc: PcAddress | null;
+  /** El PC emparejado; null hasta escanear su QR. */
+  pc: PairedPc | null;
 }
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
@@ -38,11 +41,17 @@ export function loadSettings(): Settings {
     receiveDirUri: typeof raw?.receiveDirUri === 'string' ? raw.receiveDirUri : null,
     lastSyncedHash: typeof raw?.lastSyncedHash === 'string' && SHA256_HEX.test(raw.lastSyncedHash) ? raw.lastSyncedHash : null,
     lastPc: parseLastPc(raw?.lastPc),
+    pc: parsePairedPc(raw?.pc),
   };
 }
 
 export function saveSettings(s: Settings): void {
-  writeJson('settings.json', { receiveDirUri: s.receiveDirUri, lastSyncedHash: s.lastSyncedHash, lastPc: s.lastPc });
+  writeJson('settings.json', {
+    receiveDirUri: s.receiveDirUri,
+    lastSyncedHash: s.lastSyncedHash,
+    lastPc: s.lastPc,
+    pc: s.pc,
+  });
 }
 
 /** Cambia solo esos campos; un fallo al escribir se ignora (vale para esta ejecución). */

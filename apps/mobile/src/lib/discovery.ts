@@ -44,19 +44,19 @@ export function stopDiscovery(): void {
   }
 }
 
-function resolved(): PcAddress[] {
-  return [...services.values()].flatMap(servicePcs);
+function resolved(fp: string): PcAddress[] {
+  return [...services.values()].flatMap((s) => servicePcs(s, fp));
 }
 
-/** Direcciones de los PC resueltos; si aún no hay ninguno, espera hasta `timeoutMs`. */
-export function resolvedPcs(timeoutMs: number): Promise<PcAddress[]> {
+/** Direcciones del PC con esa huella; si aún no hay ninguna, espera hasta `timeoutMs`. */
+export function resolvedPcs(timeoutMs: number, fp: string): Promise<PcAddress[]> {
   startDiscovery();
-  const now = resolved();
+  const now = resolved(fp);
   if (now.length > 0 || timeoutMs <= 0) return Promise.resolve(now);
   return new Promise((resolve) => {
     const done = () => {
-      const pcs = resolved();
-      if (pcs.length === 0 && !expired) return; // otro servicio que no vale
+      const pcs = resolved(fp);
+      if (pcs.length === 0 && !expired) return; // otro servicio u otro PC
       clearTimeout(timer);
       waiters.delete(done);
       resolve(pcs);

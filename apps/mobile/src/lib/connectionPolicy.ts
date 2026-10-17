@@ -99,3 +99,34 @@ export function backgroundDecision(s: { appState: string; pickerOpen: boolean; b
   if (s.appState !== 'background' || s.pickerOpen) return 'none';
   return s.busy ? 'watcher_only' : 'pause';
 }
+
+// --- cierre de la sesión: reintentar o desemparejar (D8) ---
+
+/** Handshakes fallidos seguidos, con el PC alcanzable, tras los que se da el emparejamiento por roto. */
+export const MAX_HANDSHAKE_FAILURES = 3;
+
+export type CloseOutcome = { kind: 'retry'; handshakeFailures: number } | { kind: 'unpair'; message: string };
+
+/**
+ * Qué hacer cuando se cierra la sesión. `ctx.handshakeFailures` son los fallos seguidos hasta
+ * ahora (sin contar este cierre) y `tokenSent` si esta sesión llevaba el token del QR.
+ */
+export function closeOutcome(reason: string, ctx: { tokenSent: boolean; handshakeFailures: number }): CloseOutcome {
+  switch (reason) {
+    case 'not_paired':
+      return {
+        kind: 'unpair',
+        message: ctx.tokenSent ? 'El QR no es válido. Genera uno nuevo en el PC.' : 'Este PC no te reconoce. Vuelve a emparejar.',
+      };
+    case 'pairing_expired':
+      return { kind: 'unpair', message: 'QR caducado. Genera uno nuevo en el PC.' };
+    case 'handshake_failed': {
+      const failures = ctx.handshakeFailures + 1;
+      return failures >= MAX_HANDSHAKE_FAILURES
+        ? { kind: 'unpair', message: 'No se pudo verificar el PC. Vuelve a emparejar.' }
+        : { kind: 'retry', handshakeFailures: failures };
+    }
+    default:
+      return { kind: 'retry', handshakeFailures: ctx.handshakeFailures };
+  }
+}

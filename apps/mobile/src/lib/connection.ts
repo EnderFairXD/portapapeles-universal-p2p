@@ -6,8 +6,11 @@ import {
   RECONNECT_INTERVAL_MS,
   Session,
   decideClip,
+  fingerprint,
   type FileSource,
+  type KeyPair,
   type Link,
+  type PairingInfo,
   type PeerInfo,
   type TransferUpdate,
 } from '@clipsync/protocol';
@@ -17,9 +20,11 @@ import { AppState, type AppStateStatus, type NativeEventSubscription } from 'rea
 
 import { readClipboard, startClipboardWatcher, writeClipboard } from './clipboardWatcher';
 import { resolvedPcs, startDiscovery, stopDiscovery } from './discovery';
+import { loadIdentity } from './identity';
 import {
   backgroundDecision,
   classifySendError,
+  closeOutcome,
   createPauseCheck,
   hasPendingWork,
   INVALID_FILE_SIZE_MESSAGE,
@@ -28,12 +33,13 @@ import {
   type SendFileResult,
 } from './connectionPolicy';
 import { isPickerOpen, onPickerSettled, openSink, resetPickers } from './files';
+import { bytesToHex, hexToBytes, pairedPcFromInfo, type PairedPc } from './pairing';
 import { connectCandidates, type PcAddress } from './pcAddress';
 import { getDeviceId, loadSettings, updateSettings } from './settings';
 import { SyncKeeper } from './syncKeeper';
 import { connectTcp } from './tcpLink';
 
-export type ConnStatus = 'searching' | 'connecting' | 'connected';
+export type ConnStatus = 'unpaired' | 'searching' | 'connecting' | 'connected';
 export type Transport = 'wifi' | 'usb';
 
 export interface HistoryEntry {
@@ -58,6 +64,8 @@ export interface ConnState {
   history: HistoryEntry[];
   /** Último aviso para el usuario; se borra al enviar algo con éxito o con clearError(). */
   lastError: string | null;
+  /** El PC emparejado; `pairing` mientras falta completar el emparejamiento con el token del QR. */
+  pc: { name: string; pairing: boolean } | null;
 }
 
 /** Terminadas (fallidas o canceladas) que se conservan en la lista, como en el PC. */
@@ -65,6 +73,8 @@ export const MAX_FINISHED_TRANSFERS = 5;
 const USB_HOST = '127.0.0.1';
 
 const CLIP_TOO_LARGE = 'Texto demasiado grande para sincronizar (máx. 1 MB)';
+const PC_UNREACHABLE = 'PC no alcanzable. Comprueba que el móvil y el PC están en la misma red WiFi.';
+const IDENTITY_FAILED = 'No se pudo acceder al almacén seguro del móvil.';
 const CLIP_WRITE_FAILED = 'No se pudo escribir en el portapapeles';
 /** Margen tras cerrarse un selector antes de pausar si la app sigue en segundo plano. */
 const PICKER_SETTLE_MS = 1000;
@@ -73,10 +83,8 @@ function isFinished(u: TransferUpdate): boolean {
   return u.state === 'done' || u.state === 'failed' || u.state === 'cancelled';
 }
 
-function toHex(bytes: Uint8Array): string {
-  let out = '';
-  for (const b of bytes) out += b.toString(16).padStart(2, '0');
-  return out;
+function pcView(pc: PairedPc | null): ConnState['pc'] {
+  return pc ? { name: pc.name, pairing: pc.token !== null } : null;
 }
 
 /** El PC serializa los opcionales como null: aquí null y ausente son lo mismo. */
@@ -89,13 +97,16 @@ function normalize(u: TransferUpdate): TransferUpdate {
 }
 
 export class ConnectionManager {
+  /** El PC emparejado (settings.json); null hasta escanear su QR. */
+  private pc: PairedPc | null = loadSettings().pc;
   private state: ConnState = {
-    status: 'searching',
+    status: this.pc ? 'searching' : 'unpaired',
     transport: null,
     peerName: null,
     transfers: [],
     history: [],
     lastError: null,
+    pc: pcView(this.pc),
   };
   private readonly listeners = new Set<() => void>();
 
@@ -126,6 +137,8 @@ export class ConnectionManager {
   private keeper: SyncKeeper | null = null;
   /** Última dirección WiFi del PC que funcionó; se prueba la primera. */
   private lastPc: PcAddress | null | undefined = undefined;
+  /** Handshakes fallidos seguidos con el PC alcanzable (D8); `ready` lo pone a 0. */
+  private handshakeFailures = 0;
   private nextHistoryId = 1;
   private self: PeerInfo | null = null;
 
@@ -209,6 +222,28 @@ export class ConnectionManager {
     if (!pending) this.applyBackground();
   }
 
+  /**
+   * Empareja con el PC del QR: guarda el PC con su token, olvida lo sincronizado con el anterior
+   * (el SyncKeeper se recrea desde settings) y reinicia la conexión.
+   */
+  pair(info: PairingInfo): void {
+    this.pause();
+    this.pc = pairedPcFromInfo(info);
+    this.lastPc = null;
+    this.keeper = null;
+    this.handshakeFailures = 0;
+    updateSettings({ pc: this.pc, lastSyncedHash: null, lastPc: null });
+    this.update({ status: 'searching', transport: null, peerName: null, pc: pcView(this.pc), lastError: null });
+    if (this.enabled && AppState.currentState !== 'background') this.resume();
+  }
+
+  /** Cierra la sesión y borra el emparejamiento (lastSyncedHash y lastPc no se tocan). */
+  forgetPc(): void {
+    this.pause({ status: 'unpaired', transport: null, peerName: null, pc: null });
+    this.pc = null;
+    updateSettings({ pc: null });
+  }
+
   // --- ciclo de vida ---
 
   private onAppState = (s: AppStateStatus) => {
@@ -234,6 +269,10 @@ export class ConnectionManager {
   }
 
   private resume(): void {
+    if (!this.pc) {
+      this.update({ status: 'unpaired' });
+      return;
+    }
     if (this.running) {
       // seguía conectado en segundo plano: solo vuelve el vigilante, y lo copiado mientras tanto
       if (!this.stopWatcher) {
@@ -260,8 +299,12 @@ export class ConnectionManager {
     this.stopWatcher = null;
   }
 
-  private pause(): void {
-    if (!this.running) return;
+  /** Para la conexión; `to` es el estado en que queda (por defecto, buscando). */
+  private pause(to?: Partial<ConnState>): void {
+    if (!this.running) {
+      if (to) this.update(to);
+      return;
+    }
     this.running = false;
     this.pauseCheck.cancel();
     this.stopClipboardWatcher();
@@ -273,43 +316,73 @@ export class ConnectionManager {
     this.ready = false;
     this.generation += 1;
     this.wake?.();
-    this.update({ status: 'searching', transport: null, peerName: null });
+    this.update(to ?? { status: 'searching', transport: null, peerName: null });
   }
 
   private async loop(gen: number): Promise<void> {
     while (gen === this.generation) {
+      const pc = this.pc;
+      if (!pc) return; // sin emparejar no hay nada que buscar
       this.update({ status: 'searching', transport: null, peerName: null });
-      const conn = await this.connectOnce(gen);
+      let identity: KeyPair;
+      try {
+        identity = await loadIdentity();
+      } catch {
+        if (gen !== this.generation) return;
+        this.setError(IDENTITY_FAILED);
+        await this.sleep(RECONNECT_INTERVAL_MS);
+        continue;
+      }
+      if (gen !== this.generation) return;
+      const conn = await this.connectOnce(gen, pc);
       if (gen !== this.generation) {
         conn?.link.close();
         return;
       }
       if (conn) {
-        const { wasReady, readyForMs } = await this.runSession(conn.link, conn.transport, gen);
+        const { reason, wasReady, readyForMs, tokenSent } = await this.runSession(conn.link, conn.transport, gen, pc, identity);
         if (gen !== this.generation) return;
+        const outcome = closeOutcome(reason, { tokenSent, handshakeFailures: this.handshakeFailures });
+        if (outcome.kind === 'unpair') {
+          this.unpair(outcome.message);
+          return;
+        }
+        this.handshakeFailures = outcome.handshakeFailures;
         // la sesión funcionó el tiempo suficiente: se reintenta enseguida; si cae al poco, se espera
         if (reconnectDelayMs(wasReady, readyForMs, RECONNECT_INTERVAL_MS) === 0) continue;
+      } else if (this.pc?.token != null) {
+        // una vuelta entera sin llegar a ningún candidato con el emparejamiento por completar
+        this.setError(PC_UNREACHABLE);
       }
       await this.sleep(RECONNECT_INTERVAL_MS);
     }
   }
 
+  /** El PC rechazó el emparejamiento (o no se pudo verificar): se borra y se vuelve a la bienvenida. */
+  private unpair(message: string): void {
+    this.pc = null;
+    this.handshakeFailures = 0;
+    updateSettings({ pc: null });
+    this.pause({ status: 'unpaired', transport: null, peerName: null, pc: null, lastError: message });
+  }
+
   /**
-   * WiFi (la última dirección que funcionó y después todas las resueltas por mDNS) y, si no,
-   * USB por 127.0.0.1. Cada intento tiene su propio plazo de CONNECT_TIMEOUT_MS.
+   * WiFi (la última dirección que funcionó, las resueltas por mDNS con la huella de este PC y
+   * las IPs del QR) y, si no, USB por 127.0.0.1. Cada intento tiene su propio plazo de CONNECT_TIMEOUT_MS.
    */
-  private async connectOnce(gen: number): Promise<{ link: Link; transport: Transport } | null> {
+  private async connectOnce(gen: number, pc: PairedPc): Promise<{ link: Link; transport: Transport } | null> {
     if (this.lastPc === undefined) this.lastPc = loadSettings().lastPc;
     const last = this.lastPc;
-    // con una dirección guardada no se espera a mDNS: se prueba ya y, si no, lo resuelto
-    const resolved = await resolvedPcs(last ? 0 : CONNECT_TIMEOUT_MS);
+    const qr = pc.ips.map((host) => ({ host, port: pc.port }));
+    // con una dirección guardada o las del QR no se espera a mDNS: se prueba ya y, si no, lo resuelto
+    const resolved = await resolvedPcs(last || qr.length > 0 ? 0 : CONNECT_TIMEOUT_MS, fingerprint(hexToBytes(pc.publicKeyHex)));
     if (gen !== this.generation) return null;
-    for (const pc of connectCandidates(last, resolved)) {
+    for (const addr of connectCandidates(last, resolved, qr)) {
       this.update({ status: 'connecting' });
       try {
-        const link = await connectTcp(pc.host, pc.port, CONNECT_TIMEOUT_MS);
+        const link = await connectTcp(addr.host, addr.port, CONNECT_TIMEOUT_MS);
         if (gen !== this.generation) return { link, transport: 'wifi' }; // el bucle lo cierra
-        this.rememberPc(pc);
+        this.rememberPc(addr);
         return { link, transport: 'wifi' };
       } catch {
         // la siguiente
@@ -330,17 +403,28 @@ export class ConnectionManager {
     updateSettings({ lastPc: pc });
   }
 
-  private runSession(link: Link, transport: Transport, gen: number): Promise<{ reason: string; wasReady: boolean; readyForMs: number }> {
+  private runSession(
+    link: Link,
+    transport: Transport,
+    gen: number,
+    pc: PairedPc,
+    identity: KeyPair,
+  ): Promise<{ reason: string; wasReady: boolean; readyForMs: number; tokenSent: boolean }> {
     return new Promise((resolve) => {
       let wasReady = false;
       let readyAt = 0;
+      const openedAt = Date.now();
       const session = new Session(link, {
         role: 'client',
         self: this.selfInfo(),
+        identity,
+        serverKey: hexToBytes(pc.publicKeyHex),
+        pairingToken: pc.token,
+        randomBytes: Crypto.getRandomBytes,
         clipSyncFor: () => this.sync().current,
         getLocalClip: () => this.localClipForStart(),
         openSink,
-        newTransferId: () => toHex(Crypto.getRandomBytes(16)),
+        newTransferId: () => bytesToHex(Crypto.getRandomBytes(16)),
       });
       this.session = session;
       this.ready = false;
@@ -350,8 +434,16 @@ export class ConnectionManager {
         if (gen !== this.generation) return;
         wasReady = true;
         readyAt = Date.now();
+        if (__DEV__) console.log(`[clipsync] enlace abierto → ready: ${readyAt - openedAt} ms`);
         this.ready = true;
-        this.update({ status: 'connected', transport, peerName: peer.deviceName });
+        this.handshakeFailures = 0;
+        // el PC aceptó: el token ya no sirve (es de un solo uso) y el emparejamiento queda completo
+        if (this.pc?.token != null) {
+          this.pc = { ...this.pc, token: null };
+          updateSettings({ pc: this.pc });
+        }
+        if (this.state.lastError === PC_UNREACHABLE) this.setError(null);
+        this.update({ status: 'connected', transport, peerName: peer.deviceName, pc: pcView(this.pc) });
       });
       // solo lo que la Session envió de verdad en la regla de inicio (M4)
       session.on('startClipSent', (text) => {
@@ -371,7 +463,7 @@ export class ConnectionManager {
         }
         // tras cualquier cierre se parte del último hash confirmado (R29)
         this.sync().renew();
-        resolve({ reason, wasReady, readyForMs: wasReady ? Date.now() - readyAt : 0 });
+        resolve({ reason, wasReady, readyForMs: wasReady ? Date.now() - readyAt : 0, tokenSent: pc.token !== null });
       });
 
       void session.start();
