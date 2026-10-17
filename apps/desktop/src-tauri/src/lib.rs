@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 use app::Ctx;
-use core::pairing::PairedStore;
+use core::pairing::{fingerprint, PairedStore};
 use core::{identity, Hub, HubConfig};
 use protocol::DEFAULT_TCP_PORT;
 
@@ -81,7 +81,10 @@ pub fn run() {
             app::get_state,
             app::send_files,
             app::cancel_transfer,
-            app::copy_text
+            app::copy_text,
+            app::start_pairing,
+            app::cancel_pairing,
+            app::forget_device
         ])
         .setup(|tauri_app| {
             let data_dir = tauri_app.path().app_data_dir().ok();
@@ -101,6 +104,7 @@ pub fn run() {
                 paired: PairedStore::load(data_dir.as_ref().map(|d| d.join("paired.json"))),
             });
             let (clipboard, clipboard_worker) = app::clipboard::channel();
+            let fp = fingerprint(&hub.public_key());
             let ctx = Arc::new(Ctx::new(hub.clone(), pc_name, local_clip, clipboard));
             tauri_app.manage(ctx.clone());
 
@@ -110,7 +114,7 @@ pub fn run() {
 
             // El ServiceDaemon debe seguir vivo mientras la app corra; Box::leak lo mantiene
             // anunciado hasta que el proceso termine.
-            match discovery::advertise(DEFAULT_TCP_PORT) {
+            match discovery::advertise(DEFAULT_TCP_PORT, &fp) {
                 Ok(daemon) => {
                     Box::leak(Box::new(daemon));
                 }
