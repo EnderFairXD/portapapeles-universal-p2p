@@ -10,6 +10,7 @@ import { SettingsIcon } from '@/components/SettingsIcon';
 import { StatusCard } from '@/components/StatusCard';
 import { Toast } from '@/components/Toast';
 import { TransferList } from '@/components/TransferList';
+import { Welcome } from '@/components/Welcome';
 import { connection } from '@/lib/connection';
 import { filesLabel } from '@/lib/format';
 import { pickAndSend } from '@/lib/sendFlow';
@@ -58,6 +59,11 @@ export default function Home() {
   const onCancel = useCallback((id: string) => connection.cancelTransfer(id), []);
 
   const disabled = !connected || picking;
+
+  // sin PC emparejado no hay nada que mostrar salvo cómo emparejar
+  if (state.status === 'unpaired') {
+    return <Welcome lastError={state.lastError} onDismissError={onDismissError} />;
+  }
 
   return (
     <View style={styles.screen}>
