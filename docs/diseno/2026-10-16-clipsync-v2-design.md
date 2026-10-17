@@ -154,7 +154,8 @@ alcanzable»…). Reglas del lado del móvil:
   motivo (§8).
 - **Los fallos `handshake_failed` solo cuentan para esos 3 por WiFi**: por USB, `adb reverse`
   acepta el socket aunque la app del PC esté cerrada, y eso no indica un PC distinto.
-- **La dirección WiFi del PC se recuerda solo tras un handshake correcto**, no al escanear.
+- **Qué se guarda y cuándo**: al escanear se guardan `pk`, `n`, `port` y las IPs del QR; la última
+  dirección WiFi que funcionó se recuerda solo tras un handshake correcto.
 - **Volver a escanear el QR del mismo PC** reempareja sin preguntar; escanear el de otro PC
   pregunta antes de sustituir el actual.
 
@@ -177,7 +178,7 @@ Mensajes de control (`kind`):
 | `kind` | Campos | Uso |
 |---|---|---|
 | `clip` | `id`, `text` (≤ 1 MiB UTF-8), `hash` | nuevo texto copiado |
-| `hello` | `v`, `deviceId`, `deviceName`, `willSendClip?` | solo en la fase 1, en claro; desde la fase 2 viaja como carga del handshake Noise |
+| ~~`hello`~~ | `v`, `deviceId`, `deviceName`, `willSendClip?` | **retirado desde la fase 2**: solo viaja como carga del primer mensaje del handshake Noise; un `hello` como mensaje de control cierra la sesión con `protocol_error` |
 | `file_start` | `transferId`, `name`, `size`, `mime` | empieza un archivo |
 | `file_ack` | `transferId`, `received` | el receptor confirma cada 1 MiB |
 | `file_end` | `transferId`, `sha256` | el emisor terminó; el hash se calcula mientras se envía, sin leer el archivo dos veces |
@@ -322,8 +323,9 @@ actualiza a la v2. Los vectores de prueba compartidos viven en `packages/protoco
 | Situación | Comportamiento |
 |---|---|
 | Sesión caída (latido, socket cerrado) | móvil: vuelve a §4; PC: vuelve a esperar. La transferencia en curso se marca fallida y se puede reintentar. |
-| Handshake rechazado (`not_paired`) | móvil: «Este PC no te reconoce. Vuelve a emparejar.» y pantalla de escaneo. |
-| Clave del PC distinta a la guardada | el PC no puede descifrar el primer mensaje y cierra. El móvil no distingue esto de un corte, así que tras 3 handshakes fallidos seguidos con el PC alcanzable muestra «No se pudo verificar el PC. Vuelve a emparejar.» |
+| Handshake rechazado (`not_paired`) | móvil: olvida el emparejamiento, deja de reintentar y vuelve a la bienvenida con el motivo: «Este PC no te reconoce. Vuelve a emparejar.» (sin token) o «El QR no es válido. Genera uno nuevo en el PC.» (con el token del QR). |
+| Handshake rechazado (`pairing_expired`) | móvil: igual que `not_paired`, con «QR caducado. Genera uno nuevo en el PC.» |
+| Clave del PC distinta a la guardada | el PC no puede descifrar el primer mensaje y cierra. El móvil no distingue esto de un corte, así que tras 3 handshakes fallidos seguidos con el PC alcanzable (`handshake_failed`, que solo cuenta por WiFi, no por USB) olvida el emparejamiento, deja de reintentar y vuelve a la bienvenida con «No se pudo verificar el PC. Vuelve a emparejar.» |
 | SHA-256 de archivo no coincide | se borra el archivo parcial y `file_result ok=false`; aviso en ambas UIs. |
 | Texto > 1 MiB | no se sincroniza; aviso «Texto demasiado grande». |
 | Sin Bluetooth / sin `adb` / sin permisos | ese medio se salta en modo automático; en modo fijo se muestra el motivo. |
@@ -338,8 +340,9 @@ actualiza a la v2. Los vectores de prueba compartidos viven en `packages/protoco
   al volver se reconecta y se aplica §3.5.
 - Bluetooth Classic: ~100–300 KB/s reales; adecuado para texto y archivos de pocos MB.
 - **Riesgo de rendimiento**: el cifrado en JavaScript (Hermes) puede limitar la velocidad por
-  WiFi/USB a unos pocos MB/s. Se mide en la fase 2; si es insuficiente, se sustituye ChaCha20 por
-  una implementación nativa sin cambiar el protocolo.
+  WiFi/USB a unos pocos MB/s. Se mide en la fase 2, por WiFi, con el criterio **handshake ≤ 1 s y
+  ≥ 2 MB/s en los dos sentidos**; si no se cumple, se sustituye ChaCha20 (y X25519) por una
+  implementación nativa sin cambiar el protocolo.
 - **Riesgo en Wayland**: la lectura del portapapeles en segundo plano depende de que el
   compositor soporte `wlr-data-control`/`ext-data-control`. Se comprueba en el escritorio de
   Javier (Pop!_OS) en la fase 1.
