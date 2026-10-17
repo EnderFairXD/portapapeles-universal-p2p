@@ -1,9 +1,12 @@
 import { bytesToBase64Url } from '@clipsync/protocol';
 import { describe, expect, it } from 'vitest';
 
+import { bytesToHex } from '../src/lib/pairing';
 import { decideScan } from '../src/lib/scanDecision';
 
 const KEY = new Uint8Array(32).fill(7);
+const SAME = { name: 'Sobremesa', publicKeyHex: bytesToHex(KEY) };
+const OTHER = { name: 'Sobremesa', publicKeyHex: 'ab'.repeat(32) };
 const TOKEN = 'AAAAAAAAAAAAAAAAAAAAAA';
 
 function qr(name: string): string {
@@ -13,7 +16,7 @@ function qr(name: string): string {
 describe('decideScan', () => {
   it('un texto que no es un QR de ClipSync es inválido', () => {
     expect(decideScan('https://ejemplo.com', null)).toEqual({ kind: 'invalid' });
-    expect(decideScan('', 'Mi PC')).toEqual({ kind: 'invalid' });
+    expect(decideScan('', OTHER)).toEqual({ kind: 'invalid' });
   });
 
   it('sin PC emparejado, empareja directamente', () => {
@@ -22,8 +25,13 @@ describe('decideScan', () => {
     if (d.kind === 'pair') expect(d.info.name).toBe('Portátil');
   });
 
+  it('el QR del mismo PC (misma clave) empareja directamente, sin confirmar', () => {
+    const d = decideScan(qr('Sobremesa'), SAME);
+    expect(d.kind).toBe('pair');
+  });
+
   it('con otro PC emparejado, pide confirmar la sustitución', () => {
-    const d = decideScan(qr('Portátil'), 'Sobremesa');
+    const d = decideScan(qr('Portátil'), OTHER);
     expect(d.kind).toBe('confirm');
     if (d.kind === 'confirm') {
       expect(d.current).toBe('Sobremesa');
