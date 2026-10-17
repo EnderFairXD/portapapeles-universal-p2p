@@ -1,5 +1,9 @@
 //! Servidor sin interfaz para el e2e: el Hub en 127.0.0.1:0, sus eventos como JSON por stdout
-//! y órdenes JSON por stdin. Uso: `headless --download-dir <dir> [--local-clip <texto>]`.
+//! y órdenes JSON por stdin. Uso:
+//! `headless --download-dir <dir> --data-dir <dir> [--local-clip <texto>]`.
+//!
+//! `--data-dir` guarda la identidad (`identity.key`) y los emparejados (`paired.json`): al
+//! relanzar con la misma carpeta se conservan.
 //!
 //! Con `panic = "abort"` nada aquí puede hacer panic: los errores van a stderr.
 
@@ -17,23 +21,37 @@ use tokio::net::TcpListener;
 #[derive(Deserialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 enum Cmd {
-    Clip { text: String },
-    File { path: PathBuf },
+    Clip {
+        text: String,
+    },
+    File {
+        path: PathBuf,
+    },
+    /// Abre una ventana de emparejamiento; responde con la línea `pairing`.
+    Pair,
+    /// Olvida un móvil emparejado; sus efectos llegan como eventos.
+    Forget {
+        #[serde(rename = "deviceKey")]
+        device_key: String,
+    },
 }
 
 struct Args {
     download_dir: PathBuf,
+    data_dir: PathBuf,
     local_clip: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut download_dir = None;
+    let mut data_dir = None;
     let mut local_clip = None;
     let mut it = std::env::args_os().skip(1);
     while let Some(arg) = it.next() {
         let value = it.next();
         match (arg.to_str(), value) {
             (Some("--download-dir"), Some(v)) => download_dir = Some(PathBuf::from(v)),
+            (Some("--data-dir"), Some(v)) => data_dir = Some(PathBuf::from(v)),
             (Some("--local-clip"), Some(v)) => {
                 local_clip = Some(v.into_string().map_err(|_| "--local-clip no es UTF-8")?)
             }
@@ -41,8 +59,10 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let download_dir = download_dir.ok_or("falta --download-dir")?;
+    let data_dir = data_dir.ok_or("falta --data-dir")?;
     Ok(Args {
         download_dir,
+        data_dir,
         local_clip,
     })
 }
@@ -65,7 +85,7 @@ async fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             err(&format!(
-                "{e}\nUso: headless --download-dir <dir> [--local-clip <texto>]"
+                "{e}\nUso: headless --download-dir <dir> --data-dir <dir> [--local-clip <texto>]"
             ));
             return ExitCode::from(2);
         }
@@ -82,9 +102,8 @@ async fn main() -> ExitCode {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
         }),
-        // efímeras y sin emparejados: la Tarea 8 añade las opciones del e2e
-        keys: identity::load_or_create(None),
-        paired: PairedStore::load(None),
+        keys: identity::load_or_create(Some(&args.data_dir)),
+        paired: PairedStore::load(Some(args.data_dir.join("paired.json"))),
     });
 
     let listener = match TcpListener::bind("127.0.0.1:0").await {
@@ -103,7 +122,10 @@ async fn main() -> ExitCode {
     };
     // primera línea, antes de cualquier evento
     // a mano: json! ordenaría las claves y "type" debe ir primero
-    if !out(&format!(r#"{{"type":"listening","port":{port}}}"#)) {
+    let public_key = hex(&hub.public_key());
+    if !out(&format!(
+        r#"{{"type":"listening","port":{port},"publicKey":"{public_key}"}}"#
+    )) {
         return ExitCode::FAILURE;
     }
 
@@ -158,8 +180,28 @@ fn handle(hub: &Hub, local: &Mutex<Option<String>>, line: &str) {
             hub.broadcast_clip(&text);
         }
         Ok(Cmd::File { path }) => send_file(hub, &path),
+        Ok(Cmd::Pair) => {
+            let offer = hub.start_pairing();
+            // a mano, por el orden de las claves; el token es base64url, pero se escapa igualmente
+            let token = serde_json::to_string(&offer.token).unwrap_or_else(|_| "\"\"".into());
+            out(&format!(
+                r#"{{"type":"pairing","token":{token},"expiresAtMs":{}}}"#,
+                offer.expires_at_ms
+            ));
+        }
+        Ok(Cmd::Forget { device_key }) => {
+            if !hub.forget_device(&device_key) {
+                err(&format!(
+                    "forget: no hay ningún móvil emparejado con {device_key}"
+                ));
+            }
+        }
         Err(e) => err(&format!("orden no válida ({e}): {line}")),
     }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn send_file(hub: &Hub, path: &Path) {
