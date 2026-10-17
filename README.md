@@ -1,7 +1,7 @@
 # Portapapeles Universal P2P (ClipSync)
 
 Sincronización del portapapeles (texto, tokens y archivos) entre móvil y escritorio **sin nube**:
-los dispositivos hablan directamente por LAN, USB o Bluetooth.
+los dispositivos hablan directamente por LAN, USB o Bluetooth. De momento solo para **Android**.
 
 ## Estructura del monorepo
 
@@ -18,10 +18,15 @@ El móvil prueba los medios por orden de preferencia y cae al siguiente si el an
 
 | Medio | Estado |
 |---|---|
-| WiFi / LAN (mDNS + TCP) | Implementado |
-| Cable USB (túnel ADB) | Implementado |
+| WiFi / LAN (mDNS + TCP) | ✅ Bidireccional (texto y archivos) |
+| Cable USB (túnel ADB) | ✅ Con el `adb` del sistema |
 | Bluetooth (BLE / Classic) | Pendiente |
-| Modo Invitado (servidor HTTP efímero para equipos donde no se puede instalar el cliente) | Implementado |
+
+No hay Modo Invitado: ClipSync necesita estar instalado en los dos dispositivos.
+
+## Comprobación manual
+
+La lista de pruebas a mano está en [`docs/testing-checklist.md`](docs/testing-checklist.md).
 
 ## Limitaciones conocidas
 

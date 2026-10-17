@@ -1,5 +1,7 @@
 # Arquitectura — Portapapeles Universal P2P (ClipSync)
 
+> **Nota (fase 1 de ClipSync v2):** este documento está desactualizado hasta su reescritura en la fase 5. Mientras tanto, la fuente de verdad es la especificación v2: [`docs/diseno/2026-10-16-clipsync-v2-design.md`](diseno/2026-10-16-clipsync-v2-design.md).
+
 > Nota de naming: el codename interno del repo/monorepo sigue siendo `portapapeles-universal-p2p` (así se llama en GitHub y en `package.json` raíz). El nombre comercial de las apps es **ClipSync** (ver `apps/mobile/app.json` y `apps/desktop/src-tauri/tauri.conf.json`). Este documento usa ambos indistintamente según el contexto.
 
 ## 0. Restricciones críticas de plataforma (leer primero)
