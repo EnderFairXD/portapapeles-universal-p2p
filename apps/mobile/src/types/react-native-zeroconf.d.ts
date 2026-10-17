@@ -1,5 +1,5 @@
-// react-native-zeroconf no publica tipos propios (ver README/npm). Solo declaramos
-// la superficie que usa este proyecto (src/lib/lanTransport.ts).
+// react-native-zeroconf 0.14 no publica tipos propios. Solo se declara la superficie que
+// usa este proyecto (src/lib/discovery.ts).
 declare module 'react-native-zeroconf' {
   export interface ZeroconfService {
     name: string;
@@ -10,15 +10,10 @@ declare module 'react-native-zeroconf' {
     txt?: Record<string, string>;
   }
 
-  type ZeroconfEvent = 'start' | 'stop' | 'found' | 'resolved' | 'remove' | 'update' | 'error';
-
   export default class Zeroconf {
     scan(type?: string, protocol?: string, domain?: string): void;
     stop(): void;
     on(event: 'resolved', handler: (service: ZeroconfService) => void): void;
-    on(event: 'found' | 'remove', handler: (name: string) => void): void;
-    on(event: 'error', handler: (error: unknown) => void): void;
-    on(event: 'start' | 'stop' | 'update', handler: () => void): void;
-    removeAllListeners(): void;
+    removeListener(event: 'resolved', handler: (service: ZeroconfService) => void): void;
   }
 }

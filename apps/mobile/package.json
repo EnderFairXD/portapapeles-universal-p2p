@@ -5,23 +5,22 @@
   "dependencies": {
     "@clipsync/protocol": "workspace:*",
     "expo": "~57.0.24",
-    "expo-blur": "~57.0.3",
     "expo-clipboard": "~57.0.2",
     "expo-constants": "~57.0.19",
     "expo-crypto": "~57.0.3",
     "expo-dev-client": "~57.0.19",
+    "expo-device": "~57.0.2",
     "expo-document-picker": "~57.0.2",
     "expo-file-system": "~57.0.7",
     "expo-linear-gradient": "~57.0.2",
     "expo-linking": "~57.0.10",
-    "expo-network": "~57.0.2",
     "expo-router": "~57.0.22",
+    "expo-share-intent": "^8.0.1",
     "expo-sharing": "~57.0.21",
     "expo-splash-screen": "~57.0.9",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
     "react-native": "0.86.3",
-    "react-native-ble-plx": "^3.5.1",
     "react-native-safe-area-context": "~5.7.0",
     "react-native-screens": "~4.26.2",
     "react-native-tcp-socket": "^6.4.3",
@@ -31,7 +30,8 @@
     "@types/react": "~19.2.2",
     "eslint": "^9.39.5",
     "eslint-config-expo": "~57.0.2",
-    "typescript": "~6.0.3"
+    "typescript": "~6.0.3",
+    "vitest": "^5.0.5"
   },
   "scripts": {
     "start": "expo start",
@@ -39,7 +39,8 @@
     "ios": "expo run:ios",
     "web": "expo start --web",
     "lint": "expo lint",
-    "build:local": "npx expo run:android --variant release"
+    "build:local": "npx expo run:android --variant release",
+    "test": "vitest run -c vitest.config.ts"
   },
   "private": true
 }

@@ -10,10 +10,6 @@
     "experiments": {
       "typedRoutes": true
     },
-    "ios": {
-      "supportsTablet": true,
-      "bundleIdentifier": "com.enderfirexd.clipsync"
-    },
     "android": {
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
@@ -24,10 +20,7 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "android.permission.CHANGE_WIFI_MULTICAST_STATE",
-        "android.permission.ACCESS_WIFI_STATE",
-        "android.permission.BLUETOOTH",
-        "android.permission.BLUETOOTH_ADMIN",
-        "android.permission.BLUETOOTH_CONNECT"
+        "android.permission.ACCESS_WIFI_STATE"
       ],
       "package": "com.enderfirexd.clipsync"
     },
@@ -36,7 +29,6 @@
     },
     "plugins": [
       "expo-sharing",
-      "react-native-ble-plx",
       "expo-router",
       "expo-status-bar",
       [
@@ -46,6 +38,15 @@
           "image": "./assets/icon.png",
           "imageWidth": 180,
           "resizeMode": "contain"
+        }
+      ],
+      [
+        "expo-share-intent",
+        {
+          "androidIntentFilters": [
+            "*/*"
+          ],
+          "disableIOS": true
         }
       ]
     ]
