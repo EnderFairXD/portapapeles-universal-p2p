@@ -13,7 +13,8 @@ use std::sync::{Arc, Mutex};
 use tauri::Manager;
 
 use app::Ctx;
-use core::{Hub, HubConfig};
+use core::pairing::PairedStore;
+use core::{identity, Hub, HubConfig};
 use protocol::DEFAULT_TCP_PORT;
 
 fn log(msg: &str) {
@@ -96,6 +97,8 @@ pub fn run() {
                     Ok(g) => g.clone(),
                     Err(p) => p.into_inner().clone(),
                 }),
+                keys: identity::load_or_create(data_dir.as_deref()),
+                paired: PairedStore::load(data_dir.as_ref().map(|d| d.join("paired.json"))),
             });
             let (clipboard, clipboard_worker) = app::clipboard::channel();
             let ctx = Arc::new(Ctx::new(hub.clone(), pc_name, local_clip, clipboard));

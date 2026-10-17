@@ -4,18 +4,11 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION};
+use super::{FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum ControlMessage {
-    Hello {
-        v: u32,
-        device_id: String,
-        device_name: String,
-        #[serde(skip_serializing_if = "Option::is_none", default)]
-        will_send_clip: Option<bool>,
-    },
     Clip { id: String, text: String, hash: String },
     FileStart { transfer_id: String, name: String, size: u64, mime: String },
     FileAck { transfer_id: String, received: u64 },
@@ -84,10 +77,9 @@ fn check_uint(v: u64, key: &str) -> Result<(), ProtocolError> {
     }
 }
 
-/// Reglas que el tipo no garantiza (versión, formato de ids y hashes, rango de enteros).
+/// Reglas que el tipo no garantiza (formato de ids y hashes, rango de enteros).
 fn check_message(msg: &ControlMessage) -> Result<(), ProtocolError> {
     match msg {
-        ControlMessage::Hello { v, .. } if *v != PROTOCOL_VERSION => fail(format!("'v' debe ser {PROTOCOL_VERSION}")),
         ControlMessage::Clip { hash, .. } => check_hash(hash, "hash"),
         ControlMessage::FileStart { transfer_id, size, .. } => {
             check_transfer_id(transfer_id)?;
@@ -154,22 +146,6 @@ fn validate_control(value: &Value) -> Result<ControlMessage, ProtocolError> {
         other => return fail(format!("kind desconocido ({})", other.map_or("undefined".into(), |k| k.to_string()))),
     };
     match kind {
-        "hello" => {
-            if o.get("v").and_then(Value::as_f64) != Some(f64::from(PROTOCOL_VERSION)) {
-                return fail(format!("'v' debe ser {PROTOCOL_VERSION}"));
-            }
-            let will_send_clip = match o.get("willSendClip") {
-                None => None,
-                Some(Value::Bool(b)) => Some(*b),
-                Some(_) => return fail("'willSendClip' debe ser booleano"),
-            };
-            Ok(ControlMessage::Hello {
-                v: PROTOCOL_VERSION,
-                device_id: str_field(o, "deviceId")?,
-                device_name: str_field(o, "deviceName")?,
-                will_send_clip,
-            })
-        }
         "clip" => Ok(ControlMessage::Clip {
             id: str_field(o, "id")?,
             text: str_field(o, "text")?,
@@ -271,16 +247,12 @@ impl Default for MessageDecoder {
 }
 
 impl MessageDecoder {
-    /// Con otro tope (como mucho `MAX_CONTROL_BYTES`), p. ej. más bajo antes del hello.
+    /// Con otro tope (como mucho `MAX_CONTROL_BYTES`).
     pub fn with_max_control_bytes(max: usize) -> Self {
         Self {
             pending: Vec::new(),
             max_control: max.min(MAX_CONTROL_BYTES),
         }
-    }
-
-    pub fn set_max_control_bytes(&mut self, max: usize) {
-        self.max_control = max.min(MAX_CONTROL_BYTES);
     }
 
     pub fn push(&mut self, payload: &[u8]) -> Result<Option<Decoded>, ProtocolError> {
@@ -341,7 +313,7 @@ fn parse_control(json: &[u8]) -> Result<ControlMessage, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{MAX_CLIP_BYTES, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES};
+    use crate::protocol::{MAX_CLIP_BYTES, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION};
     use sha2::{Digest, Sha256};
     const TID: &str = "00112233445566778899aabbccddeeff";
     const HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -413,8 +385,6 @@ mod tests {
     #[test]
     fn ida_y_vuelta_de_cada_variante() {
         let messages = vec![
-            ControlMessage::Hello { v: 2, device_id: "d1".into(), device_name: "Pixel".into(), will_send_clip: Some(false) },
-            ControlMessage::Hello { v: 2, device_id: "d1".into(), device_name: "Pixel".into(), will_send_clip: None },
             clip("hola 😀"),
             ControlMessage::FileStart { transfer_id: TID.into(), name: "a.txt".into(), size: 0, mime: "text/plain".into() },
             ControlMessage::FileAck { transfer_id: TID.into(), received: 1_048_576 },
@@ -434,15 +404,22 @@ mod tests {
     }
 
     #[test]
+    fn hello_ya_no_es_un_mensaje_de_control() {
+        let mut frame = vec![0x01];
+        frame.extend_from_slice(br#"{"kind":"hello","v":2,"deviceId":"d1","deviceName":"Pixel"}"#);
+        assert!(matches!(MessageDecoder::default().push(&frame), Err(ProtocolError::Invalid(_))));
+    }
+
+    #[test]
     fn json_usa_kind_en_snake_case_y_campos_en_camel_case() {
         let frames = encode_control(&ControlMessage::FileAck { transfer_id: TID.into(), received: 5 }).unwrap();
         let json: Value = serde_json::from_slice(&frames[0][1..]).unwrap();
         assert_eq!(json, serde_json::json!({ "kind": "file_ack", "transferId": TID, "received": 5 }));
 
-        let hello = ControlMessage::Hello { v: 2, device_id: "a".into(), device_name: "b".into(), will_send_clip: None };
-        let json: Value = serde_json::from_slice(&encode_control(&hello).unwrap()[0][1..]).unwrap();
-        assert!(json.get("willSendClip").is_none());
-        assert_eq!(json["deviceName"], "b");
+        let ok = ControlMessage::FileResult { transfer_id: TID.into(), ok: true, error: None };
+        let json: Value = serde_json::from_slice(&encode_control(&ok).unwrap()[0][1..]).unwrap();
+        assert!(json.get("error").is_none());
+        assert_eq!(json["transferId"], TID);
     }
 
     #[test]
@@ -526,8 +503,7 @@ mod tests {
         assert!(d.push(&[0x03, b'1', b'2', b'3', b'4', b'5']).unwrap().is_none());
         assert!(d.push(&[0x03, b'6', b'7', b'8', b'9', b'0', b'1']).is_err());
         // nunca por encima del máximo del protocolo
-        let mut d = MessageDecoder::with_max_control_bytes(usize::MAX);
-        d.set_max_control_bytes(usize::MAX);
+        let d = MessageDecoder::with_max_control_bytes(usize::MAX);
         assert_eq!(d.max_control, MAX_CONTROL_BYTES);
     }
 
@@ -566,8 +542,6 @@ mod tests {
     fn encode_control_rechaza_mensajes_con_forma_invalida() {
         let bad_id = ControlMessage::FileAck { transfer_id: "corto".into(), received: 1 };
         assert!(matches!(encode_control(&bad_id), Err(ProtocolError::Invalid(_))));
-        let bad_v = ControlMessage::Hello { v: 1, device_id: "a".into(), device_name: "b".into(), will_send_clip: None };
-        assert!(encode_control(&bad_v).is_err());
         let upper = ControlMessage::FileEnd { transfer_id: TID.to_uppercase(), sha256: HASH.into() };
         assert!(encode_control(&upper).is_err());
         let bad_hash = ControlMessage::Clip { id: "a".into(), text: "".into(), hash: "ab".into() };

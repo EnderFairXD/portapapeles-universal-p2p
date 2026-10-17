@@ -1,7 +1,6 @@
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
-import { FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION } from './constants';
+import { FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES } from './constants';
 
-export type HelloMsg = { kind: 'hello'; v: 2; deviceId: string; deviceName: string; willSendClip?: boolean };
 export type ClipMsg = { kind: 'clip'; id: string; text: string; hash: string };
 export type FileStartMsg = { kind: 'file_start'; transferId: string; name: string; size: number; mime: string };
 export type FileAckMsg = { kind: 'file_ack'; transferId: string; received: number };
@@ -9,7 +8,6 @@ export type FileEndMsg = { kind: 'file_end'; transferId: string; sha256: string 
 export type FileResultMsg = { kind: 'file_result'; transferId: string; ok: boolean; error?: string };
 export type FileCancelMsg = { kind: 'file_cancel'; transferId: string; reason: string };
 export type ControlMessage =
-  | HelloMsg
   | ClipMsg
   | FileStartMsg
   | FileAckMsg
@@ -74,15 +72,6 @@ function validateControl(value: unknown): ControlMessage {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) fail('se esperaba un objeto');
   const o = value as Obj;
   switch (o.kind) {
-    case 'hello': {
-      if (o.v !== PROTOCOL_VERSION) fail(`'v' debe ser ${PROTOCOL_VERSION}`);
-      const msg: HelloMsg = { kind: 'hello', v: 2, deviceId: str(o, 'deviceId'), deviceName: str(o, 'deviceName') };
-      if (o.willSendClip !== undefined) {
-        if (typeof o.willSendClip !== 'boolean') fail("'willSendClip' debe ser booleano");
-        msg.willSendClip = o.willSendClip;
-      }
-      return msg;
-    }
     case 'clip':
       return { kind: 'clip', id: str(o, 'id'), text: str(o, 'text'), hash: hash(o, 'hash') };
     case 'file_start':

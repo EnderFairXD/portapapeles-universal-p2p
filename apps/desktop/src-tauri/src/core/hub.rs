@@ -1,4 +1,6 @@
 //! Hub: acepta conexiones y mantiene una sesión por móvil (el PC hace de servidor).
+//! Solo entran los móviles emparejados (o el que trae el token vigente del QR); cada uno se
+//! identifica por su clave pública en hex (`device_key`, D4).
 //! No depende de Tauri: la app se suscribe al canal de `HubEvent`.
 
 use std::collections::{BTreeMap, HashMap};
@@ -7,17 +9,20 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
 use super::clip_sync::ClipboardSync;
+use super::pairing::{PairedDevice, PairedStore, PairingOffer, PairingTokens, TokenCheck};
 use super::session::{
     self, lock, new_id, Command, Direction, OutFile, OutMeta, SessionConfig, SessionEvent,
     SessionHost, TransferState, TransferUpdate, Transport,
 };
+use crate::protocol::hello::{ClientHello, RejectReason};
+use crate::protocol::secure::StaticKeys;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(
@@ -26,6 +31,7 @@ use super::session::{
     rename_all_fields = "camelCase"
 )]
 pub enum HubEvent {
+    /// `device_id` es la clave pública del móvil en hex, no el id que declara.
     PeerConnected {
         session_id: u64,
         device_id: String,
@@ -44,6 +50,11 @@ pub enum HubEvent {
         text: String,
     },
     Transfer(TransferUpdate),
+    /// Un móvil se emparejó con el token del QR (o volvió a escanearlo): el QR ya no sirve.
+    DevicePaired {
+        device_key: String,
+        device_name: String,
+    },
 }
 
 pub struct HubConfig {
@@ -51,13 +62,30 @@ pub struct HubConfig {
     pub pc_name: String,
     pub download_dir: PathBuf,
     pub local_clip: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// identidad del PC: respondedor del handshake Noise IK
+    pub keys: StaticKeys,
+    pub paired: PairedStore,
 }
 
 /// Mayor entero que JS representa sin pérdida: el tamaño de un archivo no puede pasar de aquí.
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const FILE_MIME: &str = "application/octet-stream";
-/// Conexiones a la vez que aún no han enviado su hello (pares desconocidos de la LAN).
-const MAX_PRE_HELLO_SESSIONS: usize = 8;
+/// Conexiones a la vez que aún no han completado el handshake (pares desconocidos de la LAN).
+const MAX_PRE_HANDSHAKE_SESSIONS: usize = 8;
+const FORGOTTEN: &str = "forgotten";
+
+fn log(msg: &str) {
+    // stderr: stdout puede llevar eventos en JSON (ejemplo headless); writeln no hace panic
+    let _ = writeln!(std::io::stderr(), "[Hub] {msg}");
+}
+
+/// Milisegundos desde 1970 (reloj del sistema), para los tokens y `pairedAtMs`.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 #[derive(Clone)]
 pub struct Hub {
@@ -65,24 +93,57 @@ pub struct Hub {
 }
 
 struct Inner {
-    config: HubConfig,
+    device_id: String,
+    pc_name: String,
+    download_dir: PathBuf,
+    local_clip: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    keys: StaticKeys,
     events: mpsc::UnboundedSender<HubEvent>,
     next_id: AtomicU64,
     state: Mutex<State>,
 }
 
-#[derive(Default)]
 struct State {
     sessions: BTreeMap<u64, Entry>,
     /// anti-rebote por dispositivo, en memoria durante esta fase
     syncs: HashMap<String, Arc<Mutex<ClipboardSync>>>,
     ready_count: u64,
+    paired: PairedStore,
+    /// emparejados con el token cuyo `paired.json` no se pudo guardar: valen hasta cerrar la app
+    unsaved: Vec<PairedDevice>,
+    tokens: PairingTokens,
+}
+
+impl State {
+    fn is_paired(&self, device_key: &str) -> bool {
+        self.paired.contains(device_key) || self.unsaved.iter().any(|d| d.public_key == device_key)
+    }
+
+    /// Guarda el emparejamiento; si no se puede, lo deja en memoria y lo registra.
+    fn save_paired(&mut self, device: PairedDevice) {
+        let key = device.public_key.clone();
+        match self.paired.upsert(device.clone()) {
+            Ok(()) => self.unsaved.retain(|d| d.public_key != key),
+            Err(e) => {
+                log(&format!("no se pudo guardar el emparejamiento: {e}"));
+                if !self.paired.contains(&key) {
+                    match self.unsaved.iter_mut().find(|d| d.public_key == key) {
+                        Some(d) => {
+                            d.device_id = device.device_id;
+                            d.device_name = device.device_name;
+                        }
+                        None => self.unsaved.push(device),
+                    }
+                }
+            }
+        }
+    }
 }
 
 struct Entry {
     commands: mpsc::UnboundedSender<Command>,
     transport: Transport,
-    /// dispositivo del hello, desde que llega (también durante la regla de inicio)
+    /// `device_key` del móvil desde que se autoriza (también durante la regla de inicio)
     device_id: Option<String>,
     /// dispositivo y orden de conexión, una vez completado el saludo
     peer: Option<(String, u64)>,
@@ -96,17 +157,53 @@ impl Inner {
 
 impl SessionHost for Inner {
     fn local_clip(&self) -> Option<String> {
-        (self.config.local_clip)()
+        (self.local_clip)()
     }
 
-    /// Se llama con el hello, antes de la regla de inicio. Si el dispositivo ya tenía sesión (p. ej.
-    /// TCP medio abierto), lo último "enviado" por ella puede no haber llegado: se olvida la
-    /// sincronía para que la regla reenvíe el texto actual (un duplicado es inofensivo).
-    fn clip_sync_for(&self, session_id: u64, device_id: &str) -> Arc<Mutex<ClipboardSync>> {
+    /// Spec §3.2: entra un móvil emparejado o el que trae el token vigente del QR. Con el token
+    /// vigente se consume, se guarda (o actualiza) el emparejamiento y se emite `DevicePaired`.
+    fn authorize(
+        &self,
+        session_id: u64,
+        public_key: &[u8; 32],
+        hello: &ClientHello,
+    ) -> Result<(), RejectReason> {
+        let key = hex::encode(public_key);
+        let now = now_ms();
         let mut st = lock(&self.state);
-        if let Some(e) = st.sessions.get_mut(&session_id) {
-            e.device_id = Some(device_id.to_string());
+        let token = hello
+            .pairing_token
+            .as_deref()
+            .map(|t| st.tokens.check_and_consume(t, now));
+        if token == Some(TokenCheck::Valid) {
+            st.save_paired(PairedDevice {
+                public_key: key.clone(),
+                device_id: hello.device_id.clone(),
+                device_name: hello.device_name.clone(),
+                paired_at_ms: now,
+            });
+            self.emit(HubEvent::DevicePaired {
+                device_key: key.clone(),
+                device_name: hello.device_name.clone(),
+            });
+        } else if !st.is_paired(&key) {
+            return Err(match token {
+                Some(TokenCheck::Expired) => RejectReason::PairingExpired,
+                _ => RejectReason::NotPaired,
+            });
         }
+        // desde ya cuenta como sesión del dispositivo: «Olvidar» también la cierra
+        if let Some(e) = st.sessions.get_mut(&session_id) {
+            e.device_id = Some(key);
+        }
+        Ok(())
+    }
+
+    /// Se llama tras aceptar el handshake, antes de la regla de inicio. Si el dispositivo ya tenía
+    /// sesión (p. ej. TCP medio abierto), lo último "enviado" por ella puede no haber llegado: se
+    /// olvida la sincronía para que la regla reenvíe el texto actual (un duplicado es inofensivo).
+    fn clip_sync_for(&self, _session_id: u64, device_id: &str) -> Arc<Mutex<ClipboardSync>> {
+        let mut st = lock(&self.state);
         let reconnect = st
             .sessions
             .values()
@@ -142,7 +239,7 @@ impl SessionHost for Inner {
                     device_name,
                     transport,
                 });
-                // un hello con un device_id que ya tenía sesión: la vieja se cierra
+                // un móvil con la misma clave que ya tenía sesión: la vieja se cierra
                 for (id, e) in &st.sessions {
                     if *id != session_id && e.peer.as_ref().is_some_and(|(d, _)| *d == device_id) {
                         let _ = e.commands.send(Command::Close("replaced".into()));
@@ -171,7 +268,7 @@ impl SessionHost for Inner {
                     return; // solo se avisa de la desconexión de quien llegó a conectarse
                 };
                 // el enlace cayó: lo último escrito puede no haber llegado al móvil. Si ya hay otra
-                // sesión del dispositivo (aunque esté saludando), su hello ya lo restableció y lo
+                // sesión del dispositivo (aunque esté saludando), su saludo ya lo restableció y lo
                 // que haya marcado desde entonces es válido: no se toca.
                 let otra = st
                     .sessions
@@ -199,11 +296,30 @@ fn is_loopback(ip: IpAddr) -> bool {
 impl Hub {
     pub fn new(config: HubConfig) -> (Hub, mpsc::UnboundedReceiver<HubEvent>) {
         let (events, rx) = mpsc::unbounded_channel();
+        let HubConfig {
+            device_id,
+            pc_name,
+            download_dir,
+            local_clip,
+            keys,
+            paired,
+        } = config;
         let inner = Inner {
-            config,
+            device_id,
+            pc_name,
+            download_dir,
+            local_clip,
+            keys,
             events,
             next_id: AtomicU64::new(1),
-            state: Mutex::new(State::default()),
+            state: Mutex::new(State {
+                sessions: BTreeMap::new(),
+                syncs: HashMap::new(),
+                ready_count: 0,
+                paired,
+                unsaved: Vec::new(),
+                tokens: PairingTokens::default(),
+            }),
         };
         (
             Hub {
@@ -227,11 +343,7 @@ impl Hub {
                     self.accept_stream(stream, transport);
                 }
                 Err(e) => {
-                    // stderr: stdout puede llevar eventos en JSON (ejemplo headless); writeln no hace panic
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "[Hub] Error al aceptar una conexión: {e}"
-                    );
+                    log(&format!("Error al aceptar una conexión: {e}"));
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
             }
@@ -239,19 +351,19 @@ impl Hub {
     }
 
     /// Lanza una sesión sobre el flujo. Debe llamarse dentro de un runtime de tokio.
-    /// Con `MAX_PRE_HELLO_SESSIONS` sesiones aún sin hello, el flujo se cierra al momento.
+    /// Con `MAX_PRE_HANDSHAKE_SESSIONS` sesiones aún sin handshake, el flujo se cierra al momento.
     pub fn accept_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &self,
         stream: S,
         transport: Transport,
     ) {
         let mut st = lock(&self.inner.state);
-        let sin_saludo = st
+        let sin_handshake = st
             .sessions
             .values()
             .filter(|e| e.device_id.is_none())
             .count();
-        if sin_saludo >= MAX_PRE_HELLO_SESSIONS {
+        if sin_handshake >= MAX_PRE_HANDSHAKE_SESSIONS {
             return; // `stream` se suelta aquí: la conexión se cierra
         }
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
@@ -266,12 +378,13 @@ impl Hub {
             },
         );
         drop(st);
-        let config = &self.inner.config;
+        let inner = &self.inner;
         let cfg = SessionConfig {
             id,
-            device_id: config.device_id.clone(),
-            device_name: config.pc_name.clone(),
-            download_dir: config.download_dir.clone(),
+            device_id: inner.device_id.clone(),
+            device_name: inner.pc_name.clone(),
+            download_dir: inner.download_dir.clone(),
+            keys: inner.keys.clone(),
         };
         let host: Arc<dyn SessionHost> = self.inner.clone();
         tokio::spawn(session::run(stream, cfg, host, rx));
@@ -346,6 +459,61 @@ impl Hub {
         for e in lock(&self.inner.state).sessions.values() {
             let _ = e.commands.send(Command::Cancel(transfer_id.to_string()));
         }
+    }
+
+    // --- emparejamiento ---
+
+    /// Clave pública del PC (va en el QR).
+    pub fn public_key(&self) -> [u8; 32] {
+        self.inner.keys.public
+    }
+
+    /// Emite un token nuevo para el QR; invalida el anterior.
+    pub fn start_pairing(&self) -> PairingOffer {
+        lock(&self.inner.state).tokens.offer(now_ms())
+    }
+
+    pub fn cancel_pairing(&self) {
+        lock(&self.inner.state).tokens.cancel();
+    }
+
+    /// La oferta vigente: sin usar y sin caducar.
+    pub fn pairing_offer(&self) -> Option<PairingOffer> {
+        lock(&self.inner.state).tokens.active(now_ms())
+    }
+
+    /// Móviles emparejados, por fecha de emparejamiento.
+    pub fn paired_devices(&self) -> Vec<PairedDevice> {
+        let st = lock(&self.inner.state);
+        let mut v = st.paired.list();
+        v.extend(st.unsaved.iter().cloned());
+        v.sort_by_key(|d| d.paired_at_ms);
+        v
+    }
+
+    /// Olvida un móvil: lo quita de `paired.json`, cierra sus sesiones con `forgotten` y borra su
+    /// anti-rebote. `false` si no estaba emparejado o no se pudo guardar el cambio (sigue igual).
+    pub fn forget_device(&self, device_key: &str) -> bool {
+        let mut st = lock(&self.inner.state);
+        let unsaved = st.unsaved.len();
+        st.unsaved.retain(|d| d.public_key != device_key);
+        let removed = match st.paired.remove(device_key) {
+            Ok(removed) => removed || st.unsaved.len() != unsaved,
+            Err(e) => {
+                log(&format!("no se pudo olvidar el dispositivo: {e}"));
+                return false;
+            }
+        };
+        if !removed {
+            return false;
+        }
+        for e in st.sessions.values() {
+            if e.device_id.as_deref() == Some(device_key) {
+                let _ = e.commands.send(Command::Close(FORGOTTEN.into()));
+            }
+        }
+        st.syncs.remove(device_key);
+        true
     }
 }
 

@@ -40,6 +40,8 @@ fn params() -> Result<snow::params::NoiseParams, snow::Error> {
 }
 
 /// Handshake del lado del móvil (iniciador): conoce de antemano la clave pública del PC.
+/// El PC no lo usa, pero sí su cliente de prueba (`hub_tests`) y los vectores.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn initiator(keys: &StaticKeys, server_public: &[u8; 32]) -> Result<HandshakeState, snow::Error> {
     snow::Builder::new(params()?)
         .local_private_key(&keys.private)?

@@ -179,6 +179,12 @@ export const KEYS: { movil: KeyPair; pc: KeyPair; otro: KeyPair } = {
   otro: keyPairFromPrivate(new Uint8Array(32).fill(3)),
 };
 
+/** Payload (trama 0x01) de un `hello` de la fase 1, que ya no es un mensaje de control. */
+export function phase1HelloPayload(peer: { deviceId: string; deviceName: string }): Uint8Array {
+  const json = JSON.stringify({ kind: 'hello', v: 2, deviceId: peer.deviceId, deviceName: peer.deviceName });
+  return Uint8Array.of(0x01, ...new TextEncoder().encode(json));
+}
+
 /** Par «a mano» ya saludado: envía y registra mensajes del protocolo, cifrados con Noise. */
 export interface RawPeer {
   received: DecodedMessage[];

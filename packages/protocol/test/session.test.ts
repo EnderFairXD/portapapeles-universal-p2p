@@ -13,7 +13,7 @@ import {
   type SessionOptions,
   type Timers,
 } from '../src/index';
-import { KEYS, fakeTimers, flush, linkPair, memorySink, rawClient, rawServer } from './helpers';
+import { KEYS, fakeTimers, flush, linkPair, memorySink, phase1HelloPayload, rawClient, rawServer } from './helpers';
 
 const MOVIL: PeerInfo = { deviceId: 'movil-1', deviceName: 'Pixel' };
 const PC: PeerInfo = { deviceId: 'pc-1', deviceName: 'PC' };
@@ -373,7 +373,7 @@ describe('errores y cierre', () => {
 
   test('un hello tras el handshake → closed("protocol_error")', async () => {
     const { s, raw } = await serverAgainstRaw();
-    raw.send({ kind: 'hello', v: 2, ...MOVIL });
+    raw.sendRaw(phase1HelloPayload(MOVIL));
     await flush();
     expect(s.ev.closed).toEqual(['protocol_error']);
   });

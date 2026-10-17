@@ -3,8 +3,6 @@
 
 mod messages;
 pub mod hello;
-// Canal cifrado Noise IK: aún sin consumidores fuera de sus tests (los usa el Hub desde la tarea 3).
-#[allow(dead_code)]
 pub mod secure;
 
 pub use messages::{encode_control, encode_file_data, ControlMessage, Decoded, MessageDecoder, ProtocolError};
@@ -34,8 +32,6 @@ pub const FILE_WINDOW_BYTES: u64 = 2_097_152;
 pub const MAX_CLIP_BYTES: usize = 1_048_576;
 /// Máximo de un mensaje de control reensamblado (2 MiB).
 pub const MAX_CONTROL_BYTES: usize = 2_097_152;
-/// Solo en el PC: máximo reensamblado antes del hello (64 KiB), ante pares hostiles en la LAN.
-pub const MAX_PRE_HELLO_CONTROL_BYTES: usize = 65_536;
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 10_000;
 pub const HEARTBEAT_TIMEOUT_MS: u64 = 30_000;

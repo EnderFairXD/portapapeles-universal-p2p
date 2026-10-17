@@ -20,6 +20,7 @@ import {
   linkPair,
   memorySink,
   memorySource,
+  phase1HelloPayload,
   rawClient,
   rawServer,
   type MemorySink,
@@ -322,7 +323,7 @@ describe('tramas cifradas', () => {
     const raw = await rawClient(a, { hello: MOVIL });
     await flush();
     expect(s.ev.ready).toEqual([MOVIL]);
-    raw.send({ kind: 'hello', v: 2, ...MOVIL });
+    raw.sendRaw(phase1HelloPayload(MOVIL));
     await flush();
     expect(s.ev.closed).toEqual(['protocol_error']);
     expect(raw.closed).toBe(true);
@@ -334,7 +335,7 @@ describe('tramas cifradas', () => {
     await c.session.start();
     await flush();
     expect(c.ev.ready).toEqual([PC]);
-    server.send({ kind: 'hello', v: 2, ...PC });
+    server.sendRaw(phase1HelloPayload(PC));
     await flush();
     expect(c.ev.closed).toEqual(['protocol_error']);
   });

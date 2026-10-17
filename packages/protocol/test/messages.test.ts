@@ -57,18 +57,24 @@ describe('vectores compartidos', () => {
 
   test('cubre cada kind y los casos de error exigidos', () => {
     const kinds = new Set<string>(vectors.flatMap((v) => ('kind' in v.expect ? [v.expect.kind] : [])));
-    for (const k of ['hello', 'clip', 'file_start', 'file_ack', 'file_end', 'file_result', 'file_cancel', 'ping', 'pong']) {
+    for (const k of ['clip', 'file_start', 'file_ack', 'file_end', 'file_result', 'file_cancel', 'ping', 'pong']) {
       expect(kinds.has(k)).toBe(true);
     }
     expect(vectors.some((v) => 'data' in v.expect)).toBe(true);
     expect(vectors.filter((v) => 'error' in v.expect && !('kind' in v.expect)).length).toBeGreaterThanOrEqual(5);
   });
+
+  test('el hello de la fase 1 ya no es un mensaje de control: sus vectores son error', () => {
+    const hellos = vectors.filter((v) =>
+      v.framesHex.some((h) => new TextDecoder().decode(hexToBytes(h)).includes('"kind":"hello"')),
+    );
+    expect(hellos.length).toBeGreaterThanOrEqual(5);
+    expect(hellos.every((v) => 'error' in v.expect)).toBe(true);
+  });
 });
 
 describe('encodeControl / MessageDecoder', () => {
   const messages: ControlMessage[] = [
-    { kind: 'hello', v: 2, deviceId: 'd1', deviceName: 'Pixel', willSendClip: false },
-    { kind: 'hello', v: 2, deviceId: 'd1', deviceName: 'Pixel' },
     { kind: 'clip', id: 'a', text: 'hola 😀', hash: HASH },
     { kind: 'file_start', transferId: TID, name: 'a.txt', size: 0, mime: 'text/plain' },
     { kind: 'file_ack', transferId: TID, received: 1048576 },
@@ -137,7 +143,13 @@ describe('encodeControl / MessageDecoder', () => {
 
   test('encodeControl rechaza mensajes con forma inválida', () => {
     expect(() => encodeControl({ kind: 'file_ack', transferId: 'corto', received: 1 })).toThrow(ProtocolError);
-    expect(() => encodeControl({ kind: 'hello', v: 1 as 2, deviceId: 'a', deviceName: 'b' })).toThrow(ProtocolError);
+  });
+
+  test('hello ya no es un mensaje de control: ni se codifica ni se decodifica', () => {
+    const hello = { kind: 'hello', v: 2, deviceId: 'd1', deviceName: 'Pixel' } as unknown as ControlMessage;
+    expect(() => encodeControl(hello)).toThrow(ProtocolError);
+    const frame = Uint8Array.of(0x01, ...new TextEncoder().encode(JSON.stringify(hello)));
+    expect(() => new MessageDecoder().push(frame)).toThrow(ProtocolError);
   });
 
   test('encodeControl rechaza un mensaje que supera el máximo reensamblado', () => {

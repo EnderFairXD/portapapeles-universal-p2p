@@ -160,6 +160,8 @@ impl AppState {
                 }
             }
             HubEvent::Transfer(u) => self.on_transfer(u, now_ms),
+            // la interfaz de emparejamiento llega en la Tarea 9
+            HubEvent::DevicePaired { .. } => {}
         }
     }
 

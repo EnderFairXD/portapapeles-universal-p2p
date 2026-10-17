@@ -1,9 +1,6 @@
 //! Cargas JSON de los dos mensajes del handshake Noise IK (móvil → PC y PC → móvil).
 //! Deben comportarse igual que `packages/protocol/src/hello.ts`.
 
-// Aún sin consumidores fuera de sus tests: los usa la sesión cifrada del Hub (tarea 7).
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -28,6 +25,16 @@ pub struct ClientHello {
 pub enum RejectReason {
     NotPaired,
     PairingExpired,
+}
+
+impl RejectReason {
+    /// Texto del motivo, el mismo que viaja en el mensaje 2 y en el cierre de la sesión.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RejectReason::NotPaired => "not_paired",
+            RejectReason::PairingExpired => "pairing_expired",
+        }
+    }
 }
 
 /// Segundo mensaje (PC → móvil).
@@ -120,6 +127,8 @@ pub fn encode_server_hello(hello: &ServerHello) -> Vec<u8> {
     serde_json::to_vec(&value).unwrap_or_default()
 }
 
+/// Lado del móvil: el PC no lo usa, pero sí su cliente de prueba (`hub_tests`) y los vectores.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn decode_server_hello(bytes: &[u8]) -> Result<ServerHello, ProtocolError> {
     let o = parse_object(bytes)?;
     check_version(&o)?;
@@ -227,6 +236,13 @@ mod tests {
         let rej: Value =
             serde_json::from_slice(&encode_server_hello(&ServerHello::reject(RejectReason::PairingExpired))).unwrap();
         assert_eq!(rej, serde_json::json!({ "v": 2, "accepted": false, "reason": "pairing_expired" }));
+    }
+
+    #[test]
+    fn as_str_coincide_con_el_json() {
+        for r in [RejectReason::NotPaired, RejectReason::PairingExpired] {
+            assert_eq!(serde_json::to_value(r).unwrap(), Value::String(r.as_str().into()));
+        }
     }
 
     #[test]

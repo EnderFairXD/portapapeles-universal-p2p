@@ -8,7 +8,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
-use clipsync_lib::core::{Hub, HubConfig};
+use clipsync_lib::core::pairing::PairedStore;
+use clipsync_lib::core::{identity, Hub, HubConfig};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
@@ -81,6 +82,9 @@ async fn main() -> ExitCode {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
         }),
+        // efímeras y sin emparejados: la Tarea 8 añade las opciones del e2e
+        keys: identity::load_or_create(None),
+        paired: PairedStore::load(None),
     });
 
     let listener = match TcpListener::bind("127.0.0.1:0").await {
