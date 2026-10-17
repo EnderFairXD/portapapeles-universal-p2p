@@ -1,4 +1,4 @@
-import { ClipboardSync, type ClipDecision } from './clipSync';
+import { ClipboardSync, prepareClip, type ClipDecision } from './clipSync';
 import {
   FILE_ACK_EVERY_BYTES,
   FILE_CHUNK_BYTES,
@@ -25,6 +25,7 @@ import {
   type FileStartMsg,
   type HelloMsg,
 } from './messages';
+import { toWellFormed } from './text';
 
 /** Flujo de bytes fiable (TCP, USB…); la sesión le aplica el framing. */
 export interface Link {
@@ -107,6 +108,8 @@ export type SessionEvents = {
   clip: (text: string) => void;
   /** El texto local del servidor pierde frente al del cliente al empezar la sesión. */
   localClipSuperseded: (text: string) => void;
+  /** La regla de inicio envió de verdad este texto (ya bien formado), antes de `ready`. */
+  startClipSent: (text: string) => void;
   transfer: (update: TransferUpdate) => void;
   closed: (reason: string) => void;
 };
@@ -159,7 +162,14 @@ export class Session {
   private readonly timers: Timers;
   private readonly frames = new FrameDecoder();
   private readonly messages = new MessageDecoder();
-  private readonly listeners: Listeners = { ready: [], clip: [], localClipSuperseded: [], transfer: [], closed: [] };
+  private readonly listeners: Listeners = {
+    ready: [],
+    clip: [],
+    localClipSuperseded: [],
+    startClipSent: [],
+    transfer: [],
+    closed: [],
+  };
 
   private queue: Promise<void> = Promise.resolve();
   private started = false;
@@ -172,6 +182,13 @@ export class Session {
   private startClip: string | null = null;
   private heartbeat: unknown = null;
   private lastRx = 0;
+  /**
+   * Confirmación de lo enviado (R29): tras cada clip sale un ping; el pong número `confirmAt`
+   * prueba que el otro lado ya procesó el clip, porque el PC contesta en orden.
+   */
+  private pingsSent = 0;
+  private pongsReceived = 0;
+  private confirmAt: number | null = null;
 
   private outQueue: OutTransfer[] = [];
   private out: OutTransfer | null = null;
@@ -220,7 +237,7 @@ export class Session {
    */
   sendClip(text: string): ClipDecision {
     if (this.closed || !this.ready) throw new Error('La sesión no está lista');
-    return this.pushClip(text);
+    return this.pushClip(toWellFormed(text));
   }
 
   /**
@@ -302,10 +319,24 @@ export class Session {
         this.fail(e);
         return;
       }
-      if (decoded) {
-        const m = decoded;
-        void this.enqueue(() => this.dispatch(m));
+      if (!decoded) continue;
+      // el ping se contesta al momento, sin esperar a la cola (p. ej. tras un selector abierto);
+      // un pong no cambia nada más. Antes de ready va por la cola, para validar el saludo.
+      if (this.ready && decoded.type === 'control' && decoded.msg.kind === 'ping') {
+        this.pongNow();
+        continue;
       }
+      const m = decoded;
+      void this.enqueue(() => this.dispatch(m));
+    }
+  }
+
+  /** Pong fuera de la cola. Si el enlace cayó, se cierra por la cola: antes se atiende lo que ya llegó. */
+  private pongNow(): void {
+    try {
+      for (const payload of encodeControl({ kind: 'pong' })) this.link.write(encodeFrame(payload));
+    } catch {
+      void this.enqueue(() => this.close('link_closed'));
     }
   }
 
@@ -339,7 +370,8 @@ export class Session {
         this.send({ kind: 'pong' });
         return;
       case 'pong':
-        return; // basta con haber recibido tráfico
+        this.onPong();
+        return;
       case 'clip':
         return this.onClip(msg);
       default:
@@ -351,7 +383,8 @@ export class Session {
 
   private async sendClientHello(): Promise<void> {
     this.sync = this.opts.clipSyncFor(null);
-    const local = await this.opts.getLocalClip();
+    const raw = await this.opts.getLocalClip();
+    const local = raw === null ? null : toWellFormed(raw);
     // se anuncia solo lo que de verdad se podrá enviar (también si no cabe al codificarlo)
     const willSendClip = local !== null && this.prepareClip(local).decision === 'send';
     if (willSendClip) this.startClip = local;
@@ -361,7 +394,7 @@ export class Session {
   private onServerHello(msg: HelloMsg): void {
     const text = this.startClip;
     this.startClip = null;
-    if (text !== null) this.pushClip(text); // antes de ready, igual que el servidor
+    if (text !== null) this.pushStartClip(text); // antes de ready, igual que el servidor
     if (this.closed) return; // falló la escritura del clip
     this.becomeReady(msg);
   }
@@ -373,11 +406,12 @@ export class Session {
 
     // La regla se resuelve antes de ready: hasta entonces la app no puede llamar a sendClip.
     // La cola espera a esto, así que el clip del cliente aún no se ha procesado.
-    const local = await this.opts.getLocalClip();
+    const raw = await this.opts.getLocalClip();
     if (this.closed) return;
+    const local = raw === null ? null : toWellFormed(raw);
     let superseded: string | null = null;
     if (local !== null) {
-      if (!msg.willSendClip) this.pushClip(local);
+      if (!msg.willSendClip) this.pushStartClip(local);
       else if (this.prepareClip(local).decision === 'send') {
         // gana el móvil: el texto del PC se da por tratado para que no salga después y cruce
         sync.markSynced(local);
@@ -402,26 +436,39 @@ export class Session {
 
   // --- portapapeles ---
 
-  /** Decide si un texto se envía; si su JSON no cabe en un mensaje de control, es 'too_large'. */
+  /** Decide si un texto (ya bien formado) se envía; si su JSON no cabe, es 'too_large'. */
   private prepareClip(text: string): { decision: ClipDecision; frames?: Uint8Array[] } {
-    const decision = this.sync!.check(text);
-    if (decision !== 'send') return { decision };
-    try {
-      const frames = encodeControl({ kind: 'clip', id: this.opts.newTransferId(), text, hash: sha256Hex(text) });
-      return { decision, frames };
-    } catch (e) {
-      if (e instanceof ProtocolError) return { decision: 'too_large' }; // p. ej. 1 MiB de comillas
-      throw e;
-    }
+    return prepareClip(this.sync!, text, this.opts.newTransferId());
   }
 
-  /** Único camino de salida de un clip, para el arranque y para sendClip. */
+  /** Único camino de salida de un clip (ya bien formado), para el arranque y para sendClip. */
   private pushClip(text: string): ClipDecision {
     const { decision, frames } = this.prepareClip(text);
     if (decision !== 'send') return decision;
     this.write(frames!);
-    this.sync!.markSynced(text);
+    if (this.closed) return decision; // la escritura falló: no llegó
+    // tentativo hasta el pong del ping que sale justo detrás
+    this.sync!.markSent(text);
+    this.sendPing();
+    this.confirmAt = this.pingsSent;
     return decision;
+  }
+
+  private pushStartClip(text: string): void {
+    if (this.pushClip(text) === 'send' && !this.closed) this.emit('startClipSent', text);
+  }
+
+  private sendPing(): void {
+    this.pingsSent += 1;
+    this.send({ kind: 'ping' });
+  }
+
+  private onPong(): void {
+    this.pongsReceived += 1;
+    if (this.confirmAt !== null && this.pongsReceived >= this.confirmAt) {
+      this.confirmAt = null;
+      this.sync!.confirmSent();
+    }
   }
 
   private onClip(msg: ClipMsg): void {
@@ -694,7 +741,7 @@ export class Session {
   private tick(): void {
     if (this.closed) return;
     if (this.timers.now() - this.lastRx >= HEARTBEAT_TIMEOUT_MS) this.close('heartbeat_timeout');
-    else if (this.ready) this.send({ kind: 'ping' });
+    else if (this.ready) this.sendPing();
   }
 
   // --- salida ---
