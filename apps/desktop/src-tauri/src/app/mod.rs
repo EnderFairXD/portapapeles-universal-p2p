@@ -16,13 +16,18 @@ use tokio::sync::{mpsc, Notify};
 
 use clipboard::ClipboardHandle;
 
+use crate::core::pairing::{lan_ipv4s, pairing_uri, qr_svg, PairedDevice};
 use crate::core::{
     ClipDecision, ClipboardSync, Direction, Hub, HubEvent, TransferState, TransferUpdate, Transport,
 };
-use crate::protocol::{encode_control, ControlMessage, MAX_HISTORY};
+use crate::protocol::{encode_control, ControlMessage, DEFAULT_TCP_PORT, MAX_HISTORY};
 
 pub const CLIP_TOO_LARGE_NOTICE: &str = "Texto demasiado grande para sincronizar (máx. 1 MB)";
 pub const CLIP_NOTICE_MS: u64 = 5_000;
+/// Cuánto se muestra el aviso «emparejado».
+pub const PAIR_NOTICE_MS: u64 = 5_000;
+/// Error de `start_pairing` si el PC no tiene ninguna IPv4 de LAN que poner en el QR.
+pub const NO_NETWORK_ERROR: &str = "No hay ninguna red disponible";
 /// Aviso fijo si no se puede escuchar en el puerto TCP del protocolo.
 pub const SERVER_PORT_ERROR: &str =
     "No se pudo abrir el puerto 52847: puede que otra copia de ClipSync esté abierta";
@@ -41,6 +46,24 @@ pub struct PeerView {
     pub device_id: String,
     pub device_name: String,
     pub transport: Transport,
+}
+
+/// Móvil emparejado; `connected` si ahora mismo hay una sesión suya.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PairedView {
+    pub device_key: String,
+    pub device_name: String,
+    pub paired_at_ms: u64,
+    pub connected: bool,
+}
+
+/// QR de emparejamiento vigente.
+#[derive(Clone, Debug, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PairingView {
+    pub qr_svg: String,
+    pub expires_at_ms: u64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -65,6 +88,9 @@ pub struct UiState {
     pub clipboard_error: Option<String>,
     pub clip_notice: Option<String>,
     pub server_error: Option<String>,
+    pub paired: Vec<PairedView>,
+    pub pairing: Option<PairingView>,
+    pub pair_notice: Option<String>,
 }
 
 /// Qué hacer con un texto nuevo del portapapeles local.
@@ -113,6 +139,10 @@ pub struct AppState {
     clipboard_error: Option<String>,
     clip_notice_until: Option<u64>,
     server_error: Option<String>,
+    paired: Vec<PairedDevice>,
+    pairing: Option<PairingView>,
+    /// texto del aviso «emparejado» y hasta cuándo se muestra
+    pair_notice: Option<(String, u64)>,
     next_id: u64,
 }
 
@@ -127,6 +157,9 @@ impl AppState {
             clipboard_error: None,
             clip_notice_until: None,
             server_error: None,
+            paired: Vec::new(),
+            pairing: None,
+            pair_notice: None,
             next_id: 1,
         }
     }
@@ -160,8 +193,14 @@ impl AppState {
                 }
             }
             HubEvent::Transfer(u) => self.on_transfer(u, now_ms),
-            // la interfaz de emparejamiento llega en la Tarea 9
-            HubEvent::DevicePaired { .. } => {}
+            // la lista de emparejados la recarga quien tiene el Hub (`Ctx`) con `set_paired`
+            HubEvent::DevicePaired { device_name, .. } => {
+                self.pairing = None;
+                self.pair_notice = Some((
+                    format!("«{device_name}» emparejado"),
+                    now_ms.saturating_add(PAIR_NOTICE_MS),
+                ));
+            }
         }
     }
 
@@ -264,8 +303,36 @@ impl AppState {
         self.clip_notice_until = Some(now_ms.saturating_add(CLIP_NOTICE_MS));
     }
 
+    pub fn set_paired(&mut self, devices: Vec<PairedDevice>) {
+        self.paired = devices;
+    }
+
+    pub fn set_pairing(&mut self, view: Option<PairingView>) {
+        self.pairing = view;
+    }
+
     pub fn snapshot(&self, now_ms: u64) -> UiState {
         let notice = self.clip_notice_until.is_some_and(|until| now_ms < until);
+        let paired = self
+            .paired
+            .iter()
+            .map(|d| PairedView {
+                device_key: d.public_key.clone(),
+                device_name: d.device_name.clone(),
+                paired_at_ms: d.paired_at_ms,
+                connected: self.peers.iter().any(|p| p.device_id == d.public_key),
+            })
+            .collect();
+        let pairing = self
+            .pairing
+            .as_ref()
+            .filter(|p| now_ms < p.expires_at_ms)
+            .cloned();
+        let pair_notice = self
+            .pair_notice
+            .as_ref()
+            .filter(|(_, until)| now_ms < *until)
+            .map(|(text, _)| text.clone());
         UiState {
             pc_name: self.pc_name.clone(),
             peers: self.peers.clone(),
@@ -274,6 +341,9 @@ impl AppState {
             clipboard_error: self.clipboard_error.clone(),
             clip_notice: notice.then(|| CLIP_TOO_LARGE_NOTICE.to_string()),
             server_error: self.server_error.clone(),
+            paired,
+            pairing,
+            pair_notice,
         }
     }
 }
@@ -303,6 +373,7 @@ fn log(msg: &str) {
 /// Orden de bloqueo: `state` antes que el Hub, nunca al revés.
 pub struct Ctx {
     hub: Hub,
+    pc_name: String,
     state: Mutex<AppState>,
     /// texto local que el Hub ofrece a las sesiones nuevas; se actualiza antes de cada broadcast
     local_clip: Arc<Mutex<Option<String>>>,
@@ -317,9 +388,12 @@ impl Ctx {
         local_clip: Arc<Mutex<Option<String>>>,
         clipboard: ClipboardHandle,
     ) -> Self {
+        let mut state = AppState::new(pc_name.clone());
+        state.set_paired(hub.paired_devices());
         Self {
             hub,
-            state: Mutex::new(AppState::new(pc_name)),
+            pc_name,
+            state: Mutex::new(state),
             local_clip,
             clipboard,
             changed: Arc::new(Notify::new()),
@@ -356,6 +430,79 @@ impl Ctx {
         self.notify();
     }
 
+    /// Vuelve a cargar los móviles emparejados desde el Hub. Con `state` ya tomado (el orden
+    /// es `state` antes que el Hub).
+    fn reload_paired(&self, st: &mut AppState) {
+        st.set_paired(self.hub.paired_devices());
+    }
+
+    /// Despierta al emisor cuando `delay_ms` después algo del estado deja de mostrarse (el QR
+    /// caducado, el aviso): sin cambios de por medio nadie reemitiría `ui-state`.
+    fn notify_after(&self, delay_ms: u64) {
+        let changed = self.changed.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(delay_ms + 50)).await;
+            changed.notify_one();
+        });
+    }
+
+    /// Emite un QR nuevo (invalida el anterior). Sin IPv4 de LAN no hay a dónde conectar:
+    /// se cancela la oferta para que no quede ningún token válido sin QR.
+    fn start_pairing(&self) -> Result<(), String> {
+        let ips = lan_ipv4s();
+        let mut st = lock(&self.state);
+        if ips.is_empty() {
+            self.hub.cancel_pairing();
+            st.set_pairing(None);
+            drop(st);
+            self.notify();
+            return Err(NO_NETWORK_ERROR.to_string());
+        }
+        let offer = self.hub.start_pairing();
+        let uri = pairing_uri(
+            &self.hub.public_key(),
+            &offer.token,
+            &self.pc_name,
+            &ips,
+            DEFAULT_TCP_PORT,
+        );
+        let svg = qr_svg(&uri);
+        if svg.is_empty() {
+            self.hub.cancel_pairing();
+            st.set_pairing(None);
+            drop(st);
+            self.notify();
+            return Err("No se pudo generar el código QR".to_string());
+        }
+        st.set_pairing(Some(PairingView {
+            qr_svg: svg,
+            expires_at_ms: offer.expires_at_ms,
+        }));
+        drop(st);
+        self.notify();
+        self.notify_after(offer.expires_at_ms.saturating_sub(now_ms()));
+        Ok(())
+    }
+
+    fn cancel_pairing(&self) {
+        let mut st = lock(&self.state);
+        self.hub.cancel_pairing();
+        st.set_pairing(None);
+        drop(st);
+        self.notify();
+    }
+
+    fn forget_device(&self, device_key: &str) -> Result<(), String> {
+        let mut st = lock(&self.state);
+        if !self.hub.forget_device(device_key) {
+            return Err("No se pudo olvidar el dispositivo".to_string());
+        }
+        self.reload_paired(&mut st);
+        drop(st);
+        self.notify();
+        Ok(())
+    }
+
     /// Texto nuevo en el portapapeles del PC (desde el hilo del portapapeles).
     pub fn on_local_text(&self, text: String) {
         match classify_local_clip(&text) {
@@ -365,11 +512,7 @@ impl Ctx {
                 self.set_local(None);
                 lock(&self.state).show_clip_notice(now_ms());
                 self.notify();
-                let changed = self.changed.clone();
-                tauri::async_runtime::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(CLIP_NOTICE_MS + 50)).await;
-                    changed.notify_one();
-                });
+                self.notify_after(CLIP_NOTICE_MS);
             }
             LocalClip::Send => {
                 self.set_local(Some(text.clone()));
@@ -386,8 +529,17 @@ impl Ctx {
             if let HubEvent::ClipReceived { text, .. } = &ev {
                 self.clipboard.write(text.clone());
             }
-            lock(&self.state).apply(ev, now_ms());
+            let paired = matches!(ev, HubEvent::DevicePaired { .. });
+            let mut st = lock(&self.state);
+            st.apply(ev, now_ms());
+            if paired {
+                self.reload_paired(&mut st);
+            }
+            drop(st);
             self.notify();
+            if paired {
+                self.notify_after(PAIR_NOTICE_MS);
+            }
         }
     }
 
@@ -442,6 +594,23 @@ pub fn send_files(paths: Vec<String>, state: State<'_, Arc<Ctx>>) -> Result<Vec<
 #[tauri::command]
 pub fn cancel_transfer(transfer_id: String, state: State<'_, Arc<Ctx>>) {
     state.hub.cancel_transfer(&transfer_id);
+}
+
+/// Muestra un QR nuevo. `Err` si el PC no tiene ninguna red a la que conectar el móvil.
+#[tauri::command]
+pub fn start_pairing(state: State<'_, Arc<Ctx>>) -> Result<(), String> {
+    state.start_pairing()
+}
+
+#[tauri::command]
+pub fn cancel_pairing(state: State<'_, Arc<Ctx>>) {
+    state.cancel_pairing();
+}
+
+/// Olvida un móvil emparejado; si estaba conectado, su sesión se cierra.
+#[tauri::command]
+pub fn forget_device(device_key: String, state: State<'_, Arc<Ctx>>) -> Result<(), String> {
+    state.forget_device(&device_key)
 }
 
 /// Copia un texto del historial al portapapeles sin reenviarlo a los móviles.
@@ -799,5 +968,123 @@ mod tests {
         assert!(v["clipNotice"].is_null());
         assert!(v["serverError"].is_null());
         assert!(v["transfers"].as_array().unwrap().is_empty());
+    }
+
+    fn dispositivo(key: &str, nombre: &str, at: u64) -> PairedDevice {
+        PairedDevice {
+            public_key: key.into(),
+            device_id: format!("id-{key}"),
+            device_name: nombre.into(),
+            paired_at_ms: at,
+        }
+    }
+
+    fn oferta(expires_at_ms: u64) -> PairingView {
+        PairingView {
+            qr_svg: "<svg/>".into(),
+            expires_at_ms,
+        }
+    }
+
+    fn emparejado(key: &str, nombre: &str) -> HubEvent {
+        HubEvent::DevicePaired {
+            device_key: key.into(),
+            device_name: nombre.into(),
+        }
+    }
+
+    #[test]
+    fn device_paired_cierra_el_qr_y_pone_el_aviso() {
+        let mut s = st();
+        s.set_pairing(Some(oferta(400_000)));
+        assert!(s.snapshot(1_000).pairing.is_some());
+        s.apply(emparejado("aa", "Pixel 8"), 1_000);
+        let ui = s.snapshot(1_000);
+        assert!(ui.pairing.is_none());
+        assert_eq!(ui.pair_notice.as_deref(), Some("«Pixel 8» emparejado"));
+    }
+
+    #[test]
+    fn el_aviso_de_emparejado_desaparece_a_los_5_s() {
+        let mut s = st();
+        s.apply(emparejado("aa", "Pixel 8"), 1_000);
+        assert!(s.snapshot(5_999).pair_notice.is_some());
+        assert_eq!(s.snapshot(6_000).pair_notice, None);
+        assert_eq!(PAIR_NOTICE_MS, 5_000);
+    }
+
+    #[test]
+    fn snapshot_omite_el_qr_caducado() {
+        let mut s = st();
+        s.set_pairing(Some(oferta(10_000)));
+        let ui = s.snapshot(9_999);
+        assert_eq!(ui.pairing.map(|p| p.expires_at_ms), Some(10_000));
+        assert!(s.snapshot(10_000).pairing.is_none());
+        assert!(s.snapshot(20_000).pairing.is_none());
+        s.set_pairing(None);
+        assert!(s.snapshot(0).pairing.is_none());
+    }
+
+    #[test]
+    fn connected_refleja_los_peers() {
+        let mut s = st();
+        s.set_paired(vec![dispositivo("aa", "Pixel 8", 1), dispositivo("bb", "Moto", 2)]);
+        let p = s.snapshot(0).paired;
+        assert_eq!(p.len(), 2);
+        assert!(p.iter().all(|d| !d.connected));
+        s.apply(connected(1, "bb"), 5);
+        let p = s.snapshot(0).paired;
+        assert_eq!(p[0].device_key, "aa");
+        assert!(!p[0].connected);
+        assert_eq!(p[1].device_key, "bb");
+        assert_eq!(p[1].device_name, "Moto");
+        assert_eq!(p[1].paired_at_ms, 2);
+        assert!(p[1].connected);
+        s.apply(
+            HubEvent::PeerDisconnected {
+                session_id: 1,
+                reason: "link_closed".into(),
+            },
+            6,
+        );
+        assert!(s.snapshot(0).paired.iter().all(|d| !d.connected));
+    }
+
+    #[test]
+    fn olvidar_un_movil_quita_el_peer_y_deja_de_estar_conectado() {
+        let mut s = st();
+        s.set_paired(vec![dispositivo("aa", "Pixel 8", 1)]);
+        s.apply(connected(7, "aa"), 1);
+        assert!(s.snapshot(1).paired[0].connected);
+        // el Hub cierra la sesión con «forgotten» y la app recarga la lista
+        s.apply(
+            HubEvent::PeerDisconnected {
+                session_id: 7,
+                reason: "forgotten".into(),
+            },
+            2,
+        );
+        s.set_paired(Vec::new());
+        let ui = s.snapshot(2);
+        assert!(ui.peers.is_empty());
+        assert!(ui.paired.is_empty());
+    }
+
+    #[test]
+    fn ui_state_serializa_el_emparejamiento_en_camel_case() {
+        let mut s = st();
+        s.set_paired(vec![dispositivo("aa", "Pixel 8", 3)]);
+        s.set_pairing(Some(oferta(99)));
+        let v = serde_json::to_value(s.snapshot(0)).unwrap();
+        assert_eq!(v["paired"][0]["deviceKey"], "aa");
+        assert_eq!(v["paired"][0]["deviceName"], "Pixel 8");
+        assert_eq!(v["paired"][0]["pairedAtMs"], 3);
+        assert_eq!(v["paired"][0]["connected"], false);
+        assert_eq!(v["pairing"]["qrSvg"], "<svg/>");
+        assert_eq!(v["pairing"]["expiresAtMs"], 99);
+        assert!(v["pairNotice"].is_null());
+        let vacio = serde_json::to_value(st().snapshot(0)).unwrap();
+        assert!(vacio["pairing"].is_null());
+        assert!(vacio["paired"].as_array().unwrap().is_empty());
     }
 }

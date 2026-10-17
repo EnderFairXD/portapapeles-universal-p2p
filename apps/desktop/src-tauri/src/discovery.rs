@@ -3,9 +3,11 @@
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::io::Write;
 
-use crate::protocol::{MDNS_FULL_SERVICE_TYPE, PROTOCOL_VERSION};
+use crate::protocol::MDNS_FULL_SERVICE_TYPE;
 
-pub fn advertise(port: u16) -> Result<ServiceDaemon, mdns_sd::Error> {
+/// `fp` es la huella de la clave pública del PC (16 hex): el móvil solo usa el servicio cuya
+/// huella coincide con la de su PC.
+pub fn advertise(port: u16, fp: &str) -> Result<ServiceDaemon, mdns_sd::Error> {
     let daemon = ServiceDaemon::new()?;
 
     let hostname = hostname::get()
@@ -16,7 +18,7 @@ pub fn advertise(port: u16) -> Result<ServiceDaemon, mdns_sd::Error> {
 
     // "" + enable_addr_auto(): mdns-sd detecta y mantiene actualizadas las IPs
     // de las interfaces de red del host, sin que tengamos que enumerarlas a mano.
-    let properties = [("v", PROTOCOL_VERSION)];
+    let properties = [("v", "2"), ("fp", fp)];
     let service_info = ServiceInfo::new(
         MDNS_FULL_SERVICE_TYPE,
         &instance_name,
