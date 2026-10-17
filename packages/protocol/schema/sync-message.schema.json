@@ -2,9 +2,8 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://portapapeles-universal-p2p/schema/sync-message.schema.json",
   "title": "ControlMessage",
-  "description": "Mensajes de control del protocolo v2 (JSON en UTF-8, tramas 0x01/0x03). Los datos de archivo (trama 0x02) son binarios y no se describen aquí. Cualquier cambio debe respetarse por igual en el móvil (TypeScript) y en el PC (Rust).",
+  "description": "Mensajes de control del protocolo v2 (JSON en UTF-8, tramas 0x01/0x03), que viajan cifrados tras el handshake Noise IK. Los datos de archivo (trama 0x02) son binarios y no se describen aquí. Las cargas del handshake están en $defs (client_hello, server_hello). Cualquier cambio debe respetarse por igual en el móvil (TypeScript) y en el PC (Rust).",
   "oneOf": [
-    { "$ref": "#/$defs/hello" },
     { "$ref": "#/$defs/clip" },
     { "$ref": "#/$defs/file_start" },
     { "$ref": "#/$defs/file_ack" },
@@ -25,16 +24,45 @@
       "pattern": "^[0-9a-f]{64}$",
       "description": "SHA-256 en hex minúscula."
     },
-    "hello": {
+    "client_hello": {
+      "description": "Carga JSON del mensaje 1 del handshake Noise IK (móvil → PC). No es un mensaje de control: viaja dentro del handshake, sin byte de tipo. Sustituye al `hello` en claro de la fase 1.",
       "type": "object",
-      "required": ["kind", "v", "deviceId", "deviceName"],
+      "required": ["v", "deviceId", "deviceName"],
       "properties": {
-        "kind": { "const": "hello" },
         "v": { "const": 2 },
-        "deviceId": { "type": "string" },
-        "deviceName": { "type": "string" },
-        "willSendClip": { "type": "boolean" }
+        "deviceId": { "type": "string", "description": "Máximo 128 bytes en UTF-8." },
+        "deviceName": { "type": "string", "description": "El PC lo recorta a 64 caracteres." },
+        "willSendClip": { "type": "boolean" },
+        "pairingToken": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9_-]{22}$",
+          "description": "Token del QR: 128 bits en base64url sin relleno. Solo al emparejar."
+        }
       }
+    },
+    "server_hello": {
+      "description": "Carga JSON del mensaje 2 del handshake Noise IK (PC → móvil): aceptación o rechazo. No es un mensaje de control.",
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["v", "accepted", "deviceId", "pcName"],
+          "properties": {
+            "v": { "const": 2 },
+            "accepted": { "const": true },
+            "deviceId": { "type": "string" },
+            "pcName": { "type": "string" }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["v", "accepted", "reason"],
+          "properties": {
+            "v": { "const": 2 },
+            "accepted": { "const": false },
+            "reason": { "enum": ["not_paired", "pairing_expired"] }
+          }
+        }
+      ]
     },
     "clip": {
       "type": "object",

@@ -1,13 +1,18 @@
-//! Tests del Hub con un cliente de prueba que habla el protocolo a mano sobre `tokio::io::duplex`.
+//! Tests del Hub con un cliente de prueba que habla el protocolo a mano sobre `tokio::io::duplex`:
+//! hace el handshake Noise IK como el móvil y cifra y descifra cada trama.
 
 use super::*;
+use crate::core::pairing::{PairedDevice, PairedStore};
+use crate::protocol::hello::{decode_server_hello, ClientHello, RejectReason, ServerHello};
+use crate::protocol::secure::{self, StaticKeys};
 use crate::protocol::{
     encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder,
-    FILE_CHUNK_BYTES,
+    FILE_CHUNK_BYTES, MAX_FRAME_BYTES,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use snow::TransportState;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
@@ -15,6 +20,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, DuplexStream, ReadBuf, WriteHalf};
 use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::oneshot;
 use tokio::time::{timeout, Instant};
 use tokio_util::bytes::Bytes;
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
@@ -35,16 +41,50 @@ fn js(ev: &HubEvent) -> Value {
     serde_json::to_value(ev).unwrap()
 }
 
+/// Claves fijas de un móvil de prueba: `sha256("test/" + device_id)`.
+fn test_keys(device_id: &str) -> StaticKeys {
+    StaticKeys::from_private(Sha256::digest(format!("test/{device_id}").as_bytes()).into())
+}
+
+/// Clave pública del móvil en hex: su identidad en el PC (D4).
+fn key_hex(device_id: &str) -> String {
+    hex::encode(test_keys(device_id).public)
+}
+
+/// Claves del PC de prueba.
+fn pc_keys() -> StaticKeys {
+    test_keys("pc")
+}
+
 struct Setup {
     hub: Hub,
     events: UnboundedReceiver<HubEvent>,
     dir: tempfile::TempDir,
+    /// carpeta de datos del PC (aquí vive `paired.json`), aparte de la de descargas
+    data: tempfile::TempDir,
     /// lo que devuelve `local_clip` (el último texto del portapapeles del PC)
     local: Arc<Mutex<Option<String>>>,
 }
 
+/// Hub con `m1` y `m2` ya emparejados.
 fn setup(local: Option<&str>) -> Setup {
+    setup_with(local, &["m1", "m2"])
+}
+
+fn setup_with(local: Option<&str>, emparejados: &[&str]) -> Setup {
     let dir = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut paired = PairedStore::load(Some(data.path().join("paired.json")));
+    for id in emparejados {
+        paired
+            .upsert(PairedDevice {
+                public_key: key_hex(id),
+                device_id: id.to_string(),
+                device_name: format!("Móvil {id}"),
+                paired_at_ms: 1,
+            })
+            .unwrap();
+    }
     let local = Arc::new(Mutex::new(local.map(String::from)));
     let l = local.clone();
     let (hub, events) = Hub::new(HubConfig {
@@ -52,11 +92,14 @@ fn setup(local: Option<&str>) -> Setup {
         pc_name: "PC de prueba".into(),
         download_dir: dir.path().to_path_buf(),
         local_clip: Arc::new(move || l.lock().unwrap().clone()),
+        keys: pc_keys(),
+        paired,
     });
     Setup {
         hub,
         events,
         dir,
+        data,
         local,
     }
 }
@@ -103,15 +146,34 @@ impl Setup {
         v.sort();
         v
     }
+
+    /// Contenido de `paired.json` (vacío si no existe).
+    fn paired_json(&self) -> String {
+        std::fs::read_to_string(self.data.path().join("paired.json")).unwrap_or_default()
+    }
 }
 
-fn hello(device_id: &str, will_send_clip: Option<bool>) -> ControlMessage {
-    ControlMessage::Hello {
+/// Carga del mensaje 1 de un móvil de prueba, sin token.
+fn client_hello(device_id: &str, will_send_clip: Option<bool>) -> ClientHello {
+    ClientHello {
         v: 2,
         device_id: device_id.into(),
         device_name: format!("Móvil {device_id}"),
         will_send_clip,
+        pairing_token: None,
     }
+}
+
+/// `hello` en claro de la fase 1, que ya no es un mensaje de control.
+fn hello_fase_1(device_id: &str) -> Vec<u8> {
+    let mut p = vec![0x01];
+    p.extend_from_slice(
+        format!(
+            r#"{{"kind":"hello","v":2,"deviceId":"{device_id}","deviceName":"Móvil {device_id}"}}"#
+        )
+        .as_bytes(),
+    );
+    p
 }
 
 fn clip(text: &str) -> ControlMessage {
@@ -122,18 +184,18 @@ fn clip(text: &str) -> ControlMessage {
     }
 }
 
-fn server_hello() -> ControlMessage {
-    ControlMessage::Hello {
-        v: 2,
-        device_id: "pc-1".into(),
-        device_name: "PC de prueba".into(),
-        will_send_clip: None,
-    }
+fn server_hello() -> ServerHello {
+    ServerHello::accept("pc-1", "PC de prueba")
 }
 
 fn peer_connected(session_id: u64, device_id: &str, transport: &str) -> Value {
-    json!({"type": "peerConnected", "sessionId": session_id, "deviceId": device_id,
+    json!({"type": "peerConnected", "sessionId": session_id, "deviceId": key_hex(device_id),
            "deviceName": format!("Móvil {device_id}"), "transport": transport})
+}
+
+fn device_paired(device_id: &str) -> Value {
+    json!({"type": "devicePaired", "deviceKey": key_hex(device_id),
+           "deviceName": format!("Móvil {device_id}")})
 }
 
 fn transfer(id: &str, dir: &str, name: &str, size: u64, bytes: u64, state: &str) -> Value {
@@ -146,10 +208,19 @@ fn with(mut v: Value, key: &str, val: Value) -> Value {
     v
 }
 
-/// Cliente de prueba: escribe a mano y un hilo lector decodifica todo lo que llega.
+/// Canal de transporte Noise del cliente, compartido entre quien escribe y el hilo lector.
+type Canal = Arc<Mutex<TransportState>>;
+
+/// Cliente de prueba: hace el handshake como el móvil, escribe a mano y un hilo lector descifra
+/// y decodifica todo lo que llega.
 struct Client<W> {
     w: FramedWrite<W, LengthDelimitedCodec>,
     rx: UnboundedReceiver<Decoded>,
+    /// primera trama del PC (el mensaje 2); `None` si cerró sin enviarla
+    msg2: Option<oneshot::Receiver<Option<Vec<u8>>>>,
+    /// entrega el canal al hilo lector si el PC acepta; si se suelta, el lector solo espera al cierre
+    al_lector: Option<oneshot::Sender<Canal>>,
+    canal: Option<Canal>,
 }
 
 fn connect(hub: &Hub) -> Client<WriteHalf<DuplexStream>> {
@@ -161,11 +232,31 @@ fn connect(hub: &Hub) -> Client<WriteHalf<DuplexStream>> {
 fn over<S: AsyncRead + AsyncWrite + Send + 'static>(s: S) -> Client<WriteHalf<S>> {
     let (r, w) = tokio::io::split(s);
     let (tx, rx) = mpsc::unbounded_channel();
+    let (msg2_tx, msg2_rx) = oneshot::channel();
+    let (canal_tx, canal_rx) = oneshot::channel::<Canal>();
     tokio::spawn(async move {
         let mut frames = FramedRead::new(r, frame_codec());
+        let Some(Ok(primera)) = frames.next().await else {
+            let _ = msg2_tx.send(None);
+            return; // cerró sin responder: `rx` queda cerrado
+        };
+        let _ = msg2_tx.send(Some(primera.to_vec()));
+        let Ok(canal) = canal_rx.await else {
+            // rechazado (o sin handshake): tras el mensaje 2 solo cabe el cierre
+            if let Some(Ok(f)) = frames.next().await {
+                panic!("el servidor envió {} bytes tras rechazar", f.len());
+            }
+            return;
+        };
         let mut dec = MessageDecoder::default();
+        let mut buf = vec![0u8; MAX_FRAME_BYTES];
         while let Some(Ok(f)) = frames.next().await {
-            match dec.push(&f) {
+            let n = canal
+                .lock()
+                .unwrap()
+                .read_message(&f, &mut buf)
+                .expect("el servidor envió una trama que no descifra");
+            match dec.push(&buf[..n]) {
                 Ok(Some(d)) => {
                     if tx.send(d).is_err() {
                         break;
@@ -179,22 +270,107 @@ fn over<S: AsyncRead + AsyncWrite + Send + 'static>(s: S) -> Client<WriteHalf<S>
     Client {
         w: FramedWrite::new(w, frame_codec()),
         rx,
+        msg2: Some(msg2_rx),
+        al_lector: Some(canal_tx),
+        canal: None,
     }
 }
 
 impl<W: AsyncWrite + Unpin> Client<W> {
+    /// Handshake con las claves de `hello.device_id` contra la clave pública `pc`. Devuelve la
+    /// respuesta del PC, o `None` si cerró sin responder.
+    async fn handshake_to(
+        &mut self,
+        keys: &StaticKeys,
+        pc: &[u8; 32],
+        hello: &ClientHello,
+    ) -> Option<ServerHello> {
+        let mut hs = secure::initiator(keys, pc).unwrap();
+        let mut buf = vec![0u8; MAX_FRAME_BYTES];
+        let n = hs
+            .write_message(&serde_json::to_vec(hello).unwrap(), &mut buf)
+            .unwrap();
+        if self
+            .w
+            .send(Bytes::copy_from_slice(&buf[..n]))
+            .await
+            .is_err()
+        {
+            return None; // el PC ya había cerrado (p. ej. sin hueco)
+        }
+        let msg2 = timeout(WAIT, self.msg2.take().expect("handshake repetido"))
+            .await
+            .expect("el PC no respondió al mensaje 1")
+            .unwrap()?;
+        let n = hs
+            .read_message(&msg2, &mut buf)
+            .expect("mensaje 2 inválido");
+        let answer = decode_server_hello(&buf[..n]).unwrap();
+        let al_lector = self.al_lector.take().unwrap();
+        if matches!(answer, ServerHello::Accepted { .. }) {
+            let canal = Arc::new(Mutex::new(hs.into_transport_mode().unwrap()));
+            let _ = al_lector.send(canal.clone());
+            self.canal = Some(canal);
+        }
+        Some(answer)
+    }
+
+    async fn handshake(&mut self, hello: &ClientHello) -> Option<ServerHello> {
+        let keys = test_keys(&hello.device_id);
+        self.handshake_to(&keys, &pc_keys().public, hello).await
+    }
+
+    async fn hello(&mut self, device_id: &str, will_send_clip: Option<bool>) {
+        let answer = self
+            .handshake(&client_hello(device_id, will_send_clip))
+            .await;
+        assert_eq!(answer, Some(server_hello()));
+    }
+
     async fn send(&mut self, msg: ControlMessage) {
         for f in encode_control(&msg).unwrap() {
-            self.w.send(Bytes::from(f)).await.unwrap();
+            self.send_payload(&f).await;
         }
+    }
+
+    /// Envía un payload: cifrado tras el handshake y en claro antes (como un par hostil). Antes
+    /// del handshake el PC puede cerrar en cualquier momento, así que ahí se ignoran los errores.
+    async fn send_payload(&mut self, payload: &[u8]) {
+        let Some(canal) = &self.canal else {
+            let _ = self.w.send(Bytes::copy_from_slice(payload)).await;
+            return;
+        };
+        let mut buf = vec![0u8; MAX_FRAME_BYTES];
+        let n = canal
+            .lock()
+            .unwrap()
+            .write_message(payload, &mut buf)
+            .unwrap();
+        self.w
+            .send(Bytes::copy_from_slice(&buf[..n]))
+            .await
+            .unwrap();
+    }
+
+    /// Cifra el payload y cambia un bit del mensaje cifrado antes de enviarlo.
+    async fn send_corrupt(&mut self, payload: &[u8]) {
+        let canal = self.canal.as_ref().expect("sin handshake");
+        let mut buf = vec![0u8; MAX_FRAME_BYTES];
+        let n = canal
+            .lock()
+            .unwrap()
+            .write_message(payload, &mut buf)
+            .unwrap();
+        buf[n / 2] ^= 0x01;
+        self.w
+            .send(Bytes::copy_from_slice(&buf[..n]))
+            .await
+            .unwrap();
     }
 
     async fn send_data(&mut self, id: &str, bytes: &[u8]) {
         let id: [u8; 16] = hex::decode(id).unwrap().try_into().unwrap();
-        self.w
-            .send(Bytes::from(encode_file_data(&id, bytes)))
-            .await
-            .unwrap();
+        self.send_payload(&encode_file_data(&id, bytes)).await;
     }
 
     async fn recv(&mut self) -> Option<Decoded> {
@@ -212,11 +388,6 @@ impl<W: AsyncWrite + Unpin> Client<W> {
                 other => panic!("se esperaba control: {other:?}"),
             }
         }
-    }
-
-    async fn hello(&mut self, device_id: &str, will_send_clip: Option<bool>) {
-        self.send(hello(device_id, will_send_clip)).await;
-        assert_eq!(self.ctrl().await, server_hello());
     }
 
     /// Envía ping y devuelve lo que llegó antes del pong (sin contar los ping).
@@ -281,8 +452,10 @@ async fn clips_antes_de_fin<W: AsyncWrite + Unpin>(
 async fn saludo_emite_peer_connected() {
     let mut s = setup(None);
     let mut c = connect(&s.hub);
-    c.send(hello("m1", Some(false))).await;
-    assert_eq!(c.ctrl().await, server_hello());
+    assert_eq!(
+        c.handshake(&client_hello("m1", Some(false))).await,
+        Some(server_hello())
+    );
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
     assert!(
         c.sync().await.is_empty(),
@@ -457,9 +630,10 @@ async fn clip_de_mas_de_1_mib_cierra_con_protocol_error() {
 }
 
 #[tokio::test]
-async fn mensaje_antes_del_hello_cierra_sin_peer_connected() {
+async fn trama_que_no_es_un_mensaje_1_valido_cierra_sin_eventos() {
     let mut s = setup(None);
     let mut c = connect(&s.hub);
+    // un mensaje de control en claro en lugar del mensaje 1 del handshake
     c.send(clip("hola")).await;
     c.closed().await;
     // nunca llegó a estar conectado: no hay evento de conexión ni de desconexión
@@ -467,16 +641,18 @@ async fn mensaje_antes_del_hello_cierra_sin_peer_connected() {
 }
 
 #[tokio::test]
-async fn hello_repetido_es_protocol_error() {
+async fn hello_tras_el_handshake_cierra_con_protocol_error() {
     let mut s = setup(None);
     let mut c = connect(&s.hub);
     c.hello("m1", Some(false)).await;
     s.event().await;
-    c.send(hello("m1", Some(false))).await;
+    // el hello de la fase 1 ya no es un mensaje de control
+    c.send_payload(&hello_fase_1("m1")).await;
     assert_eq!(
         s.event().await,
         json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
     );
+    c.closed().await;
 }
 
 #[tokio::test]
@@ -780,9 +956,70 @@ async fn corte_a_mitad_borra_part_y_emite_failed() {
     assert!(s.files().is_empty());
 }
 
-/// Enlace que, al escribir un mensaje de control con ese `kind`, falla o (con `true`) se
-/// queda bloqueado para siempre, como un TCP medio abierto con el búfer lleno.
-struct FallaAlEscribir(DuplexStream, &'static str, bool);
+/// Cuenta las tramas que escribe el PC (u16 big-endian + datos) sin poder leerlas: van cifradas.
+#[derive(Clone, Copy, Default)]
+struct Tramas {
+    /// tramas ya escritas enteras
+    hechas: usize,
+    cabecera: [u8; 2],
+    bytes_cabecera: usize,
+    quedan: usize,
+}
+
+impl Tramas {
+    fn avanza(&mut self, b: u8) {
+        if self.bytes_cabecera < 2 {
+            self.cabecera[self.bytes_cabecera] = b;
+            self.bytes_cabecera += 1;
+            if self.bytes_cabecera == 2 {
+                self.quedan = u16::from_be_bytes(self.cabecera) as usize;
+            }
+        } else {
+            self.quedan -= 1;
+        }
+        if self.bytes_cabecera == 2 && self.quedan == 0 {
+            *self = Tramas {
+                hechas: self.hechas + 1,
+                ..Tramas::default()
+            };
+        }
+    }
+}
+
+/// Enlace que, al empezar a escribir la trama número `n` del PC (la 0 es el mensaje 2 del
+/// handshake), falla o (con `true`) se queda bloqueado para siempre, como un TCP medio abierto
+/// con el búfer lleno. Las tramas anteriores pasan enteras.
+struct FallaAlEscribir {
+    inner: DuplexStream,
+    n: usize,
+    bloquear: bool,
+    tramas: Tramas,
+}
+
+impl FallaAlEscribir {
+    fn new(inner: DuplexStream, n: usize, bloquear: bool) -> Self {
+        FallaAlEscribir {
+            inner,
+            n,
+            bloquear,
+            tramas: Tramas::default(),
+        }
+    }
+
+    /// Bytes de `buf` que caben antes de la trama `n`.
+    fn permitidos(&self, buf: &[u8]) -> usize {
+        let mut t = self.tramas;
+        let mut k = 0;
+        for &b in buf {
+            if t.hechas == self.n && t.bytes_cabecera == 0 {
+                break;
+            }
+            t.avanza(b);
+            k += 1;
+        }
+        k
+    }
+}
 
 impl AsyncRead for FallaAlEscribir {
     fn poll_read(
@@ -790,7 +1027,7 @@ impl AsyncRead for FallaAlEscribir {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        Pin::new(&mut self.inner).poll_read(cx, buf)
     }
 }
 
@@ -800,20 +1037,26 @@ impl AsyncWrite for FallaAlEscribir {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let marca = format!("\"kind\":\"{}\"", self.1);
-        if buf.windows(marca.len()).any(|w| w == marca.as_bytes()) {
-            if self.2 {
+        let k = self.permitidos(buf);
+        if k == 0 && !buf.is_empty() {
+            if self.bloquear {
                 return Poll::Pending;
             }
             return Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
         }
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        let res = Pin::new(&mut self.inner).poll_write(cx, &buf[..k]);
+        if let Poll::Ready(Ok(escritos)) = res {
+            for &b in &buf[..escritos] {
+                self.tramas.avanza(b);
+            }
+        }
+        res
     }
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        Pin::new(&mut self.inner).poll_flush(cx)
     }
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -821,9 +1064,10 @@ impl AsyncWrite for FallaAlEscribir {
 async fn si_cae_antes_de_file_result_se_borra_el_archivo_guardado() {
     let mut s = setup(None);
     let (a, b) = tokio::io::duplex(256 * 1024);
-    // la sesión cae tras `finish()` y antes de confirmar
+    // la sesión cae tras `finish()` y antes de confirmar: tramas 0 = mensaje 2, 1 = file_ack,
+    // 2 = file_result
     s.hub
-        .accept_stream(FallaAlEscribir(b, "file_result", false), Transport::Wifi);
+        .accept_stream(FallaAlEscribir::new(b, 2, false), Transport::Wifi);
     let mut c = over(a);
     c.hello("m1", Some(false)).await;
     s.event().await;
@@ -1233,8 +1477,9 @@ async fn cierre_con_archivos_salientes_los_marca_failed() {
 async fn clip_que_no_se_pudo_escribir_llega_al_reconectar() {
     let mut s = setup(None);
     let (a, b) = tokio::io::duplex(256 * 1024);
+    // tramas 0 = mensaje 2, 1 = el clip
     s.hub
-        .accept_stream(FallaAlEscribir(b, "clip", false), Transport::Wifi);
+        .accept_stream(FallaAlEscribir::new(b, 1, false), Transport::Wifi);
     let mut c = over(a);
     c.hello("m1", Some(false)).await;
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
@@ -1293,14 +1538,16 @@ async fn tras_caer_por_latido_la_reconexion_recibe_el_texto_actual() {
 }
 
 #[tokio::test]
-async fn device_id_de_mas_de_128_bytes_es_protocol_error() {
-    let mut s = setup(None);
+async fn device_id_de_mas_de_128_bytes_cierra_el_handshake() {
+    // los dos emparejados: el rechazo es por el límite, no por la autorización
+    let (a, b) = ("a".repeat(128), "b".repeat(129));
+    let mut s = setup_with(None, &[&a, &b]);
     let mut ok = connect(&s.hub);
-    ok.hello(&"a".repeat(128), Some(false)).await;
-    assert_eq!(s.event().await["deviceId"], json!("a".repeat(128)));
+    ok.hello(&a, Some(false)).await;
+    assert_eq!(s.event().await["deviceId"], json!(key_hex(&a)));
 
     let mut c = connect(&s.hub);
-    c.send(hello(&"b".repeat(129), Some(false))).await;
+    assert_eq!(c.handshake(&client_hello(&b, Some(false))).await, None);
     c.closed().await;
     s.no_events();
 }
@@ -1309,14 +1556,11 @@ async fn device_id_de_mas_de_128_bytes_es_protocol_error() {
 async fn device_name_se_recorta_a_64_caracteres() {
     let mut s = setup(None);
     let mut c = connect(&s.hub);
-    c.send(ControlMessage::Hello {
-        v: 2,
-        device_id: "m1".into(),
+    let hello = ClientHello {
         device_name: "ñ".repeat(100),
-        will_send_clip: Some(false),
-    })
-    .await;
-    assert_eq!(c.ctrl().await, server_hello());
+        ..client_hello("m1", Some(false))
+    };
+    assert_eq!(c.handshake(&hello).await, Some(server_hello()));
     assert_eq!(s.event().await["deviceName"], json!("ñ".repeat(64)));
 }
 
@@ -1327,8 +1571,9 @@ async fn sesion_vieja_que_cae_tarde_no_borra_la_sincronia_de_la_nueva() {
     let mut s = setup(None);
     // la vieja se queda bloqueada al escribir un clip: no verá su Close("replaced")
     let (a, b) = tokio::io::duplex(256 * 1024);
+    // tramas 0 = mensaje 2, 1 = el clip
     s.hub
-        .accept_stream(FallaAlEscribir(b, "clip", true), Transport::Wifi);
+        .accept_stream(FallaAlEscribir::new(b, 1, true), Transport::Wifi);
     let mut viejo = over(a);
     viejo.hello("m1", Some(false)).await;
     assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
@@ -1399,16 +1644,15 @@ async fn como_mucho_8_sesiones_sin_saludo_y_la_novena_se_cierra() {
 async fn al_cerrarse_una_sesion_sin_saludo_queda_su_hueco() {
     let mut s = setup(None);
     let mut sin_saludo: Vec<_> = (0..8).map(|_| connect(&s.hub)).collect();
-    // un mensaje antes del hello la cierra y libera su hueco
+    // una trama que no es un mensaje 1 válido la cierra y libera su hueco
     sin_saludo[0].send(clip("hola")).await;
     sin_saludo[0].closed().await;
     // el Hub quita la sesión al recibir su Closed: se reintenta hasta que haya hueco
     let _nueva = timeout(WAIT, async {
         loop {
             let mut c = connect(&s.hub);
-            c.send(hello("m1", Some(false))).await;
-            if let Some(Decoded::Control(m)) = c.recv().await {
-                assert_eq!(m, server_hello());
+            if let Some(answer) = c.handshake(&client_hello("m1", Some(false))).await {
+                assert_eq!(answer, server_hello());
                 return c;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
@@ -1419,17 +1663,18 @@ async fn al_cerrarse_una_sesion_sin_saludo_queda_su_hueco() {
     let e = s.event().await;
     assert_eq!(
         (e["type"].as_str(), e["deviceId"].as_str()),
-        (Some("peerConnected"), Some("m1"))
+        (Some("peerConnected"), Some(key_hex("m1").as_str()))
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn sin_hello_en_30_s_se_cierra_aunque_haya_trafico() {
+async fn sin_mensaje_1_completo_en_30_s_se_cierra_aunque_lleguen_bytes() {
     let mut s = setup(None);
     let mut c = connect(&s.hub);
-    // fragmentos 0x03 de un byte: mantienen vivo el latido pero nunca completan el hello
+    // una trama anunciada de 65 535 bytes que llega byte a byte y nunca se completa
+    c.w.get_mut().write_all(&[0xff, 0xff]).await.unwrap();
     for _ in 0..4 {
-        c.w.send(Bytes::from_static(&[0x03, b' '])).await.unwrap();
+        let _ = c.w.get_mut().write_all(b" ").await;
         tokio::time::sleep(Duration::from_secs(9)).await;
     }
     c.closed().await;
@@ -1437,21 +1682,18 @@ async fn sin_hello_en_30_s_se_cierra_aunque_haya_trafico() {
 }
 
 #[tokio::test]
-async fn antes_del_hello_un_mensaje_de_mas_de_64_kib_se_rechaza() {
+async fn antes_del_handshake_un_mensaje_de_mas_de_64_kib_se_rechaza() {
     let mut s = setup(None);
     let mut c = connect(&s.hub);
-    // un hello válido, pero de más de 64 KiB reensamblados
-    let mut grande = hello("m1", Some(false));
-    if let ControlMessage::Hello { device_name, .. } = &mut grande {
-        *device_name = "x".repeat(70_000);
-    }
-    c.send(grande).await;
+    // un mensaje de control de más de 64 KiB en claro: su primera trama, de tamaño máximo, no
+    // es un mensaje 1 válido
+    c.send(clip(&"x".repeat(70_000))).await;
     c.closed().await;
     s.no_events();
 }
 
 #[tokio::test]
-async fn tras_el_hello_un_mensaje_de_mas_de_64_kib_si_vale() {
+async fn tras_el_handshake_un_mensaje_de_mas_de_64_kib_si_vale() {
     let mut s = setup(None);
     let mut c = connect(&s.hub);
     c.hello("m1", Some(false)).await;
@@ -1481,4 +1723,362 @@ async fn nombre_de_archivo_entrante_se_recorta_a_255_caracteres() {
     assert_eq!(v.last().unwrap()["state"], "done");
     // el archivo se guarda con el nombre saneado de siempre
     assert_eq!(s.files().len(), 1);
+}
+
+// --- canal cifrado y emparejamiento (fase 2) ---
+
+/// Mensaje 1 con el token del QR.
+fn con_token(device_id: &str, token: &str) -> ClientHello {
+    ClientHello {
+        pairing_token: Some(token.into()),
+        ..client_hello(device_id, Some(false))
+    }
+}
+
+#[tokio::test]
+async fn public_key_es_la_del_pc() {
+    let s = setup(None);
+    assert_eq!(s.hub.public_key(), pc_keys().public);
+}
+
+#[tokio::test]
+async fn peer_connected_lleva_la_clave_del_movil() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    c.hello("m1", Some(false)).await;
+    let e = s.event().await;
+    assert_eq!(e["type"], "peerConnected");
+    assert_eq!(e["deviceId"], json!(hex::encode(test_keys("m1").public)));
+    // no el deviceId que declara el móvil
+    assert_ne!(e["deviceId"], json!("m1"));
+}
+
+#[tokio::test]
+async fn no_emparejado_recibe_not_paired_y_no_hay_eventos() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&client_hello("m9", Some(false))).await,
+        Some(ServerHello::reject(RejectReason::NotPaired))
+    );
+    c.closed().await;
+    s.no_events();
+    // un token que no es el del QR tampoco empareja
+    s.hub.start_pairing();
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&con_token("m9", "AAAAAAAAAAAAAAAAAAAAAA"))
+            .await,
+        Some(ServerHello::reject(RejectReason::NotPaired))
+    );
+    c.closed().await;
+    s.no_events();
+    assert!(!s.paired_json().contains(&key_hex("m9")));
+}
+
+#[tokio::test]
+async fn token_valido_empareja_guarda_y_emite_device_paired() {
+    let mut s = setup(None);
+    let offer = s.hub.start_pairing();
+    assert_eq!(s.hub.pairing_offer(), Some(offer.clone()));
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&con_token("m3", &offer.token)).await,
+        Some(server_hello())
+    );
+    assert_eq!(s.event().await, device_paired("m3"));
+    assert_eq!(s.event().await, peer_connected(1, "m3", "wifi"));
+    assert!(
+        s.paired_json().contains(&key_hex("m3")),
+        "{}",
+        s.paired_json()
+    );
+    let m3 = s
+        .hub
+        .paired_devices()
+        .into_iter()
+        .find(|d| d.public_key == key_hex("m3"))
+        .expect("m3 emparejado");
+    assert_eq!(
+        (m3.device_id.as_str(), m3.device_name.as_str()),
+        ("m3", "Móvil m3")
+    );
+    assert_eq!(s.hub.pairing_offer(), None, "el token ya se usó");
+
+    // reconectar sin token → aceptado
+    c.cut().await;
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"})
+    );
+    let mut c = connect(&s.hub);
+    c.hello("m3", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(2, "m3", "wifi"));
+}
+
+#[tokio::test]
+async fn token_usado_por_otro_movil_da_pairing_expired() {
+    let mut s = setup(None);
+    let offer = s.hub.start_pairing();
+    let mut c3 = connect(&s.hub);
+    assert_eq!(
+        c3.handshake(&con_token("m3", &offer.token)).await,
+        Some(server_hello())
+    );
+    assert_eq!(s.event().await, device_paired("m3"));
+    assert_eq!(s.event().await, peer_connected(1, "m3", "wifi"));
+
+    let mut c4 = connect(&s.hub);
+    assert_eq!(
+        c4.handshake(&con_token("m4", &offer.token)).await,
+        Some(ServerHello::reject(RejectReason::PairingExpired))
+    );
+    c4.closed().await;
+    s.no_events();
+    let claves: Vec<String> = s
+        .hub
+        .paired_devices()
+        .into_iter()
+        .map(|d| d.public_key)
+        .collect();
+    assert!(claves.contains(&key_hex("m3")));
+    assert!(!claves.contains(&key_hex("m4")));
+    assert!(c3.sync().await.is_empty(), "m3 sigue conectado");
+}
+
+#[tokio::test]
+async fn emparejado_con_token_vigente_lo_consume_y_cierra_la_oferta() {
+    let mut s = setup(None);
+    let offer = s.hub.start_pairing();
+    let mut c = connect(&s.hub);
+    // m1 ya estaba emparejado; vuelve a escanear el QR con otro nombre e id
+    let hello = ClientHello {
+        device_id: "m1-nuevo".into(),
+        device_name: "Móvil m1".into(),
+        pairing_token: Some(offer.token.clone()),
+        will_send_clip: Some(false),
+        v: 2,
+    };
+    assert_eq!(
+        c.handshake_to(&test_keys("m1"), &pc_keys().public, &hello)
+            .await,
+        Some(server_hello())
+    );
+    assert_eq!(s.event().await, device_paired("m1"));
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    assert_eq!(s.hub.pairing_offer(), None);
+    let m1 = s
+        .hub
+        .paired_devices()
+        .into_iter()
+        .find(|d| d.public_key == key_hex("m1"))
+        .unwrap();
+    assert_eq!(m1.device_id, "m1-nuevo");
+    assert_eq!(
+        m1.paired_at_ms, 1,
+        "conserva la fecha del primer emparejamiento"
+    );
+    assert!(s.paired_json().contains("m1-nuevo"));
+}
+
+#[tokio::test]
+async fn emparejado_con_token_caducado_o_ajeno_entra_sin_device_paired() {
+    let mut s = setup(None);
+    let offer = s.hub.start_pairing();
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&con_token("m1", "AAAAAAAAAAAAAAAAAAAAAA"))
+            .await,
+        Some(server_hello())
+    );
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    assert_eq!(
+        s.hub.pairing_offer(),
+        Some(offer),
+        "la oferta sigue abierta"
+    );
+}
+
+#[tokio::test]
+async fn cancelar_el_emparejamiento_invalida_el_token() {
+    let mut s = setup(None);
+    let offer = s.hub.start_pairing();
+    s.hub.cancel_pairing();
+    assert_eq!(s.hub.pairing_offer(), None);
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&con_token("m3", &offer.token)).await,
+        Some(ServerHello::reject(RejectReason::NotPaired))
+    );
+    c.closed().await;
+    s.no_events();
+}
+
+#[tokio::test]
+async fn token_valido_sin_poder_guardar_acepta_y_queda_en_memoria() {
+    let mut s = setup(None);
+    // paired.json pasa a ser una carpeta: guardarlo falla
+    let ruta = s.data.path().join("paired.json");
+    std::fs::remove_file(&ruta).unwrap();
+    std::fs::create_dir(&ruta).unwrap();
+    let offer = s.hub.start_pairing();
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&con_token("m3", &offer.token)).await,
+        Some(server_hello())
+    );
+    assert_eq!(s.event().await, device_paired("m3"));
+    assert_eq!(s.event().await, peer_connected(1, "m3", "wifi"));
+    assert!(s
+        .hub
+        .paired_devices()
+        .iter()
+        .any(|d| d.public_key == key_hex("m3")));
+    c.cut().await;
+    s.event().await;
+    let mut c = connect(&s.hub);
+    c.hello("m3", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(2, "m3", "wifi"));
+    // olvidarlo también funciona aunque no llegara a guardarse
+    assert!(s.hub.forget_device(&key_hex("m3")));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 2, "reason": "forgotten"})
+    );
+}
+
+#[tokio::test]
+async fn olvidar_cierra_la_sesion_y_rechaza_la_reconexion() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    c.hello("m1", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    let mut otro = connect(&s.hub);
+    otro.hello("m2", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(2, "m2", "wifi"));
+
+    assert!(s.hub.forget_device(&key_hex("m1")));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "forgotten"})
+    );
+    c.closed().await;
+    assert!(!s.paired_json().contains(&key_hex("m1")));
+    assert!(s.paired_json().contains(&key_hex("m2")));
+    assert!(!s.hub.forget_device(&key_hex("m1")), "ya no estaba");
+
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&client_hello("m1", Some(false))).await,
+        Some(ServerHello::reject(RejectReason::NotPaired))
+    );
+    c.closed().await;
+    s.no_events();
+    assert!(otro.sync().await.is_empty(), "m2 sigue conectado");
+}
+
+#[tokio::test]
+async fn olvidar_borra_la_sincronia_del_dispositivo() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    c.hello("m1", Some(false)).await;
+    s.event().await;
+    s.copy("texto");
+    assert!(matches!(c.ctrl().await, ControlMessage::Clip { text, .. } if text == "texto"));
+    assert!(s.hub.forget_device(&key_hex("m1")));
+    s.event().await;
+    // vuelve a emparejarse: el texto actual se le envía de nuevo
+    let offer = s.hub.start_pairing();
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&con_token("m1", &offer.token)).await,
+        Some(server_hello())
+    );
+    assert!(matches!(c.ctrl().await, ControlMessage::Clip { text, .. } if text == "texto"));
+}
+
+#[tokio::test]
+async fn clave_de_pc_equivocada_cierra_sin_eventos() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    let otra = test_keys("otro-pc");
+    assert_eq!(
+        c.handshake_to(
+            &test_keys("m1"),
+            &otra.public,
+            &client_hello("m1", Some(false))
+        )
+        .await,
+        None
+    );
+    c.closed().await;
+    s.no_events();
+}
+
+#[tokio::test]
+async fn trama_alterada_a_mitad_de_archivo_cierra_y_borra_el_parcial() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    c.hello("m1", Some(false)).await;
+    s.event().await;
+    let n = 2 * MIB;
+    c.send(ControlMessage::FileStart {
+        transfer_id: TID.into(),
+        name: "x.bin".into(),
+        size: n,
+        mime: "x/y".into(),
+    })
+    .await;
+    let data = datos(22 * FILE_CHUNK_BYTES);
+    for chunk in data.chunks(FILE_CHUNK_BYTES) {
+        c.send_data(TID, chunk).await;
+    }
+    assert_eq!(c.ctrl().await, ack(1_081_344));
+    assert_eq!(
+        s.event().await,
+        transfer(TID, "in", "x.bin", n, 0, "active")
+    );
+    assert_eq!(
+        s.event().await,
+        transfer(TID, "in", "x.bin", n, 1_081_344, "active")
+    );
+    assert_eq!(s.files(), vec!["x.bin.part"]);
+    let id: [u8; 16] = hex::decode(TID).unwrap().try_into().unwrap();
+    c.send_corrupt(&encode_file_data(&id, &datos(FILE_CHUNK_BYTES)))
+        .await;
+    assert_eq!(
+        s.event().await,
+        with(
+            transfer(TID, "in", "x.bin", n, 1_081_344, "failed"),
+            "error",
+            json!("protocol_error")
+        )
+    );
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
+    );
+    c.closed().await;
+    assert!(s.files().is_empty(), "{:?}", s.files());
+}
+
+#[tokio::test(start_paused = true)]
+async fn sin_mensaje_1_en_30s_se_cierra() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    let t0 = Instant::now();
+    let r = timeout(Duration::from_secs(60), c.rx.recv())
+        .await
+        .expect("no se cerró");
+    assert!(r.is_none());
+    let dt = t0.elapsed();
+    assert!(
+        dt >= Duration::from_secs(30) && dt <= Duration::from_secs(31),
+        "{dt:?}"
+    );
+    s.no_events();
+    // ya no ocupa hueco: otra conexión saluda con normalidad
+    let mut otra = connect(&s.hub);
+    otra.hello("m1", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(2, "m1", "wifi"));
 }

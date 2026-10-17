@@ -1,7 +1,9 @@
 //! Sesión del protocolo v2 en el rol servidor. Espejo de `packages/protocol/src/session.ts`.
 //!
-//! Una tarea por sesión: lee tramas, atiende las órdenes del Hub, el latido y el emisor de
-//! archivos, todo en serie. Cada mensaje entrante se procesa entero antes del siguiente.
+//! Una tarea por sesión: primero el handshake Noise IK (mensaje 1 con el saludo del móvil,
+//! autorización y mensaje 2); después lee tramas cifradas, atiende las órdenes del Hub, el latido
+//! y el emisor de archivos, todo en serie. Cada mensaje entrante se procesa entero antes del
+//! siguiente.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
@@ -10,7 +12,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use serde::Serialize;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, MissedTickBehavior};
 use tokio_util::bytes::Bytes;
@@ -18,11 +20,14 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 use super::clip_sync::{sha256_hex, ClipDecision, ClipboardSync};
 use super::files::FileReceiver;
+use crate::protocol::hello::{
+    decode_client_hello, encode_server_hello, ClientHello, RejectReason, ServerHello,
+};
+use crate::protocol::secure::{self, SecureChannel, StaticKeys};
 use crate::protocol::{
     encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder,
     FILE_ACK_EVERY_BYTES, FILE_CHUNK_BYTES, FILE_WINDOW_BYTES, HEARTBEAT_INTERVAL_MS,
-    HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES, MAX_CONTROL_BYTES, MAX_PRE_HELLO_CONTROL_BYTES,
-    PROTOCOL_VERSION,
+    HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES, MAX_FRAME_BYTES,
 };
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
@@ -87,6 +92,7 @@ pub(super) struct OutMeta {
 
 /// Lo que la sesión comunica al Hub.
 pub(super) enum SessionEvent {
+    /// `device_id` es la `device_key` del móvil: su clave pública en hex (D4).
     Ready {
         device_id: String,
         device_name: String,
@@ -100,8 +106,16 @@ pub(super) enum SessionEvent {
 /// Lo que la sesión necesita del Hub. `on_event` se llama de forma síncrona y en orden.
 pub(super) trait SessionHost: Send + Sync + 'static {
     fn local_clip(&self) -> Option<String>;
-    /// Al recibir el hello: asocia la sesión a ese dispositivo y devuelve su ClipboardSync.
-    fn clip_sync_for(&self, session_id: u64, device_id: &str) -> Arc<Mutex<ClipboardSync>>;
+    /// Tras leer el mensaje 1: decide si el móvil con esa clave pública puede entrar. Con
+    /// `Err`, el PC responde con el rechazo y cierra con ese motivo.
+    fn authorize(
+        &self,
+        session_id: u64,
+        public_key: &[u8; 32],
+        hello: &ClientHello,
+    ) -> Result<(), RejectReason>;
+    /// Tras aceptar: devuelve la ClipboardSync del dispositivo (`device_key` = clave en hex).
+    fn clip_sync_for(&self, session_id: u64, device_key: &str) -> Arc<Mutex<ClipboardSync>>;
     fn on_event(&self, session_id: u64, event: SessionEvent);
 }
 
@@ -110,6 +124,8 @@ pub(super) struct SessionConfig {
     pub device_id: String,
     pub device_name: String,
     pub download_dir: PathBuf,
+    /// claves estáticas del PC (respondedor del handshake)
+    pub keys: StaticKeys,
 }
 
 /// Un Mutex envenenado no debe tumbar la app (panic = "abort"): se sigue con el valor.
@@ -123,7 +139,7 @@ pub(super) fn new_id() -> (String, [u8; 16]) {
     (id.simple().to_string(), *id.as_bytes())
 }
 
-/// Límites de lo que el móvil envía en su hello y se guarda en memoria.
+/// Límites de lo que el móvil envía en el mensaje 1 y se guarda en memoria.
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const MAX_DEVICE_NAME_CHARS: usize = 64;
 /// Nombre de un archivo entrante que se muestra y viaja en los eventos.
@@ -133,6 +149,7 @@ const PROTOCOL_ERROR: &str = "protocol_error";
 const INTERNAL_ERROR: &str = "internal_error";
 const LINK_CLOSED: &str = "link_closed";
 const HEARTBEAT_TIMEOUT: &str = "heartbeat_timeout";
+const HANDSHAKE_FAILED: &str = "handshake_failed";
 /// Motivo de file_cancel cuando lo pide el usuario; cualquier otro motivo es un fallo.
 const CANCEL_REASON: &str = "cancelled";
 const WRITE_ERROR: &str = "write_error";
@@ -268,6 +285,67 @@ enum Input {
     Step,
 }
 
+/// Lo que deja un handshake aceptado.
+struct Handshake {
+    channel: SecureChannel,
+    /// clave pública del móvil en hex: su identidad en el PC
+    device_key: String,
+    hello: ClientHello,
+}
+
+/// Mensaje 1 → autorización → mensaje 2. `Err` lleva el motivo de cierre: la sesión no llega a
+/// estar lista. El mensaje 1 debe llegar en `HEARTBEAT_TIMEOUT_MS` desde que se aceptó la
+/// conexión, aunque vayan llegando bytes.
+async fn handshake<S: AsyncRead + AsyncWrite>(
+    reader: &mut FramedRead<ReadHalf<S>, LengthDelimitedCodec>,
+    writer: &mut FramedWrite<WriteHalf<S>, LengthDelimitedCodec>,
+    cfg: &SessionConfig,
+    host: &dyn SessionHost,
+) -> Result<Handshake, &'static str> {
+    let timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
+    let msg1 = match tokio::time::timeout(timeout, reader.next()).await {
+        Ok(Some(Ok(frame))) => frame,
+        Ok(_) => return Err(LINK_CLOSED),
+        Err(_) => return Err(HEARTBEAT_TIMEOUT),
+    };
+    let mut hs = secure::responder(&cfg.keys).map_err(|_| INTERNAL_ERROR)?;
+    let mut buf = vec![0u8; MAX_FRAME_BYTES];
+    // clave del PC equivocada, trama alterada o que no es un mensaje 1
+    let n = hs
+        .read_message(&msg1, &mut buf)
+        .map_err(|_| HANDSHAKE_FAILED)?;
+    let mut hello = decode_client_hello(&buf[..n]).map_err(|_| HANDSHAKE_FAILED)?;
+    if hello.device_id.len() > MAX_DEVICE_ID_BYTES {
+        return Err(HANDSHAKE_FAILED);
+    }
+    hello.device_name = truncate_chars(hello.device_name, MAX_DEVICE_NAME_CHARS);
+    let public_key: [u8; 32] = hs
+        .get_remote_static()
+        .and_then(|k| k.try_into().ok())
+        .ok_or(HANDSHAKE_FAILED)?;
+
+    let verdict = host.authorize(cfg.id, &public_key, &hello);
+    let answer = match verdict {
+        Ok(()) => ServerHello::accept(cfg.device_id.clone(), cfg.device_name.clone()),
+        Err(reason) => ServerHello::reject(reason),
+    };
+    let n = hs
+        .write_message(&encode_server_hello(&answer), &mut buf)
+        .map_err(|_| INTERNAL_ERROR)?;
+    match tokio::time::timeout(timeout, writer.send(Bytes::copy_from_slice(&buf[..n]))).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => return Err(LINK_CLOSED),
+        Err(_) => return Err(HEARTBEAT_TIMEOUT),
+    }
+    verdict.map_err(RejectReason::as_str)?;
+    let channel = SecureChannel::new(hs).map_err(|_| INTERNAL_ERROR)?;
+    Ok(Handshake {
+        channel,
+        device_key: hex::encode(public_key),
+        hello,
+    })
+}
+
 /// Atiende una conexión hasta que se cierra. Siempre termina con `SessionEvent::Closed`.
 pub(super) async fn run<S>(
     stream: S,
@@ -279,28 +357,32 @@ pub(super) async fn run<S>(
 {
     let (r, w) = tokio::io::split(stream);
     let mut reader = FramedRead::new(r, frame_codec());
+    let mut writer = FramedWrite::new(w, frame_codec());
+    let hs = match handshake(&mut reader, &mut writer, &cfg, host.as_ref()).await {
+        Ok(hs) => hs,
+        // sin sesión lista no hay transferencias ni órdenes que cerrar
+        Err(reason) => return host.on_event(cfg.id, SessionEvent::Closed(reason.into())),
+    };
     let mut s = Session {
         cfg,
         host,
-        writer: FramedWrite::new(w, frame_codec()),
+        writer,
         commands,
-        // hasta el hello, un par desconocido no puede hacer reservar más de 64 KiB
-        decoder: MessageDecoder::with_max_control_bytes(MAX_PRE_HELLO_CONTROL_BYTES),
+        channel: hs.channel,
+        decoder: MessageDecoder::default(),
         closed: false,
-        hello_received: false,
         ready: false,
         sync: Arc::new(Mutex::new(ClipboardSync::new(None))),
         last_rx: Instant::now(),
-        started: Instant::now(),
         out_queue: VecDeque::new(),
         out: None,
         inc: None,
         ended_in: HashSet::new(),
     };
-    // el plazo del latido corre desde ya, también durante el saludo
     let period = Duration::from_millis(HEARTBEAT_INTERVAL_MS);
     let mut ticker = tokio::time::interval_at(Instant::now() + period, period);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    s.on_client_hello(hs.device_key, hs.hello).await;
 
     while !s.closed {
         s.pump_out().await;
@@ -333,15 +415,14 @@ struct Session<W> {
     host: Arc<dyn SessionHost>,
     writer: FramedWrite<W, LengthDelimitedCodec>,
     commands: mpsc::UnboundedReceiver<Command>,
+    /// cifra cada payload que sale y descifra cada trama que llega
+    channel: SecureChannel,
     decoder: MessageDecoder,
     closed: bool,
-    hello_received: bool,
     ready: bool,
-    /// ClipboardSync del dispositivo (compartido entre sus sesiones); provisional hasta el hello
+    /// ClipboardSync del dispositivo (compartido entre sus sesiones); provisional hasta el saludo
     sync: Arc<Mutex<ClipboardSync>>,
     last_rx: Instant,
-    /// el hello debe llegar en `HEARTBEAT_TIMEOUT_MS` aunque haya tráfico
-    started: Instant,
     out_queue: VecDeque<OutTransfer>,
     out: Option<OutTransfer>,
     inc: Option<InTransfer>,
@@ -360,10 +441,19 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     // --- salida ---
 
+    /// Cifra y escribe los payloads en orden (cada uno, una trama).
     async fn write_frames(&mut self, frames: Vec<Vec<u8>>) {
         if self.closed {
             return;
         }
+        let mut cipher = Vec::with_capacity(frames.len());
+        for f in &frames {
+            match self.channel.encrypt(f) {
+                Ok(c) => cipher.push(c),
+                Err(_) => return self.close(INTERNAL_ERROR),
+            }
+        }
+        let frames = cipher;
         let w = &mut self.writer;
         let res = tokio::time::timeout(Duration::from_millis(HEARTBEAT_TIMEOUT_MS), async {
             for f in frames {
@@ -425,11 +515,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     async fn tick(&mut self) {
         let timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
-        let now = Instant::now();
-        // sin hello a tiempo: no ocupa un hueco de sesión sin saludo para siempre
-        if now.duration_since(self.last_rx) >= timeout
-            || (!self.hello_received && now.duration_since(self.started) >= timeout)
-        {
+        if Instant::now().duration_since(self.last_rx) >= timeout {
             self.close(HEARTBEAT_TIMEOUT);
         } else if self.ready {
             self.send(ControlMessage::Ping).await;
@@ -488,7 +574,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     // --- entrada ---
 
     async fn on_frame(&mut self, frame: &[u8]) {
-        let decoded = match self.decoder.push(frame) {
+        // alterada, fuera de orden o de otro canal
+        let Ok(payload) = self.channel.decrypt(frame) else {
+            return self.close(PROTOCOL_ERROR);
+        };
+        let decoded = match self.decoder.push(&payload) {
             Ok(Some(d)) => d,
             Ok(None) => return,
             Err(_) => return self.close(PROTOCOL_ERROR),
@@ -501,35 +591,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     async fn dispatch(&mut self, d: Decoded) -> Res {
         let msg = match d {
             Decoded::Data { transfer_id, bytes } => {
-                if !self.ready {
-                    return Err(PROTOCOL_ERROR); // datos antes del saludo
-                }
                 return self.on_file_data(hex::encode(transfer_id), bytes).await;
             }
             Decoded::Control(msg) => msg,
         };
-        if !self.hello_received {
-            let ControlMessage::Hello {
-                device_id,
-                device_name,
-                will_send_clip,
-                ..
-            } = msg
-            else {
-                return Err(PROTOCOL_ERROR);
-            };
-            self.hello_received = true;
-            self.decoder.set_max_control_bytes(MAX_CONTROL_BYTES);
-            if device_id.len() > MAX_DEVICE_ID_BYTES {
-                return Err(PROTOCOL_ERROR);
-            }
-            let device_name = truncate_chars(device_name, MAX_DEVICE_NAME_CHARS);
-            self.on_client_hello(device_id, device_name, will_send_clip == Some(true))
-                .await;
-            return Ok(());
-        }
+        // un `hello` tras el handshake ya no decodifica: el MessageDecoder da protocol_error
         match msg {
-            ControlMessage::Hello { .. } => Err(PROTOCOL_ERROR),
             ControlMessage::Ping => {
                 self.send(ControlMessage::Pong).await;
                 Ok(())
@@ -567,23 +634,18 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     // --- saludo y regla de inicio ---
 
-    async fn on_client_hello(
-        &mut self,
-        device_id: String,
-        device_name: String,
-        will_send_clip: bool,
-    ) {
-        self.sync = self.host.clip_sync_for(self.cfg.id, &device_id);
-        self.send(ControlMessage::Hello {
-            v: PROTOCOL_VERSION,
-            device_id: self.cfg.device_id.clone(),
-            device_name: self.cfg.device_name.clone(),
-            will_send_clip: None,
-        })
-        .await;
-        if self.closed {
-            return;
+    /// Tras aceptar el handshake (el mensaje 2 ya salió): regla de inicio y `Ready`.
+    async fn on_client_hello(&mut self, device_key: String, hello: ClientHello) {
+        self.sync = self.host.clip_sync_for(self.cfg.id, &device_key);
+        // Órdenes que llegaron durante el handshake: como la sesión no está lista, los clips se
+        // ignoran (la regla de inicio lee ahora el portapapeles local) y un Close la cierra.
+        while let Ok(c) = self.commands.try_recv() {
+            self.on_command(c).await;
+            if self.closed {
+                return;
+            }
         }
+        let will_send_clip = hello.will_send_clip == Some(true);
         // La regla se resuelve antes de ready; el clip del cliente aún no se ha procesado.
         let mut superseded = None;
         if let Some(local) = self.host.local_clip() {
@@ -600,8 +662,8 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         self.ready = true;
         self.emit(SessionEvent::Ready {
-            device_id,
-            device_name,
+            device_id: device_key,
+            device_name: hello.device_name,
         });
         if let Some(text) = superseded {
             self.emit(SessionEvent::LocalClipSuperseded(text));

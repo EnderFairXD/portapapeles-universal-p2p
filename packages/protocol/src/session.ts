@@ -400,8 +400,6 @@ export class Session {
     if (m.type === 'data') return this.onFileData(m.transferId, m.bytes);
     const msg = m.msg;
     switch (msg.kind) {
-      case 'hello':
-        throw new ProtocolError('hello tras el handshake: el saludo va dentro del handshake');
       case 'ping':
         this.send({ kind: 'pong' });
         return;
