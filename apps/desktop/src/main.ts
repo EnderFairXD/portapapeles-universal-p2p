@@ -3,7 +3,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { open } from "@tauri-apps/plugin-dialog";
+import { ask, open } from "@tauri-apps/plugin-dialog";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { render } from "./render";
 import type { UiState } from "./types";
@@ -20,15 +20,35 @@ const EMPTY_STATE: UiState = {
   clipboardError: null,
   clipNotice: null,
   serverError: null,
+  paired: [],
+  pairing: null,
+  pairNotice: null,
 };
 
 const app = document.getElementById("app")!;
 const toastEl = document.getElementById("toast")!;
 let state: UiState = EMPTY_STATE;
 
+/** Repinta cada segundo mientras haya un QR vigente, para que la cuenta atrás avance. */
+let countdownTimer: number | undefined;
+
+function syncCountdown(): void {
+  const live = state.pairing !== null && state.pairing.expiresAtMs > Date.now();
+  if (live && countdownTimer === undefined) {
+    countdownTimer = window.setInterval(() => {
+      render(app, state);
+      syncCountdown(); // se detiene solo al caducar el QR
+    }, 1000);
+  } else if (!live && countdownTimer !== undefined) {
+    window.clearInterval(countdownTimer);
+    countdownTimer = undefined;
+  }
+}
+
 function apply(next: UiState): void {
   state = next;
   render(app, next);
+  syncCountdown();
 }
 
 let toastTimer: number | undefined;
@@ -44,6 +64,9 @@ const COMMAND_ERROR = new Map([
   ["no_peer", NO_PEER_TEXT],
   ["read_error", "No se pudo leer el archivo"],
   [CLIPBOARD_TEXT, CLIPBOARD_TEXT],
+  // Los de start_pairing ya vienen en español del backend.
+  ["No hay ninguna red disponible", "No hay ninguna red disponible"],
+  ["No se pudo generar el código QR", "No se pudo generar el código QR"],
 ]);
 
 /** Un error desconocido (p. ej. en inglés, de arboard o del sistema) solo va a la consola. */
@@ -80,6 +103,9 @@ const ACTION_FALLBACK = new Map([
   ["cancel", "No se pudo cancelar"],
   ["copy", CLIPBOARD_TEXT],
   ["reveal", "No se pudo abrir la carpeta"],
+  ["start-pairing", "No se pudo iniciar el emparejamiento"],
+  ["cancel-pairing", "No se pudo cancelar el emparejamiento"],
+  ["forget", "No se pudo olvidar el móvil"],
 ]);
 
 async function onAction(action: string, el: HTMLElement): Promise<void> {
@@ -101,6 +127,23 @@ async function onAction(action: string, el: HTMLElement): Promise<void> {
       case "reveal":
         if (item?.location) await revealItemInDir(item.location);
         break;
+      case "start-pairing":
+        await invoke("start_pairing");
+        break;
+      case "cancel-pairing":
+        await invoke("cancel_pairing");
+        break;
+      case "forget": {
+        const deviceKey = el.dataset.deviceKey;
+        const device = state.paired.find((d) => d.deviceKey === deviceKey);
+        if (!deviceKey || !device) break;
+        const yes = await ask(`¿Olvidar «${device.deviceName}»? Tendrá que volver a escanear el QR.`, {
+          title: "ClipSync",
+          kind: "warning",
+        });
+        if (yes) await invoke("forget_device", { deviceKey });
+        break;
+      }
     }
   } catch (e) {
     toast(errorMessage(e, ACTION_FALLBACK.get(action) ?? "Algo salió mal"));
