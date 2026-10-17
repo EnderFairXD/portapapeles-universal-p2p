@@ -57,14 +57,17 @@ fn download_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-async fn serve(hub: Hub) {
+async fn serve(hub: Hub, ctx: Arc<Ctx>) {
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_TCP_PORT));
     match tokio::net::TcpListener::bind(addr).await {
         Ok(listener) => {
             log(&format!("[TCP] Escuchando en {addr}"));
             hub.serve_tcp(listener).await;
         }
-        Err(e) => log(&format!("[TCP] No se pudo escuchar en {addr}: {e}")),
+        Err(e) => {
+            log(&format!("[TCP] No se pudo escuchar en {addr}: {e}"));
+            ctx.set_server_error(app::SERVER_PORT_ERROR);
+        }
     }
 }
 
@@ -100,7 +103,7 @@ pub fn run() {
 
             tauri::async_runtime::spawn(ctx.clone().run_emitter(tauri_app.handle().clone()));
             tauri::async_runtime::spawn(ctx.clone().run_events(events));
-            tauri::async_runtime::spawn(serve(hub));
+            tauri::async_runtime::spawn(serve(hub, ctx.clone()));
 
             // El ServiceDaemon debe seguir vivo mientras la app corra; Box::leak lo mantiene
             // anunciado hasta que el proceso termine.

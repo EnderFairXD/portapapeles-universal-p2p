@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/plugin-opener", () => ({ revealItemInDir: vi.fn() }));
 const STATE_ERROR = "No se pudo cargar el estado de la app";
 
 function state(over: Partial<UiState> = {}): UiState {
-  return { pcName: "pop-os", peers: [], history: [], transfers: [], clipboardError: null, clipNotice: null, ...over };
+  return { pcName: "pop-os", peers: [], history: [], transfers: [], clipboardError: null, clipNotice: null, serverError: null, ...over };
 }
 
 const toastText = () => document.getElementById("toast")!.textContent;
@@ -97,5 +97,34 @@ describe("arranque", () => {
     await start();
     await vi.waitFor(() => expect(document.querySelector(".pc-name")!.textContent).toBe("otro-pc"));
     expect(toastText()).toBe("");
+  });
+});
+
+describe("errores de los comandos", () => {
+  const textItem = { id: 7, kind: "text" as const, direction: "in" as const, text: "hola", fileName: null, location: null, atMs: 1 };
+
+  it("un error en inglés al copiar se muestra como «No se pudo acceder al portapapeles»", async () => {
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_state") return state({ history: [textItem] });
+      if (cmd === "copy_text") throw "Unknown error while interacting with the clipboard: X11 server connection timed out";
+    });
+    await start();
+    await vi.waitFor(() => expect(document.querySelector('[data-action="copy"]')).not.toBeNull());
+    document.querySelector<HTMLElement>('[data-action="copy"]')!.click();
+    await vi.waitFor(() => expect(toastText()).toBe("No se pudo acceder al portapapeles"));
+    expect(console.error).toHaveBeenCalled();
+  });
+
+  it("los códigos conocidos siguen traduciéndose", async () => {
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_state") return state({ peers: [{ sessionId: 1, deviceId: "d", deviceName: "Pixel 8", transport: "usb" }] });
+      if (cmd === "send_files") throw "read_error";
+    });
+    await start();
+    await vi.waitFor(() => expect(title()).toBe("Conectado con Pixel 8 por USB"));
+    expect(uiStateHandler).toBeDefined();
+    const drop = tauri.onDragDropEvent.mock.calls[0][0] as (e: { payload: { type: string; paths: string[] } }) => void;
+    drop({ payload: { type: "drop", paths: ["/tmp/a"] } });
+    await vi.waitFor(() => expect(toastText()).toBe("No se pudo leer el archivo"));
   });
 });
