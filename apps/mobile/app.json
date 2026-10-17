@@ -46,7 +46,10 @@
           "androidIntentFilters": [
             "*/*"
           ],
-          "disableIOS": true
+          "disableIOS": true,
+          "androidMultiIntentFilters": [
+            "*/*"
+          ]
         }
       ]
     ]

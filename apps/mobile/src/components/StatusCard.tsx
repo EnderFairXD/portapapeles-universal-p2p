@@ -78,10 +78,12 @@ interface Props {
   state: ConnState;
   /** Aviso informativo (p. ej. archivos esperando conexión). */
   notice?: string | null;
+  /** Si se da, el aviso informativo lleva un botón «Cancelar». */
+  onCancelNotice?: () => void;
   onDismissError: () => void;
 }
 
-export function StatusCard({ state, notice, onDismissError }: Props) {
+export function StatusCard({ state, notice, onCancelNotice, onDismissError }: Props) {
   const connected = state.status === 'connected';
   return (
     <View>
@@ -119,6 +121,17 @@ export function StatusCard({ state, notice, onDismissError }: Props) {
                 <Text style={styles.markText}>i</Text>
               </View>
               <Text style={styles.noticeText}>{notice}</Text>
+              {onCancelNotice && (
+                <Pressable
+                  style={styles.noticeAction}
+                  onPress={onCancelNotice}
+                  accessibilityRole="button"
+                  accessibilityLabel="Cancelar el envío de lo compartido"
+                  hitSlop={6}
+                >
+                  <Text style={styles.noticeActionText}>Cancelar</Text>
+                </Pressable>
+              )}
             </View>
           )}
         </View>
@@ -149,6 +162,8 @@ const styles = StyleSheet.create({
   noticeError: { backgroundColor: colors.dangerBg },
   noticeInfo: { backgroundColor: colors.infoBg },
   noticeText: { ...type.small, color: colors.text, flex: 1 },
+  noticeAction: { minHeight: 32, justifyContent: 'center', paddingHorizontal: 6, marginVertical: -6 },
+  noticeActionText: { ...type.small, color: colors.outFg, fontWeight: '700' },
   mark: { width: 18, height: 18, borderRadius: radius.pill, alignItems: 'center', justifyContent: 'center' },
   markText: { color: colors.bg, fontSize: 12, fontWeight: '700', lineHeight: 15 },
 });

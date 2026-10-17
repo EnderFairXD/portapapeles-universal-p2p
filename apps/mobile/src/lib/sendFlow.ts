@@ -1,8 +1,8 @@
 // Envío de archivos desde la interfaz: abre el origen y lo encola, avisando de los fallos.
 import { connection } from './connection';
+import { INVALID_FILE_SIZE_MESSAGE, sendFailureMessage } from './connectionPolicy';
 import { FileTooLargeError, fileSourceFromUri, pickFileSource, UnknownFileSizeError } from './files';
 
-const NO_CONNECTION = 'No hay conexión con el PC';
 const OPEN_FAILED = 'No se pudo abrir el archivo';
 
 /** Solo se enseñan los mensajes propios; el resto de errores no (pueden traer rutas o texto interno). */
@@ -15,7 +15,9 @@ export async function pickAndSend(): Promise<void> {
   try {
     const src = await pickFileSource();
     if (!src) return;
-    if (connection.sendFile(src) === null) connection.reportError(NO_CONNECTION);
+    // un rechazo ya dejó su propio aviso en lastError: no se pisa con «sin conexión»
+    const failure = sendFailureMessage(connection.sendFile(src));
+    if (failure) connection.reportError(failure);
   } catch (e) {
     connection.reportError(openErrorText(e));
   }
@@ -31,7 +33,8 @@ export interface SharedFile {
 /**
  * - `sent`: encolado.
  * - `no_connection`: no hay sesión lista; se puede reintentar más tarde.
- * - `failed`: el archivo no se pudo abrir; devuelve el aviso para el usuario.
+ * - `failed`: el archivo no se pudo abrir o la sesión lo rechazó; no se reintenta.
+ *   Lleva el aviso para el usuario.
  */
 export type SharedSendResult = { kind: 'sent' } | { kind: 'no_connection' } | { kind: 'failed'; message: string };
 
@@ -43,6 +46,8 @@ export function sendSharedFile(file: SharedFile): SharedSendResult {
   } catch (e) {
     return { kind: 'failed', message: openErrorText(e) };
   }
-  // sendFile cierra `src` si no hay sesión lista
-  return connection.sendFile(src) === null ? { kind: 'no_connection' } : { kind: 'sent' };
+  // sendFile cierra `src` si no lo encola
+  const result = connection.sendFile(src);
+  if (result.ok) return { kind: 'sent' };
+  return result.reason === 'no_session' ? { kind: 'no_connection' } : { kind: 'failed', message: INVALID_FILE_SIZE_MESSAGE };
 }

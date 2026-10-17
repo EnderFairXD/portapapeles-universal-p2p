@@ -5,20 +5,32 @@ import { useEffect, useRef } from 'react';
 
 import { connection } from '@/lib/connection';
 import { sendSharedFile } from '@/lib/sendFlow';
+import { newShareProgress, runShareQueue, type ShareProgress } from '@/lib/shareQueue';
 import { useConnection } from '@/lib/useConnection';
 import { colors } from '@/theme';
 
-const ONLY_FILES = 'ClipSync solo recibe archivos al compartir';
+const ONLY_FILES = 'Solo se pueden compartir archivos con ClipSync';
+const SHARE_FAILED = 'No se pudo recibir lo compartido';
+
+// Un archivo compartido espera a que haya conexión aunque la app pase a segundo plano
+// (el usuario se va al PC a abrir ClipSync): solo se descarta al enviarlo o al cancelar.
+const SHARE_OPTIONS = { resetOnBackground: false };
 
 /**
  * «Compartir → ClipSync»: encola los archivos del intent en cuanto hay conexión
  * (mientras tanto Home enseña «Esperando conexión…») y después lo descarta.
  */
 function ShareSender() {
-  const { hasShareIntent, shareIntent, resetShareIntent } = useShareIntentContext();
+  const { hasShareIntent, shareIntent, resetShareIntent, error } = useShareIntentContext();
   const { status } = useConnection();
   // por dónde va el intent actual, para no reenviar archivos si el efecto se repite
-  const progress = useRef<{ intent: unknown; next: number } | null>(null);
+  const progress = useRef<ShareProgress | null>(null);
+
+  useEffect(() => {
+    if (!error) return;
+    connection.reportError(SHARE_FAILED);
+    resetShareIntent();
+  }, [error, resetShareIntent]);
 
   useEffect(() => {
     if (!hasShareIntent) {
@@ -33,17 +45,12 @@ function ShareSender() {
     }
     if (status !== 'connected') return;
 
-    if (progress.current?.intent !== shareIntent) progress.current = { intent: shareIntent, next: 0 };
+    if (progress.current?.intent !== shareIntent) progress.current = newShareProgress(shareIntent);
     const p = progress.current;
-    let failure: string | null = null;
-    while (p.next < files.length) {
-      const result = sendSharedFile(files[p.next]);
-      if (result.kind === 'no_connection') return; // la sesión cayó: se sigue cuando vuelva
-      if (result.kind === 'failed') failure = result.message;
-      p.next += 1;
-    }
+    // si la sesión cae a medias, se sigue por donde iba cuando vuelva
+    if (runShareQueue(files, p, sendSharedFile) === 'waiting') return;
     // un envío correcto borra el aviso: si algún archivo falló, se vuelve a mostrar
-    if (failure) connection.reportError(failure);
+    if (p.failure) connection.reportError(p.failure);
     resetShareIntent();
   }, [hasShareIntent, shareIntent, status, resetShareIntent]);
 
@@ -59,7 +66,7 @@ export default function RootLayout() {
   }, []);
 
   return (
-    <ShareIntentProvider>
+    <ShareIntentProvider options={SHARE_OPTIONS}>
       <StatusBar style="light" />
       <ShareSender />
       <Stack screenOptions={{ headerShown: false, contentStyle: { backgroundColor: colors.bg } }} />

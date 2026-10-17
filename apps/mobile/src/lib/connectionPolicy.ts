@@ -23,3 +23,58 @@ export function localSendOutcome(decision: string, sessionStillOpen: boolean): L
   if (decision === 'send' && sessionStillOpen) return 'record';
   return 'none';
 }
+
+// --- envío de archivos ---
+
+export const NO_CONNECTION_MESSAGE = 'No hay conexión con el PC';
+export const INVALID_FILE_SIZE_MESSAGE = 'No se pudo leer el tamaño del archivo';
+
+/** Resultado de encolar un archivo: sin sesión (se puede reintentar) o rechazado (no tiene arreglo). */
+export type SendFileResult = { ok: true; id: string } | { ok: false; reason: 'no_session' | 'rejected' };
+
+/**
+ * Clasifica el fallo de `Session.sendFile`: un tamaño inválido (RangeError) es un rechazo del
+ * archivo; cualquier otro (sesión cerrada o no lista) es falta de sesión.
+ */
+export function classifySendError(e: unknown): 'no_session' | 'rejected' {
+  return e instanceof RangeError ? 'rejected' : 'no_session';
+}
+
+/** Aviso a mostrar tras un envío: solo «sin conexión» si no había sesión; un rechazo ya dejó el suyo. */
+export function sendFailureMessage(result: SendFileResult): string | null {
+  return !result.ok && result.reason === 'no_session' ? NO_CONNECTION_MESSAGE : null;
+}
+
+// --- pausa diferida tras un selector ---
+
+export interface PauseCheckDeps {
+  delayMs: number;
+  setTimer(fn: () => void, ms: number): unknown;
+  clearTimer(handle: unknown): void;
+  appState(): string;
+  pickerOpen(): boolean;
+  pause(): void;
+}
+
+/**
+ * Tras cerrarse un selector, Android resuelve su promesa antes de que la app vuelva a
+ * 'active': comprobar al momento pararía la sesión en cada selección normal. Se espera
+ * `delayMs` y solo entonces se mira si la app sigue en segundo plano.
+ */
+export function createPauseCheck(deps: PauseCheckDeps): { schedule(): void; cancel(): void } {
+  let handle: unknown = null;
+  const cancel = () => {
+    if (handle !== null) deps.clearTimer(handle);
+    handle = null;
+  };
+  return {
+    schedule() {
+      cancel();
+      handle = deps.setTimer(() => {
+        handle = null;
+        if (deps.appState() === 'background' && !deps.pickerOpen()) deps.pause();
+      }, deps.delayMs);
+    },
+    cancel,
+  };
+}
