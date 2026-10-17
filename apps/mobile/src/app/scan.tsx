@@ -21,6 +21,8 @@ export default function Scan() {
   const [invalid, setInvalid] = useState(false);
   // true mientras se procesa una lectura (aviso, confirmación o emparejado)
   const busy = useRef(false);
+  // todas las salidas de la pantalla (emparejar, Cancelar, cerrar el aviso) pasan por `leave`
+  const left = useRef(false);
   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => () => {
@@ -35,12 +37,18 @@ export default function Scan() {
     return () => sub.remove();
   }, [refreshPermission]);
 
+  const leave = useCallback(() => {
+    if (left.current) return;
+    left.current = true;
+    router.back();
+  }, [router]);
+
   const finish = useCallback(
     (info: Parameters<typeof connection.pair>[0]) => {
       connection.pair(info);
-      router.back();
+      leave();
     },
-    [router],
+    [leave],
   );
 
   const onScanned = useCallback(
@@ -56,13 +64,6 @@ export default function Scan() {
           busy.current = false;
         }, RETRY_MS);
       } else if (decision.kind === 'confirm') {
-        // Cancelar y cerrar el aviso salen por el mismo sitio; solo una vez
-        let left = false;
-        const leave = () => {
-          if (left) return;
-          left = true;
-          router.back();
-        };
         Alert.alert(
           `Ya estás emparejado con «${decision.current}». ¿Sustituirlo por «${decision.info.name}»?`,
           undefined,
@@ -77,7 +78,7 @@ export default function Scan() {
         finish(decision.info);
       }
     },
-    [finish, router],
+    [finish, leave],
   );
 
   return (
@@ -85,7 +86,7 @@ export default function Scan() {
       <LinearGradient colors={[colors.headerTop, colors.bg]} style={[styles.top, { paddingTop: insets.top + 8 }]}>
         <Pressable
           style={styles.back}
-          onPress={() => router.back()}
+          onPress={leave}
           accessibilityRole="button"
           accessibilityLabel="Volver"
           hitSlop={8}
