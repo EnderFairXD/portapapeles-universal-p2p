@@ -1,0 +1,469 @@
+[
+  {
+    "name": "cliente mínimo",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "v": 2,
+      "deviceId": "dev-1",
+      "deviceName": "Pixel 8"
+    }
+  },
+  {
+    "name": "cliente con willSendClip true",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"willSendClip\":true}",
+    "expect": {
+      "v": 2,
+      "deviceId": "dev-1",
+      "deviceName": "Pixel 8",
+      "willSendClip": true
+    }
+  },
+  {
+    "name": "cliente con willSendClip false",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"willSendClip\":false}",
+    "expect": {
+      "v": 2,
+      "deviceId": "dev-1",
+      "deviceName": "Pixel 8",
+      "willSendClip": false
+    }
+  },
+  {
+    "name": "cliente con pairingToken",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"pairingToken\":\"AbCdEfGhIjKlMnOpQrSt_-\"}",
+    "expect": {
+      "v": 2,
+      "deviceId": "dev-1",
+      "deviceName": "Pixel 8",
+      "pairingToken": "AbCdEfGhIjKlMnOpQrSt_-"
+    }
+  },
+  {
+    "name": "cliente completo con acentos",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-ñ\",\"deviceName\":\"Móvil de Javier 😀\",\"willSendClip\":true,\"pairingToken\":\"AbCdEfGhIjKlMnOpQrSt_-\"}",
+    "expect": {
+      "v": 2,
+      "deviceId": "dev-ñ",
+      "deviceName": "Móvil de Javier 😀",
+      "willSendClip": true,
+      "pairingToken": "AbCdEfGhIjKlMnOpQrSt_-"
+    }
+  },
+  {
+    "name": "cliente con campos desconocidos",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"extra\":1,\"pairingToken\":\"AbCdEfGhIjKlMnOpQrSt_-\",\"otro\":{\"a\":[1]}}",
+    "expect": {
+      "v": 2,
+      "deviceId": "dev-1",
+      "deviceName": "Pixel 8",
+      "pairingToken": "AbCdEfGhIjKlMnOpQrSt_-"
+    }
+  },
+  {
+    "name": "cliente con v escrita 2.0",
+    "side": "client",
+    "json": "{\"v\":2.0,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "v": 2,
+      "deviceId": "dev-1",
+      "deviceName": "Pixel 8"
+    }
+  },
+  {
+    "name": "cliente sin v",
+    "side": "client",
+    "json": "{\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con v 1",
+    "side": "client",
+    "json": "{\"v\":1,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con v 3",
+    "side": "client",
+    "json": "{\"v\":3,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con v texto",
+    "side": "client",
+    "json": "{\"v\":\"2\",\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con v nulo",
+    "side": "client",
+    "json": "{\"v\":null,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente sin deviceId",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con deviceId numérico",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":7,\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente sin deviceName",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con deviceName nulo",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":null}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con willSendClip texto",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"willSendClip\":\"true\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con willSendClip nulo",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"willSendClip\":null}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con pairingToken de 21 caracteres",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"pairingToken\":\"AbCdEfGhIjKlMnOpQrSt_\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con pairingToken de 23 caracteres",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"pairingToken\":\"AbCdEfGhIjKlMnOpQrSt_-A\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con pairingToken vacío",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"pairingToken\":\"\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con pairingToken con relleno =",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"pairingToken\":\"AbCdEfGhIjKlMnOpQrSt_=\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con pairingToken con un +",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"pairingToken\":\"AbCdEfGhIjKlMnOpQrSt_+\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con pairingToken numérico",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"pairingToken\":1234}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con pairingToken nulo",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel 8\",\"pairingToken\":null}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con JSON inválido",
+    "side": "client",
+    "json": "{no es json",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con texto vacío",
+    "side": "client",
+    "json": "",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con array",
+    "side": "client",
+    "json": "[]",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con nulo",
+    "side": "client",
+    "json": "null",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con número",
+    "side": "client",
+    "json": "2",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor acepta",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":true,\"deviceId\":\"pc-1\",\"pcName\":\"PC de Javier\"}",
+    "expect": {
+      "v": 2,
+      "accepted": true,
+      "deviceId": "pc-1",
+      "pcName": "PC de Javier"
+    }
+  },
+  {
+    "name": "servidor acepta con acentos",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":true,\"deviceId\":\"pc-ñ\",\"pcName\":\"Sobremesa 😀\"}",
+    "expect": {
+      "v": 2,
+      "accepted": true,
+      "deviceId": "pc-ñ",
+      "pcName": "Sobremesa 😀"
+    }
+  },
+  {
+    "name": "servidor acepta con campos desconocidos",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":true,\"deviceId\":\"pc-1\",\"pcName\":\"PC\",\"extra\":1,\"reason\":\"not_paired\"}",
+    "expect": {
+      "v": 2,
+      "accepted": true,
+      "deviceId": "pc-1",
+      "pcName": "PC"
+    }
+  },
+  {
+    "name": "servidor rechaza not_paired",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":false,\"reason\":\"not_paired\"}",
+    "expect": {
+      "v": 2,
+      "accepted": false,
+      "reason": "not_paired"
+    }
+  },
+  {
+    "name": "servidor rechaza pairing_expired",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":false,\"reason\":\"pairing_expired\"}",
+    "expect": {
+      "v": 2,
+      "accepted": false,
+      "reason": "pairing_expired"
+    }
+  },
+  {
+    "name": "servidor rechaza e ignora pcName y deviceId",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":false,\"reason\":\"not_paired\",\"deviceId\":\"pc-1\",\"pcName\":\"PC\"}",
+    "expect": {
+      "v": 2,
+      "accepted": false,
+      "reason": "not_paired"
+    }
+  },
+  {
+    "name": "servidor sin v",
+    "side": "server",
+    "json": "{\"accepted\":false,\"reason\":\"not_paired\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor con v 1",
+    "side": "server",
+    "json": "{\"v\":1,\"accepted\":false,\"reason\":\"not_paired\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor con v texto",
+    "side": "server",
+    "json": "{\"v\":\"2\",\"accepted\":false,\"reason\":\"not_paired\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor sin accepted",
+    "side": "server",
+    "json": "{\"v\":2,\"deviceId\":\"pc-1\",\"pcName\":\"PC\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor con accepted texto",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":\"true\",\"deviceId\":\"pc-1\",\"pcName\":\"PC\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor con accepted numérico",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":1,\"reason\":\"not_paired\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor aceptado sin pcName",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":true,\"deviceId\":\"pc-1\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor aceptado con pcName numérico",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":true,\"deviceId\":\"pc-1\",\"pcName\":5}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor aceptado sin deviceId",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":true,\"pcName\":\"PC\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor aceptado con deviceId nulo",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":true,\"deviceId\":null,\"pcName\":\"PC\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor rechazado sin reason",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":false}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor rechazado con reason otra",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":false,\"reason\":\"otra\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor rechazado con reason numérico",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":false,\"reason\":3}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor rechazado con reason nulo",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":false,\"reason\":null}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor rechazado con reason en mayúsculas",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":false,\"reason\":\"NOT_PAIRED\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor con JSON inválido",
+    "side": "server",
+    "json": "{",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor con array",
+    "side": "server",
+    "json": "[1]",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor con nulo",
+    "side": "server",
+    "json": "null",
+    "expect": {
+      "error": true
+    }
+  }
+]

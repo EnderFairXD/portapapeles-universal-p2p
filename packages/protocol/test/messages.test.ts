@@ -5,6 +5,7 @@ import {
   FILE_CHUNK_BYTES,
   MAX_CONTROL_BYTES,
   MAX_FRAME_BYTES,
+  MAX_PAYLOAD_BYTES,
   MessageDecoder,
   ProtocolError,
   createSha256,
@@ -98,13 +99,22 @@ describe('encodeControl / MessageDecoder', () => {
     expect(m.type === 'control' && m.msg.kind === 'clip' && m.msg.text === text).toBe(true);
   });
 
-  test('un JSON de exactamente 65534 bytes cabe en una trama y uno de 65535 se trocea', () => {
+  test('un control de exactamente 65519 bytes de payload va en una trama y uno más se trocea', () => {
+    // payload = byte de tipo + JSON: el JSON cabe hasta MAX_PAYLOAD_BYTES - 1
     const overhead = new TextEncoder().encode(JSON.stringify({ kind: 'clip', id: 'a', text: '', hash: HASH })).length;
-    const exact = encodeControl({ kind: 'clip', id: 'a', text: 'x'.repeat(65534 - overhead), hash: HASH });
+    const exact = encodeControl({ kind: 'clip', id: 'a', text: 'x'.repeat(MAX_PAYLOAD_BYTES - 1 - overhead), hash: HASH });
     expect(exact).toHaveLength(1);
-    expect(exact[0].length).toBe(65535);
-    const over = encodeControl({ kind: 'clip', id: 'a', text: 'x'.repeat(65535 - overhead), hash: HASH });
+    expect(exact[0].length).toBe(MAX_PAYLOAD_BYTES);
+    const over = encodeControl({ kind: 'clip', id: 'a', text: 'x'.repeat(MAX_PAYLOAD_BYTES - overhead), hash: HASH });
     expect(over.map((f) => f[0])).toEqual([0x03, 0x01]);
+    expect(over.map((f) => f.length)).toEqual([MAX_PAYLOAD_BYTES, 2]);
+  });
+
+  test('ningún payload de encodeControl pasa de MAX_PAYLOAD_BYTES (clip de 1 MiB de emojis)', () => {
+    const text = '😀'.repeat(262144);
+    const frames = encodeControl({ kind: 'clip', id: 'a', text, hash: sha256Hex(text) });
+    expect(frames.every((f) => f.length <= MAX_PAYLOAD_BYTES)).toBe(true);
+    expect(frames.some((f) => f.length === MAX_PAYLOAD_BYTES)).toBe(true);
   });
 
   test('reensamblado de control > 2 MiB lanza ProtocolError', () => {
