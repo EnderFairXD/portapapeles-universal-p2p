@@ -17,7 +17,14 @@ import { AppState, type AppStateStatus, type NativeEventSubscription } from 'rea
 
 import { readClipboard, startClipboardWatcher, writeClipboard } from './clipboardWatcher';
 import { discoverPc } from './discovery';
-import { localSendOutcome, reconnectDelayMs } from './connectionPolicy';
+import {
+  classifySendError,
+  createPauseCheck,
+  INVALID_FILE_SIZE_MESSAGE,
+  localSendOutcome,
+  reconnectDelayMs,
+  type SendFileResult,
+} from './connectionPolicy';
 import { isPickerOpen, onPickerSettled, openSink, resetPickers } from './files';
 import { getDeviceId } from './settings';
 import { connectTcp } from './tcpLink';
@@ -55,7 +62,8 @@ const USB_HOST = '127.0.0.1';
 
 const CLIP_TOO_LARGE = 'Texto demasiado grande para sincronizar (máx. 1 MB)';
 const CLIP_WRITE_FAILED = 'No se pudo escribir en el portapapeles';
-const INVALID_FILE_SIZE = 'No se pudo leer el tamaño del archivo';
+/** Margen tras cerrarse un selector antes de pausar si la app sigue en segundo plano. */
+const PICKER_SETTLE_MS = 1000;
 
 function isFinished(u: TransferUpdate): boolean {
   return u.state === 'done' || u.state === 'failed' || u.state === 'cancelled';
@@ -91,6 +99,14 @@ export class ConnectionManager {
   private enabled = false;
   private appStateSub: NativeEventSubscription | null = null;
   private pickerSub: (() => void) | null = null;
+  private readonly pauseCheck = createPauseCheck({
+    delayMs: PICKER_SETTLE_MS,
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+    clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+    appState: () => AppState.currentState,
+    pickerOpen: isPickerOpen,
+    pause: () => this.pause(),
+  });
   /** Bucle de conexión activo. */
   private running = false;
   /** Sube en cada arranque/parada: un bucle con otra generación ya no vale. */
@@ -114,7 +130,7 @@ export class ConnectionManager {
     if (this.enabled) return;
     this.enabled = true;
     this.appStateSub = AppState.addEventListener('change', this.onAppState);
-    this.pickerSub = onPickerSettled(this.onPickerSettled);
+    this.pickerSub = onPickerSettled(() => this.pauseCheck.schedule());
     if (AppState.currentState !== 'background') this.resume();
   }
 
@@ -125,6 +141,7 @@ export class ConnectionManager {
     this.appStateSub = null;
     this.pickerSub?.();
     this.pickerSub = null;
+    this.pauseCheck.cancel();
     this.pause();
   }
 
@@ -138,23 +155,24 @@ export class ConnectionManager {
   };
 
   /**
-   * Encola un archivo y devuelve su transferId; null si no hay sesión lista (entonces se
-   * cierra `src`).
+   * Encola un archivo. Si no se puede, cierra `src` y dice por qué: `no_session` (sin sesión
+   * lista; se puede reintentar) o `rejected` (el archivo no vale; el aviso ya está en lastError).
    */
-  sendFile(src: FileSource): string | null {
+  sendFile(src: FileSource): SendFileResult {
     const session = this.readySession();
     if (!session) {
       void src.close().catch(() => {});
-      return null;
+      return { ok: false, reason: 'no_session' };
     }
     try {
       const id = session.sendFile(src);
       this.setError(null);
-      return id;
+      return { ok: true, id };
     } catch (e) {
       void src.close().catch(() => {});
-      if (e instanceof RangeError) this.setError(INVALID_FILE_SIZE);
-      return null;
+      const reason = classifySendError(e);
+      if (reason === 'rejected') this.setError(INVALID_FILE_SIZE_MESSAGE);
+      return { ok: false, reason };
     }
   }
 
@@ -184,15 +202,11 @@ export class ConnectionManager {
     if (s === 'active') {
       // de vuelta en primer plano no queda ningún selector vivo (aunque no haya terminado)
       resetPickers();
+      this.pauseCheck.cancel();
       this.resume();
     }
     // un selector del sistema abierto también manda la app a segundo plano
     else if (s === 'background' && !isPickerOpen()) this.pause();
-  };
-
-  /** Un selector terminó: si mientras tanto la app pasó a segundo plano, ahora sí se pausa. */
-  private onPickerSettled = () => {
-    if (AppState.currentState === 'background' && !isPickerOpen()) this.pause();
   };
 
   private resume(): void {
@@ -206,6 +220,7 @@ export class ConnectionManager {
   private pause(): void {
     if (!this.running) return;
     this.running = false;
+    this.pauseCheck.cancel();
     this.stopWatcher?.();
     this.stopWatcher = null;
     // cierre ordenado (no hace falta renovar el anti-rebote); antes de cambiar de generación

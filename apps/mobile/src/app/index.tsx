@@ -20,7 +20,7 @@ export default function Home() {
   const state = useConnection();
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const { hasShareIntent, shareIntent } = useShareIntentContext();
+  const { hasShareIntent, shareIntent, resetShareIntent } = useShareIntentContext();
 
   const [picking, setPicking] = useState(false);
   const [toast, setToast] = useState({ text: 'Copiado', visible: false });
@@ -77,6 +77,7 @@ export default function Home() {
           <StatusCard
             state={state}
             notice={waiting > 0 ? `Esperando conexión para enviar ${filesLabel(waiting)}` : null}
+            onCancelNotice={waiting > 0 ? () => resetShareIntent() : undefined}
             onDismissError={onDismissError}
           />
         </View>
