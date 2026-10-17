@@ -191,18 +191,22 @@ describe('closeOutcome', () => {
   });
 
   test.each([
-    ['not_paired', { tokenSent: true, handshakeFailures: 0 }, { kind: 'unpair', message: notPairedToken }],
-    ['not_paired', { tokenSent: false, handshakeFailures: 0 }, { kind: 'unpair', message: notPairedPlain }],
-    ['pairing_expired', { tokenSent: true, handshakeFailures: 1 }, { kind: 'unpair', message: expired }],
-    ['pairing_expired', { tokenSent: false, handshakeFailures: 0 }, { kind: 'unpair', message: expired }],
-    ['handshake_failed', { tokenSent: false, handshakeFailures: 2 }, { kind: 'unpair', message: unverified }],
-    ['handshake_failed', { tokenSent: true, handshakeFailures: 5 }, { kind: 'unpair', message: unverified }],
-    ['handshake_failed', { tokenSent: false, handshakeFailures: 0 }, { kind: 'retry', handshakeFailures: 1 }],
-    ['handshake_failed', { tokenSent: true, handshakeFailures: 1 }, { kind: 'retry', handshakeFailures: 2 }],
-    ['link_closed', { tokenSent: false, handshakeFailures: 2 }, { kind: 'retry', handshakeFailures: 2 }],
-    ['heartbeat_timeout', { tokenSent: true, handshakeFailures: 0 }, { kind: 'retry', handshakeFailures: 0 }],
-    ['protocol_error', { tokenSent: false, handshakeFailures: 1 }, { kind: 'retry', handshakeFailures: 1 }],
-  ])('closeOutcome(%s, %j)', (reason, ctx, expected) => {
+    ['not_paired', { tokenSent: true, handshakeFailures: 0, transport: 'wifi' }, { kind: 'unpair', message: notPairedToken }],
+    ['not_paired', { tokenSent: false, handshakeFailures: 0, transport: 'wifi' }, { kind: 'unpair', message: notPairedPlain }],
+    ['not_paired', { tokenSent: false, handshakeFailures: 0, transport: 'usb' }, { kind: 'unpair', message: notPairedPlain }],
+    ['pairing_expired', { tokenSent: true, handshakeFailures: 1, transport: 'wifi' }, { kind: 'unpair', message: expired }],
+    ['pairing_expired', { tokenSent: false, handshakeFailures: 0, transport: 'usb' }, { kind: 'unpair', message: expired }],
+    ['handshake_failed', { tokenSent: false, handshakeFailures: 2, transport: 'wifi' }, { kind: 'unpair', message: unverified }],
+    ['handshake_failed', { tokenSent: true, handshakeFailures: 5, transport: 'wifi' }, { kind: 'unpair', message: unverified }],
+    ['handshake_failed', { tokenSent: false, handshakeFailures: 0, transport: 'wifi' }, { kind: 'retry', handshakeFailures: 1 }],
+    ['handshake_failed', { tokenSent: true, handshakeFailures: 1, transport: 'wifi' }, { kind: 'retry', handshakeFailures: 2 }],
+    // por USB (adb reverse) el PC puede no estar: no cuenta y nunca desempareja
+    ['handshake_failed', { tokenSent: false, handshakeFailures: 2, transport: 'usb' }, { kind: 'retry', handshakeFailures: 2 }],
+    ['handshake_failed', { tokenSent: true, handshakeFailures: 0, transport: 'usb' }, { kind: 'retry', handshakeFailures: 0 }],
+    ['link_closed', { tokenSent: false, handshakeFailures: 2, transport: 'wifi' }, { kind: 'retry', handshakeFailures: 2 }],
+    ['heartbeat_timeout', { tokenSent: true, handshakeFailures: 0, transport: 'usb' }, { kind: 'retry', handshakeFailures: 0 }],
+    ['protocol_error', { tokenSent: false, handshakeFailures: 1, transport: 'wifi' }, { kind: 'retry', handshakeFailures: 1 }],
+  ] as const)('closeOutcome(%s, %j)', (reason, ctx, expected) => {
     expect(closeOutcome(reason, ctx)).toEqual(expected);
   });
 });

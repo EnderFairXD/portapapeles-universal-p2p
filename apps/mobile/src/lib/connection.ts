@@ -239,8 +239,9 @@ export class ConnectionManager {
 
   /** Cierra la sesión y borra el emparejamiento (lastSyncedHash y lastPc no se tocan). */
   forgetPc(): void {
-    this.pause({ status: 'unpaired', transport: null, peerName: null, pc: null });
+    this.pause({ status: 'unpaired', transport: null, peerName: null, pc: null, lastError: null });
     this.pc = null;
+    this.handshakeFailures = 0;
     updateSettings({ pc: null });
   }
 
@@ -340,9 +341,9 @@ export class ConnectionManager {
         return;
       }
       if (conn) {
-        const { reason, wasReady, readyForMs, tokenSent } = await this.runSession(conn.link, conn.transport, gen, pc, identity);
+        const { reason, wasReady, readyForMs, tokenSent } = await this.runSession(conn.link, conn.transport, conn.addr, gen, pc, identity);
         if (gen !== this.generation) return;
-        const outcome = closeOutcome(reason, { tokenSent, handshakeFailures: this.handshakeFailures });
+        const outcome = closeOutcome(reason, { tokenSent, handshakeFailures: this.handshakeFailures, transport: conn.transport });
         if (outcome.kind === 'unpair') {
           this.unpair(outcome.message);
           return;
@@ -370,7 +371,7 @@ export class ConnectionManager {
    * WiFi (la última dirección que funcionó, las resueltas por mDNS con la huella de este PC y
    * las IPs del QR) y, si no, USB por 127.0.0.1. Cada intento tiene su propio plazo de CONNECT_TIMEOUT_MS.
    */
-  private async connectOnce(gen: number, pc: PairedPc): Promise<{ link: Link; transport: Transport } | null> {
+  private async connectOnce(gen: number, pc: PairedPc): Promise<{ link: Link; transport: Transport; addr: PcAddress | null } | null> {
     if (this.lastPc === undefined) this.lastPc = loadSettings().lastPc;
     const last = this.lastPc;
     const qr = pc.ips.map((host) => ({ host, port: pc.port }));
@@ -381,16 +382,15 @@ export class ConnectionManager {
       this.update({ status: 'connecting' });
       try {
         const link = await connectTcp(addr.host, addr.port, CONNECT_TIMEOUT_MS);
-        if (gen !== this.generation) return { link, transport: 'wifi' }; // el bucle lo cierra
-        this.rememberPc(addr);
-        return { link, transport: 'wifi' };
+        // la dirección se recuerda en `ready`, no aquí: una IP del QR podría ser de otro dispositivo
+        return { link, transport: 'wifi', addr }; // si cambió la generación, el bucle lo cierra
       } catch {
         // la siguiente
       }
       if (gen !== this.generation) return null;
     }
     try {
-      return { link: await connectTcp(USB_HOST, DEFAULT_TCP_PORT, CONNECT_TIMEOUT_MS), transport: 'usb' };
+      return { link: await connectTcp(USB_HOST, DEFAULT_TCP_PORT, CONNECT_TIMEOUT_MS), transport: 'usb', addr: null };
     } catch {
       return null;
     }
@@ -406,6 +406,7 @@ export class ConnectionManager {
   private runSession(
     link: Link,
     transport: Transport,
+    addr: PcAddress | null,
     gen: number,
     pc: PairedPc,
     identity: KeyPair,
@@ -437,12 +438,13 @@ export class ConnectionManager {
         if (__DEV__) console.log(`[clipsync] enlace abierto → ready: ${readyAt - openedAt} ms`);
         this.ready = true;
         this.handshakeFailures = 0;
+        if (addr) this.rememberPc(addr);
         // el PC aceptó: el token ya no sirve (es de un solo uso) y el emparejamiento queda completo
         if (this.pc?.token != null) {
           this.pc = { ...this.pc, token: null };
           updateSettings({ pc: this.pc });
         }
-        if (this.state.lastError === PC_UNREACHABLE) this.setError(null);
+        if (this.state.lastError === PC_UNREACHABLE || this.state.lastError === IDENTITY_FAILED) this.setError(null);
         this.update({ status: 'connected', transport, peerName: peer.deviceName, pc: pcView(this.pc) });
       });
       // solo lo que la Session envió de verdad en la regla de inicio (M4)

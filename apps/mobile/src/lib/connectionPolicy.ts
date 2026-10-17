@@ -109,9 +109,13 @@ export type CloseOutcome = { kind: 'retry'; handshakeFailures: number } | { kind
 
 /**
  * Qué hacer cuando se cierra la sesión. `ctx.handshakeFailures` son los fallos seguidos hasta
- * ahora (sin contar este cierre) y `tokenSent` si esta sesión llevaba el token del QR.
+ * ahora (sin contar este cierre), `tokenSent` si esta sesión llevaba el token del QR y
+ * `transport` por dónde se conectó.
  */
-export function closeOutcome(reason: string, ctx: { tokenSent: boolean; handshakeFailures: number }): CloseOutcome {
+export function closeOutcome(
+  reason: string,
+  ctx: { tokenSent: boolean; handshakeFailures: number; transport: 'wifi' | 'usb' },
+): CloseOutcome {
   switch (reason) {
     case 'not_paired':
       return {
@@ -121,6 +125,10 @@ export function closeOutcome(reason: string, ctx: { tokenSent: boolean; handshak
     case 'pairing_expired':
       return { kind: 'unpair', message: 'QR caducado. Genera uno nuevo en el PC.' };
     case 'handshake_failed': {
+      // Con `adb reverse` activo, 127.0.0.1 siempre acepta la conexión (la acepta adbd) y la cierra
+      // si la app del PC no está escuchando: eso no prueba que el PC sea alcanzable, así que por
+      // USB un handshake fallido no cuenta (D8: solo «con el PC alcanzable»).
+      if (ctx.transport === 'usb') return { kind: 'retry', handshakeFailures: ctx.handshakeFailures };
       const failures = ctx.handshakeFailures + 1;
       return failures >= MAX_HANDSHAKE_FAILURES
         ? { kind: 'unpair', message: 'No se pudo verificar el PC. Vuelve a emparejar.' }
