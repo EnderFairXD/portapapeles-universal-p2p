@@ -17,7 +17,8 @@ import { AppState, type AppStateStatus, type NativeEventSubscription } from 'rea
 
 import { readClipboard, startClipboardWatcher, writeClipboard } from './clipboardWatcher';
 import { discoverPc } from './discovery';
-import { isPickerOpen, openSink } from './files';
+import { localSendOutcome, reconnectDelayMs } from './connectionPolicy';
+import { isPickerOpen, onPickerSettled, openSink, resetPickers } from './files';
 import { getDeviceId } from './settings';
 import { connectTcp } from './tcpLink';
 
@@ -89,6 +90,7 @@ export class ConnectionManager {
   /** start() llamado (y no stop()): la app quiere estar conectada en primer plano. */
   private enabled = false;
   private appStateSub: NativeEventSubscription | null = null;
+  private pickerSub: (() => void) | null = null;
   /** Bucle de conexión activo. */
   private running = false;
   /** Sube en cada arranque/parada: un bucle con otra generación ya no vale. */
@@ -112,6 +114,7 @@ export class ConnectionManager {
     if (this.enabled) return;
     this.enabled = true;
     this.appStateSub = AppState.addEventListener('change', this.onAppState);
+    this.pickerSub = onPickerSettled(this.onPickerSettled);
     if (AppState.currentState !== 'background') this.resume();
   }
 
@@ -120,6 +123,8 @@ export class ConnectionManager {
     this.enabled = false;
     this.appStateSub?.remove();
     this.appStateSub = null;
+    this.pickerSub?.();
+    this.pickerSub = null;
     this.pause();
   }
 
@@ -176,9 +181,18 @@ export class ConnectionManager {
   // --- ciclo de vida ---
 
   private onAppState = (s: AppStateStatus) => {
-    if (s === 'active') this.resume();
+    if (s === 'active') {
+      // de vuelta en primer plano no queda ningún selector vivo (aunque no haya terminado)
+      resetPickers();
+      this.resume();
+    }
     // un selector del sistema abierto también manda la app a segundo plano
     else if (s === 'background' && !isPickerOpen()) this.pause();
+  };
+
+  /** Un selector terminó: si mientras tanto la app pasó a segundo plano, ahora sí se pausa. */
+  private onPickerSettled = () => {
+    if (AppState.currentState === 'background' && !isPickerOpen()) this.pause();
   };
 
   private resume(): void {
@@ -199,6 +213,8 @@ export class ConnectionManager {
     this.session?.close('closed');
     this.session = null;
     this.ready = false;
+    // lo escrito en un socket muerto sin saberlo pudo no llegar: se reenviará al reconectar
+    this.sync = new ClipboardSync(null);
     this.generation += 1;
     this.wake?.();
     this.update({ status: 'searching', transport: null, peerName: null });
@@ -213,11 +229,12 @@ export class ConnectionManager {
         return;
       }
       if (conn) {
-        const { reason, wasReady } = await this.runSession(conn.link, conn.transport, gen);
+        const { reason, wasReady, readyForMs } = await this.runSession(conn.link, conn.transport, gen);
         if (gen !== this.generation) return;
         // R18: lo escrito en un enlace moribundo pudo no llegar al PC; no se da por sincronizado
         if (reason === 'link_closed' || reason === 'heartbeat_timeout') this.sync = new ClipboardSync(null);
-        if (wasReady) continue; // la sesión funcionó: se reintenta enseguida
+        // la sesión funcionó el tiempo suficiente: se reintenta enseguida; si cae al poco, se espera
+        if (reconnectDelayMs(wasReady, readyForMs, RECONNECT_INTERVAL_MS) === 0) continue;
       }
       await this.sleep(RECONNECT_INTERVAL_MS);
     }
@@ -243,9 +260,10 @@ export class ConnectionManager {
     }
   }
 
-  private runSession(link: Link, transport: Transport, gen: number): Promise<{ reason: string; wasReady: boolean }> {
+  private runSession(link: Link, transport: Transport, gen: number): Promise<{ reason: string; wasReady: boolean; readyForMs: number }> {
     return new Promise((resolve) => {
       let wasReady = false;
+      let readyAt = 0;
       this.startClip = null;
       const session = new Session(link, {
         role: 'client',
@@ -262,6 +280,7 @@ export class ConnectionManager {
       session.on('ready', (peer) => {
         if (gen !== this.generation) return;
         wasReady = true;
+        readyAt = Date.now();
         this.ready = true;
         const sent = this.startClip;
         this.startClip = null;
@@ -280,7 +299,7 @@ export class ConnectionManager {
           this.session = null;
           this.ready = false;
         }
-        resolve({ reason, wasReady });
+        resolve({ reason, wasReady, readyForMs: wasReady ? Date.now() - readyAt : 0 });
       });
 
       void session.start();
@@ -309,10 +328,12 @@ export class ConnectionManager {
     } catch {
       return; // la sesión acaba de cerrarse
     }
-    if (decision === 'send') {
+    // si el socket estaba muerto, sendClip cerró la sesión y el texto no llegó
+    const outcome = localSendOutcome(decision, this.readySession() === session);
+    if (outcome === 'record') {
       this.addHistory({ kind: 'text', direction: 'out', text });
       this.setError(null);
-    } else if (decision === 'too_large') this.setError(CLIP_TOO_LARGE);
+    } else if (outcome === 'too_large') this.setError(CLIP_TOO_LARGE);
   }
 
   // --- archivos ---
