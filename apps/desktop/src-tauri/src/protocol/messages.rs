@@ -4,7 +4,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, PROTOCOL_VERSION};
+use super::{FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
@@ -229,7 +229,8 @@ pub fn encode_control(msg: &ControlMessage) -> Result<Vec<Vec<u8>>, ProtocolErro
         return fail(format!("supera {MAX_CONTROL_BYTES} bytes"));
     }
 
-    let max_body = MAX_FRAME_BYTES - 1;
+    // cada payload (byte de tipo + trozo) debe caber en un mensaje Noise: MAX_PAYLOAD_BYTES
+    let max_body = MAX_PAYLOAD_BYTES - 1;
     let total = json.len().div_ceil(max_body);
     Ok(json
         .chunks(max_body)
@@ -340,7 +341,7 @@ fn parse_control(json: &[u8]) -> Result<ControlMessage, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::MAX_CLIP_BYTES;
+    use crate::protocol::{MAX_CLIP_BYTES, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES};
     use sha2::{Digest, Sha256};
     const TID: &str = "00112233445566778899aabbccddeeff";
     const HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -458,13 +459,23 @@ mod tests {
     }
 
     #[test]
-    fn json_de_65534_bytes_cabe_en_una_trama_y_65535_se_trocea() {
+    fn json_de_65518_bytes_cabe_en_una_trama_y_65519_se_trocea() {
+        // payload = byte de tipo + JSON: el JSON cabe hasta MAX_PAYLOAD_BYTES - 1
         let overhead = serde_json::to_vec(&clip("")).unwrap().len();
-        let exact = encode_control(&clip(&"x".repeat(65534 - overhead))).unwrap();
+        let exact = encode_control(&clip(&"x".repeat(MAX_PAYLOAD_BYTES - 1 - overhead))).unwrap();
         assert_eq!(exact.len(), 1);
-        assert_eq!(exact[0].len(), 65535);
-        let over = encode_control(&clip(&"x".repeat(65535 - overhead))).unwrap();
+        assert_eq!(exact[0].len(), MAX_PAYLOAD_BYTES);
+        let over = encode_control(&clip(&"x".repeat(MAX_PAYLOAD_BYTES - overhead))).unwrap();
         assert_eq!(over.iter().map(|f| f[0]).collect::<Vec<_>>(), vec![0x03, 0x01]);
+        assert_eq!(over.iter().map(Vec::len).collect::<Vec<_>>(), vec![MAX_PAYLOAD_BYTES, 2]);
+    }
+
+    #[test]
+    fn ningun_payload_de_encode_control_pasa_de_max_payload_bytes() {
+        let text = "😀".repeat(262_144);
+        let frames = encode_control(&clip(&text)).unwrap();
+        assert!(frames.iter().all(|f| f.len() <= MAX_PAYLOAD_BYTES));
+        assert!(frames.iter().any(|f| f.len() == MAX_PAYLOAD_BYTES));
     }
 
     #[test]

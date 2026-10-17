@@ -2,6 +2,7 @@
 //! mismo formato de trama y misma validación que la implementación de referencia en TS.
 
 mod messages;
+pub mod hello;
 // Canal cifrado Noise IK: aún sin consumidores fuera de sus tests (los usa el Hub desde la tarea 3).
 #[allow(dead_code)]
 pub mod secure;

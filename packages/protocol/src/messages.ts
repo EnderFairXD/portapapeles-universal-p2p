@@ -1,5 +1,5 @@
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
-import { FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_FRAME_BYTES, PROTOCOL_VERSION } from './constants';
+import { FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION } from './constants';
 
 export type HelloMsg = { kind: 'hello'; v: 2; deviceId: string; deviceName: string; willSendClip?: boolean };
 export type ClipMsg = { kind: 'clip'; id: string; text: string; hash: string };
@@ -129,7 +129,8 @@ export function encodeControl(msg: ControlMessage): Uint8Array[] {
   const json = new TextEncoder().encode(JSON.stringify(validateControl(msg)));
   if (json.length > MAX_CONTROL_BYTES) fail(`supera ${MAX_CONTROL_BYTES} bytes`);
 
-  const maxBody = MAX_FRAME_BYTES - 1;
+  // cada payload (byte de tipo + trozo) debe caber en un mensaje Noise: MAX_PAYLOAD_BYTES
+  const maxBody = MAX_PAYLOAD_BYTES - 1;
   const frames: Uint8Array[] = [];
   for (let off = 0; off + maxBody < json.length; off += maxBody) {
     frames.push(withType(TYPE_CONTROL_MORE, json.subarray(off, off + maxBody)));
