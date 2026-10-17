@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { formatProgress, render } from "./render";
-import type { HistoryItem, Peer, Transfer, UiState } from "./types";
+import type { HistoryItem, PairedDevice, Peer, Transfer, UiState } from "./types";
 
 let root: HTMLElement;
 
@@ -11,7 +11,11 @@ beforeEach(() => {
 });
 
 function state(over: Partial<UiState> = {}): UiState {
-  return { pcName: "pop-os", peers: [], history: [], transfers: [], clipboardError: null, clipNotice: null, serverError: null, ...over };
+  return { pcName: "pop-os", peers: [], history: [], transfers: [], clipboardError: null, clipNotice: null, serverError: null, paired: [], pairing: null, pairNotice: null, ...over };
+}
+
+function device(over: Partial<PairedDevice> = {}): PairedDevice {
+  return { deviceKey: "ab".repeat(32), deviceName: "Pixel 8", pairedAtMs: 1_760_000_000_000, connected: false, ...over };
 }
 
 function peer(over: Partial<Peer> = {}): Peer {
@@ -41,8 +45,8 @@ const qa = (sel: string) => Array.from(root.querySelectorAll<HTMLElement>(sel));
 const pickButton = () => q<HTMLButtonElement>('button[data-action="pick-files"]')!;
 
 describe("estado de conexión", () => {
-  it("sin peers muestra «Esperando al móvil…» con la pista y el botón de enviar desactivado", () => {
-    render(root, state());
+  it("con emparejados y sin conexión mantiene la pista de la fase 1 y el botón de enviar desactivado", () => {
+    render(root, state({ paired: [device()] }));
     expect(q(".status-title")!.textContent).toBe("Esperando al móvil…");
     expect(q(".status-hint")!.textContent).toBe(
       "Abre ClipSync en el móvil, conectado a la misma red WiFi o por cable USB",
@@ -370,5 +374,136 @@ describe("avisos", () => {
   it("los avisos se muestran como texto, nunca como HTML", () => {
     render(root, state({ clipboardError: "<img src=x onerror=alert(1)>" }));
     expect(q(".notice img")).toBeNull();
+  });
+});
+
+describe("emparejamiento", () => {
+  const expiresAtMs = 1_760_000_300_000;
+
+  it("sin emparejados ni peers: texto que invita a emparejar", () => {
+    render(root, state());
+    expect(q(".status-title")!.textContent).toBe("Esperando al móvil…");
+    expect(q(".status-hint")!.hidden).toBe(false);
+    expect(q(".status-hint")!.textContent).toBe(
+      "Pulsa «Emparejar móvil» y escanea el QR con ClipSync en el móvil",
+    );
+  });
+
+  it("el botón «Emparejar móvil» lleva la acción start-pairing", () => {
+    render(root, state());
+    const b = q<HTMLButtonElement>('button[data-action="start-pairing"]')!;
+    expect(b.textContent).toBe("Emparejar móvil");
+  });
+
+  it("sin pairing el panel de QR está oculto", () => {
+    render(root, state());
+    expect(q(".pairing")!.hidden).toBe(true);
+  });
+
+  it("pairing: img con src data:image/svg+xml y «Caduca en 4:59» con nowMs = expiresAtMs - 299_000", () => {
+    const qrSvg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1 1"><rect width="1" height="1"/></svg>';
+    render(root, state({ pairing: { qrSvg, expiresAtMs } }), expiresAtMs - 299_000);
+    const img = q<HTMLImageElement>(".pairing img")!;
+    expect(img.getAttribute("alt")).toBe("Código QR de emparejamiento");
+    expect(img.getAttribute("src")).toBe("data:image/svg+xml;charset=utf-8," + encodeURIComponent(qrSvg));
+    expect(q(".pairing")!.textContent).toContain("Escanéalo con ClipSync en el móvil");
+    expect(q(".pairing-countdown")!.textContent).toBe("Caduca en 4:59");
+    expect(q(".pairing")!.hidden).toBe(false);
+    expect(q<HTMLButtonElement>('button[data-action="cancel-pairing"]')!.textContent).toBe("Cancelar");
+  });
+
+  it("la cuenta atrás redondea hacia arriba, usa m:ss y se queda en 0:00", () => {
+    const pairing = { qrSvg: "<svg/>", expiresAtMs };
+    render(root, state({ pairing }), expiresAtMs - 61_000);
+    expect(q(".pairing-countdown")!.textContent).toBe("Caduca en 1:01");
+    render(root, state({ pairing }), expiresAtMs - 59_500);
+    expect(q(".pairing-countdown")!.textContent).toBe("Caduca en 1:00");
+    render(root, state({ pairing }), expiresAtMs - 1);
+    expect(q(".pairing-countdown")!.textContent).toBe("Caduca en 0:01");
+  });
+
+  it("al llegar a 0 el panel se oculta y vuelve a verse con un QR nuevo", () => {
+    const pairing = { qrSvg: "<svg/>", expiresAtMs };
+    render(root, state({ pairing }), expiresAtMs);
+    expect(q(".pairing")!.hidden).toBe(true);
+    expect(q("img")).toBeNull();
+    render(root, state({ pairing }), expiresAtMs + 5_000);
+    expect(q(".pairing")!.hidden).toBe(true);
+    render(root, state({ pairing }), expiresAtMs - 10_000);
+    expect(q(".pairing")!.hidden).toBe(false);
+  });
+
+  it("repintar cada segundo no vuelve a crear la imagen del QR", () => {
+    const pairing = { qrSvg: "<svg/>", expiresAtMs };
+    render(root, state({ pairing }), expiresAtMs - 10_000);
+    const img = q(".pairing img");
+    render(root, state({ pairing }), expiresAtMs - 9_000);
+    expect(q(".pairing img")).toBe(img);
+    expect(q(".pairing-countdown")!.textContent).toBe("Caduca en 0:09");
+  });
+
+  it("pairing con «<script>» en el SVG: no se crea ningún <script> en el DOM", () => {
+    const qrSvg = '<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>';
+    render(root, state({ pairing: { qrSvg, expiresAtMs } }), expiresAtMs - 1000);
+    expect(root.querySelector("script")).toBeNull();
+    expect(q(".pairing img")!.getAttribute("src")).not.toContain("<script>");
+  });
+
+  it("emparejados: una fila por dispositivo con «Olvidar» y data-device-key; «Conectado» solo si connected", () => {
+    const a = device({ deviceKey: "a".repeat(64), deviceName: "Pixel 8", connected: true });
+    const b = device({ deviceKey: "b".repeat(64), deviceName: "Galaxy S24", connected: false });
+    render(root, state({ paired: [a, b] }));
+    const rows = qa(".paired-item");
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain("Pixel 8");
+    expect(rows[0].textContent).toContain("Conectado");
+    expect(rows[1].textContent).toContain("Galaxy S24");
+    expect(rows[1].textContent).not.toContain("Conectado");
+    const forget = qa('button[data-action="forget"]');
+    expect(forget.map((f) => f.dataset.deviceKey)).toEqual(["a".repeat(64), "b".repeat(64)]);
+    expect(forget[0].textContent).toBe("Olvidar");
+  });
+
+  it("el nombre del móvil emparejado se muestra como texto, nunca como HTML", () => {
+    render(root, state({ paired: [device({ deviceName: "<img src=x onerror=alert(1)>" })] }));
+    expect(q(".paired-item img")).toBeNull();
+    expect(q(".paired-item")!.textContent).toContain("<img src=x onerror=alert(1)>");
+  });
+
+  it("al repintar se reutiliza la fila y «Conectado» aparece y desaparece", () => {
+    render(root, state({ paired: [device()] }));
+    const row = q(".paired-item");
+    expect(row!.textContent).not.toContain("Conectado");
+    render(root, state({ paired: [device({ connected: true })] }));
+    expect(q(".paired-item")).toBe(row);
+    expect(row!.textContent).toContain("Conectado");
+    render(root, state({ paired: [device({ connected: false })] }));
+    expect(row!.textContent).not.toContain("Conectado");
+    render(root, state({ paired: [] }));
+    expect(qa(".paired-item")).toHaveLength(0);
+  });
+
+  it("lista vacía → «Ningún móvil emparejado»", () => {
+    render(root, state());
+    expect(q(".paired-empty")!.hidden).toBe(false);
+    expect(q(".paired-empty")!.textContent).toBe("Ningún móvil emparejado");
+    render(root, state({ paired: [device()] }));
+    expect(q(".paired-empty")!.hidden).toBe(true);
+  });
+
+  it("pairNotice visible como aviso informativo y desaparece al limpiarse", () => {
+    render(root, state({ pairNotice: "Móvil emparejado" }));
+    const n = qa(".notice").find((e) => e.textContent!.includes("Móvil emparejado"))!;
+    expect(n.classList.contains("notice-info")).toBe(true);
+    expect(q(".notices")!.hidden).toBe(false);
+    render(root, state({ pairNotice: null }));
+    expect(qa(".notice")).toHaveLength(0);
+  });
+
+  it("pairNotice y clipNotice pueden verse a la vez", () => {
+    render(root, state({ pairNotice: "uno", clipNotice: "dos" }));
+    expect(qa(".notice").map((e) => e.textContent)).toEqual(
+      expect.arrayContaining([expect.stringContaining("uno"), expect.stringContaining("dos")]),
+    );
   });
 });

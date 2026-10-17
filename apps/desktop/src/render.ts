@@ -3,7 +3,7 @@
 // nunca como HTML. Los elementos con botones se reutilizan entre pintados para
 // no perder foco ni hover cuando el progreso se actualiza varias veces por segundo.
 
-import type { HistoryItem, Transfer, UiState } from "./types";
+import type { HistoryItem, PairedDevice, Transfer, UiState } from "./types";
 
 /** Caracteres de un texto que se llevan al DOM; el resto se corta (el clic copia el texto completo). */
 const MAX_PREVIEW_CHARS = 600;
@@ -101,6 +101,12 @@ interface TransferRow extends Row {
   cancel: HTMLButtonElement;
 }
 
+interface PairedRow extends Row {
+  name: HTMLElement;
+  badge: HTMLElement;
+  forget: HTMLButtonElement;
+}
+
 interface View {
   top: HTMLElement;
   pcName: HTMLElement;
@@ -111,6 +117,13 @@ interface View {
   noticeServer: HTMLElement;
   noticeError: HTMLElement;
   noticeInfo: HTMLElement;
+  noticePair: HTMLElement;
+  pairing: HTMLElement;
+  pairingImg: HTMLImageElement;
+  pairingCountdown: HTMLElement;
+  pairedList: HTMLElement;
+  pairedEmpty: HTMLElement;
+  pairedRows: Map<string, PairedRow>;
   drop: HTMLElement;
   dropHint: HTMLElement;
   pick: HTMLButtonElement;
@@ -158,6 +171,23 @@ function build(root: HTMLElement): View {
   const noticeServer = notice("error");
   const noticeError = notice("error");
   const noticeInfo = notice("info");
+  const noticePair = notice("info");
+
+  // Panel del QR: la imagen se pinta como <img>, nunca como HTML.
+  const pairingImg = el("img", "pairing-qr");
+  pairingImg.alt = "Código QR de emparejamiento";
+  const pairingCountdown = el("p", "pairing-countdown");
+  const pairingText = el("div", "pairing-text");
+  pairingText.append(el("p", "pairing-title", "Escanéalo con ClipSync en el móvil"), pairingCountdown, button("Cancelar", "cancel-pairing", "btn btn-ghost"));
+  const pairing = el("div", "pairing");
+  pairing.append(pairingText); // la imagen solo está en el DOM mientras hay un QR vigente
+
+  const pairedList = el("ul", "paired-list");
+  const pairedEmpty = el("p", "paired-empty", "Ningún móvil emparejado");
+  const pairHead = el("div", "section-head");
+  pairHead.append(el("h2", "section-title", "Móviles emparejados"), button("Emparejar móvil", "start-pairing", "btn btn-primary"));
+  const paired = el("section", "paired");
+  paired.append(pairHead, pairing, pairedList, pairedEmpty);
 
   const dropHint = el("p", "drop-hint");
   const pick = button("Elegir archivo", "pick-files", "btn btn-primary");
@@ -175,7 +205,7 @@ function build(root: HTMLElement): View {
   const history = el("section", "history");
   history.append(el("h2", "section-title", "Historial"), historyList, historyEmpty);
 
-  top.append(header, notices, send, transfers, history);
+  top.append(header, notices, paired, send, transfers, history);
   root.replaceChildren(top);
 
   return {
@@ -188,6 +218,13 @@ function build(root: HTMLElement): View {
     noticeServer,
     noticeError,
     noticeInfo,
+    noticePair,
+    pairing,
+    pairingImg,
+    pairingCountdown,
+    pairedList,
+    pairedEmpty,
+    pairedRows: new Map(),
     drop,
     dropHint,
     pick,
@@ -215,7 +252,12 @@ function renderStatus(view: View, state: UiState): boolean {
     view.statusHint.hidden = true;
   } else {
     setText(view.statusTitle, "Esperando al móvil…");
-    setText(view.statusHint, "Abre ClipSync en el móvil, conectado a la misma red WiFi o por cable USB");
+    setText(
+      view.statusHint,
+      state.paired.length === 0
+        ? "Pulsa «Emparejar móvil» y escanea el QR con ClipSync en el móvil"
+        : "Abre ClipSync en el móvil, conectado a la misma red WiFi o por cable USB",
+    );
     view.statusHint.hidden = false;
   }
   return Boolean(peer);
@@ -235,7 +277,55 @@ function renderNotices(view: View, state: UiState): void {
   // el del servidor va el primero: sin él no hay conexión posible
   setNotice(view.notices, view.noticeServer, state.serverError, true);
   setNotice(view.notices, view.noticeInfo, state.clipNotice, false);
+  setNotice(view.notices, view.noticePair, state.pairNotice, false);
   view.notices.hidden = view.notices.childElementCount === 0;
+}
+
+/** «Caduca en m:ss»: segundos redondeados hacia arriba y nunca negativos. */
+function formatCountdown(expiresAtMs: number, nowMs: number): string {
+  const total = Math.max(0, Math.ceil((expiresAtMs - nowMs) / 1000));
+  const seconds = total % 60;
+  return `Caduca en ${Math.floor(total / 60)}:${seconds < 10 ? "0" : ""}${seconds}`;
+}
+
+function renderPairing(view: View, state: UiState, nowMs: number): void {
+  const p = state.pairing;
+  // El backend ya descarta el QR caducado; aquí se oculta sin esperar a su aviso.
+  const live = p !== null && p.expiresAtMs - nowMs > 0;
+  view.pairing.hidden = !live;
+  if (!live) {
+    view.pairingImg.remove();
+    return;
+  }
+  if (!view.pairingImg.parentElement) view.pairing.prepend(view.pairingImg);
+  // Solo se toca `src` si cambia: así el QR no parpadea al repintar cada segundo.
+  const src = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(p.qrSvg);
+  if (view.pairingImg.getAttribute("src") !== src) view.pairingImg.setAttribute("src", src);
+  setText(view.pairingCountdown, formatCountdown(p.expiresAtMs, nowMs));
+}
+
+function createPaired(d: PairedDevice): PairedRow {
+  const li = el("li", "paired-item");
+  const name = el("span", "paired-name");
+  const badge = el("span", "paired-badge", "Conectado");
+  const forget = button("Olvidar", "forget", "btn btn-ghost");
+  forget.dataset.deviceKey = d.deviceKey;
+  li.append(name, forget);
+  return { el: li, name, badge, forget };
+}
+
+function updatePaired(row: PairedRow, d: PairedDevice): void {
+  setText(row.name, d.deviceName);
+  row.name.title = d.deviceName;
+  row.forget.setAttribute("aria-label", `Olvidar ${d.deviceName}`);
+  if (d.connected && !row.badge.parentElement) row.el.insertBefore(row.badge, row.forget);
+  else if (!d.connected && row.badge.parentElement) row.badge.remove();
+}
+
+function renderPaired(view: View, state: UiState): void {
+  syncList(view.pairedList, view.pairedRows, state.paired, (d) => d.deviceKey, createPaired, updatePaired);
+  view.pairedList.hidden = state.paired.length === 0;
+  view.pairedEmpty.hidden = state.paired.length > 0;
 }
 
 function renderSend(view: View, connected: boolean): void {
@@ -409,7 +499,7 @@ function renderHistory(view: View, state: UiState): void {
   view.historyEmpty.hidden = state.history.length > 0;
 }
 
-export function render(root: HTMLElement, state: UiState): void {
+export function render(root: HTMLElement, state: UiState, nowMs = Date.now()): void {
   let view = views.get(root);
   if (!view || !root.contains(view.top)) {
     view = build(root);
@@ -417,6 +507,8 @@ export function render(root: HTMLElement, state: UiState): void {
   }
   const connected = renderStatus(view, state);
   renderNotices(view, state);
+  renderPairing(view, state, nowMs);
+  renderPaired(view, state);
   renderSend(view, connected);
   renderTransfers(view, state);
   renderHistory(view, state);

@@ -37,6 +37,20 @@ export interface Transfer {
   location?: string | null;
 }
 
+/** Móvil emparejado; `deviceKey` es su clave pública en hex (la misma que `Peer.deviceId`). */
+export interface PairedDevice {
+  deviceKey: string;
+  deviceName: string;
+  pairedAtMs: number;
+  connected: boolean;
+}
+
+/** QR de emparejamiento en curso. El SVG viene del backend y solo se usa como imagen. */
+export interface PairingInfo {
+  qrSvg: string;
+  expiresAtMs: number;
+}
+
 export interface UiState {
   pcName: string;
   /** El último es el más reciente. */
@@ -48,4 +62,9 @@ export interface UiState {
   clipNotice?: string | null;
   /** El PC no pudo abrir su puerto TCP (p. ej. otra copia abierta). */
   serverError?: string | null;
+  /** Móviles emparejados con este PC. */
+  paired: PairedDevice[];
+  /** `null` si no hay un QR vigente. */
+  pairing: PairingInfo | null;
+  pairNotice?: string | null;
 }
