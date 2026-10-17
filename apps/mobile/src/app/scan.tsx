@@ -2,10 +2,11 @@ import { CameraView, useCameraPermissions } from 'expo-camera';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Alert, Linking, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, AppState, Linking, Pressable, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { connection } from '@/lib/connection';
+import { loadSettings } from '@/lib/settings';
 import { decideScan } from '@/lib/scanDecision';
 import { colors, radius, TOUCH, type } from '@/theme';
 
@@ -16,7 +17,7 @@ const RETRY_MS = 2000;
 export default function Scan() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
-  const [permission, requestPermission] = useCameraPermissions();
+  const [permission, requestPermission, refreshPermission] = useCameraPermissions();
   const [invalid, setInvalid] = useState(false);
   // true mientras se procesa una lectura (aviso, confirmación o emparejado)
   const busy = useRef(false);
@@ -25,6 +26,14 @@ export default function Scan() {
   useEffect(() => () => {
     if (retryTimer.current) clearTimeout(retryTimer.current);
   }, []);
+
+  // al volver de los ajustes del sistema, comprobar de nuevo si se dio el permiso
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (s) => {
+      if (s === 'active') refreshPermission().catch(() => {});
+    });
+    return () => sub.remove();
+  }, [refreshPermission]);
 
   const finish = useCallback(
     (info: Parameters<typeof connection.pair>[0]) => {
@@ -39,7 +48,7 @@ export default function Scan() {
       if (busy.current) return;
       busy.current = true;
 
-      const decision = decideScan(data, connection.getState().pc?.name ?? null);
+      const decision = decideScan(data, loadSettings().pc);
       if (decision.kind === 'invalid') {
         setInvalid(true);
         retryTimer.current = setTimeout(() => {
@@ -47,20 +56,28 @@ export default function Scan() {
           busy.current = false;
         }, RETRY_MS);
       } else if (decision.kind === 'confirm') {
+        // Cancelar y cerrar el aviso salen por el mismo sitio; solo una vez
+        let left = false;
+        const leave = () => {
+          if (left) return;
+          left = true;
+          router.back();
+        };
         Alert.alert(
           `Ya estás emparejado con «${decision.current}». ¿Sustituirlo por «${decision.info.name}»?`,
           undefined,
           [
-            { text: 'Cancelar', style: 'cancel', onPress: () => (busy.current = false) },
+            // el usuario decide no sustituir: se sale (la cámara seguiría viendo el mismo QR)
+            { text: 'Cancelar', style: 'cancel', onPress: leave },
             { text: 'Sustituir', onPress: () => finish(decision.info) },
           ],
-          { cancelable: true, onDismiss: () => (busy.current = false) },
+          { cancelable: true, onDismiss: leave },
         );
       } else {
         finish(decision.info);
       }
     },
-    [finish],
+    [finish, router],
   );
 
   return (
