@@ -84,21 +84,47 @@ Cada dispositivo tiene un par de claves X25519 permanente (su identidad):
 - PC: archivo `identity.key` en el directorio de datos de la app (permisos `600` en Linux).
 - Móvil: `expo-secure-store` (respaldado por Android Keystore).
 
-El móvil es el iniciador y conoce la clave pública del PC (por el QR). En el primer mensaje del
-handshake el móvil envía su clave pública cifrada y una carga útil JSON:
+El móvil es el iniciador y el PC el respondedor; el móvil conoce la clave pública del PC (por el
+QR). El prólogo Noise es `clipsync/2` (bytes UTF-8), que ata el handshake a esta versión del
+protocolo. Tras el handshake, cada trama es un mensaje Noise de transporte (AD vacío, nonce por
+contador de 64 bits); el payload en claro máximo es 65 519 bytes (65 535 − 16 de la etiqueta
+Poly1305), así que los fragmentos de control llevan como mucho 65 518 bytes de contenido. No hay
+modo en claro: `hello` deja de ser un mensaje de control y, si llega uno tras el handshake, la
+sesión se cierra con `protocol_error`.
+
+En el primer mensaje del handshake el móvil envía su clave pública cifrada y una carga útil JSON:
 
 ```json
-{ "v": 2, "deviceId": "…", "deviceName": "Pixel 8", "pairingToken": "…opcional…" }
+{ "v": 2, "deviceId": "…", "deviceName": "Pixel 8", "willSendClip": true, "pairingToken": "…opcional…" }
 ```
+
+El PC identifica a un móvil por su clave pública en hex (`device_key`), no por el `deviceId` que
+declara: el Hub indexa por ella las sesiones, el anti-rebote y «Olvidar», y `PeerConnected.deviceId`
+lleva ese valor. Así un móvil emparejado no puede hacerse pasar por otro.
 
 El PC decide al terminar el handshake:
 
 1. La clave del móvil está en `paired.json` → acepta.
 2. No está, pero `pairingToken` coincide con el token vigente → la añade a `paired.json`,
    invalida el token y acepta.
-3. En cualquier otro caso → responde `{ "accepted": false, "reason": "not_paired" }` y cierra.
+3. En cualquier otro caso → responde con un motivo tipado y cierra:
+   - `not_paired`: sin token, o con un token que no es el del QR.
+   - `pairing_expired`: el token es el del último QR, pero caducó o ya lo usó otro móvil.
 
-Segundo mensaje (PC → móvil): `{ "v": 2, "accepted": true, "pcName": "…" }`.
+   El resultado de la autorización es ese motivo tipado, y permite que el móvil diga «QR caducado».
+
+Segundo mensaje (PC → móvil):
+`{ "v": 2, "accepted": true, "deviceId": "<id del PC>", "pcName": "…" }` o
+`{ "v": 2, "accepted": false, "reason": "not_paired" | "pairing_expired" }`. Se incluye `deviceId`
+porque la `Session` necesita un `PeerInfo` completo.
+
+Archivos del PC (en el directorio de datos de la app):
+
+- `identity.key`: los 32 bytes de la clave privada, en crudo y con permisos `600`.
+- `paired.json`: `{ "v": 1, "devices": [{ "publicKey", "deviceId", "deviceName", "pairedAtMs" }] }`.
+
+Si uno está dañado, se aparta como `.bad` y se crea uno nuevo; la app no cae. Las claves en
+ficheros y JSON internos van en hex minúscula (64 caracteres); base64url solo en el QR.
 
 ### 3.3 Emparejamiento por QR
 
@@ -106,12 +132,31 @@ En el PC, «Emparejar móvil» genera un token aleatorio de 128 bits, válido **
 solo uso**, y muestra un QR con:
 
 ```
-clipsync://pair?v=2&pk=<clave pública PC, base64url>&t=<token>&n=<nombre PC>
-               &ip=<IPs LAN separadas por coma>&port=52847&bt=<dirección BT, si hay adaptador>
+clipsync://pair?v=2&pk=<clave pública PC, base64url sin relleno>&t=<token>&n=<nombre PC, %-codificado>
+               &ip=<IPv4 LAN separadas por coma>&port=52847
 ```
 
-El móvil lo escanea (`expo-camera`), guarda `pk`, `n`, `ip`, `port` y `bt`, y conecta enviando el
-token. Si el emparejamiento falla se muestra el motivo («QR caducado», «PC no alcanzable»…).
+El token son 128 bits en base64url sin relleno (22 caracteres). Un QR nuevo invalida el anterior.
+El PC no tiene Bluetooth hasta la fase 4, así que el QR no lleva `bt`; el parser ignora los
+parámetros desconocidos.
+
+El móvil lo escanea con el escáner de la app (`expo-camera`), guarda `pk`, `n`, `ip` y `port`, y
+conecta enviando el token. Si el emparejamiento falla se muestra el motivo («QR caducado», «PC no
+alcanzable»…). Reglas del lado del móvil:
+
+- **Sin enlace profundo**: un `clipsync://pair` que llegue de fuera no empareja nada. Solo empareja
+  el escáner de la app; si no, una web podría cambiar el PC emparejado.
+- **Huella mDNS**: la TXT del servicio incluye `fp=<16 hex>` (los 8 primeros bytes del SHA-256 de
+  la clave pública del PC) y el móvil solo usa servicios cuyo `fp` coincide con el de su PC, así
+  que dos PCs en la misma red no se confunden. Si mDNS no encuentra el PC, prueba las IPs del QR.
+- **Rechazo** (`not_paired`, `pairing_expired`) o 3 handshakes fallidos seguidos con el PC
+  alcanzable: el móvil borra el emparejamiento, deja de reintentar y vuelve a la bienvenida con el
+  motivo (§8).
+- **Los fallos `handshake_failed` solo cuentan para esos 3 por WiFi**: por USB, `adb reverse`
+  acepta el socket aunque la app del PC esté cerrada, y eso no indica un PC distinto.
+- **La dirección WiFi del PC se recuerda solo tras un handshake correcto**, no al escanear.
+- **Volver a escanear el QR del mismo PC** reempareja sin preguntar; escanear el de otro PC
+  pregunta antes de sustituir el actual.
 
 ### 3.4 Mensajes de sesión
 
@@ -337,6 +382,9 @@ Cada fase termina con algo usable y probado en el móvil real.
    conecta en claro. Las tramas ya llevan el byte de tipo, así que el cifrado se intercala
    en la fase 2 sin cambiar los mensajes.
 2. **Emparejamiento por QR y cifrado Noise IK**, con vectores de prueba y e2e.
+   Medida en el móvil real (handshake, 50 MB en los dos sentidos): pendiente, se anota aquí tras
+   la prueba de Javier. Bench en Node: ~84 handshakes/s (≈ 11,8 ms) y ~69 MB/s cifrando y
+   descifrando.
 3. **USB**: `adb` incluido, avisos de permisos/driver, selección automática WiFi → USB.
 4. **Bluetooth Classic**: módulo nativo Android, listeners RFCOMM de Linux y Windows,
    selector completo y modo fijo.
