@@ -1,5 +1,6 @@
 import { PROTOCOL_VERSION } from './constants';
 import { ProtocolError } from './messages';
+import { toWellFormed } from './text';
 
 /** Carga JSON del primer mensaje Noise (móvil → PC). Sustituye al `hello` en claro de la fase 1. */
 export interface ClientHello {
@@ -41,6 +42,8 @@ function parseObject(bytes: Uint8Array): Obj {
 function str(o: Obj, key: string): string {
   const v = o[key];
   if (typeof v !== 'string') fail(`'${key}' debe ser texto`);
+  // JSON.parse acepta `\ud800` suelto; serde_json (el PC) no: los dos lados lo rechazan.
+  if (toWellFormed(v) !== v) fail(`'${key}' tiene un sustituto UTF-16 suelto`);
   return v;
 }
 
@@ -76,9 +79,9 @@ export function decodeServerHello(bytes: Uint8Array): ServerHello {
   return { v: 2, accepted: false, reason: reason as RejectReason };
 }
 
-/** Solo serializa (sin campos de más); la validación está en `decode*`. */
+/** Solo serializa (sin campos de más); la validación está en `decode*`. Los sustitutos sueltos pasan a U+FFFD. */
 export function encodeClientHello(h: ClientHello): Uint8Array {
-  const out: ClientHello = { v: 2, deviceId: h.deviceId, deviceName: h.deviceName };
+  const out: ClientHello = { v: 2, deviceId: toWellFormed(h.deviceId), deviceName: toWellFormed(h.deviceName) };
   if (h.willSendClip !== undefined) out.willSendClip = h.willSendClip;
   if (h.pairingToken !== undefined) out.pairingToken = h.pairingToken;
   return new TextEncoder().encode(JSON.stringify(out));
@@ -86,7 +89,7 @@ export function encodeClientHello(h: ClientHello): Uint8Array {
 
 export function encodeServerHello(h: ServerHello): Uint8Array {
   const out: ServerHello = h.accepted
-    ? { v: 2, accepted: true, deviceId: h.deviceId, pcName: h.pcName }
+    ? { v: 2, accepted: true, deviceId: toWellFormed(h.deviceId), pcName: toWellFormed(h.pcName) }
     : { v: 2, accepted: false, reason: h.reason };
   return new TextEncoder().encode(JSON.stringify(out));
 }
