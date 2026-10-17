@@ -1,11 +1,11 @@
 // Conexión persistente con el PC: WiFi (mDNS) o USB (adb reverse), con reintentos.
 import {
-  ClipboardSync,
   CONNECT_TIMEOUT_MS,
   DEFAULT_TCP_PORT,
   MAX_HISTORY,
   RECONNECT_INTERVAL_MS,
   Session,
+  decideClip,
   type FileSource,
   type Link,
   type PeerInfo,
@@ -16,17 +16,21 @@ import * as Device from 'expo-device';
 import { AppState, type AppStateStatus, type NativeEventSubscription } from 'react-native';
 
 import { readClipboard, startClipboardWatcher, writeClipboard } from './clipboardWatcher';
-import { discoverPc } from './discovery';
+import { resolvedPcs, startDiscovery, stopDiscovery } from './discovery';
 import {
+  backgroundDecision,
   classifySendError,
   createPauseCheck,
+  hasPendingWork,
   INVALID_FILE_SIZE_MESSAGE,
   localSendOutcome,
   reconnectDelayMs,
   type SendFileResult,
 } from './connectionPolicy';
 import { isPickerOpen, onPickerSettled, openSink, resetPickers } from './files';
-import { getDeviceId } from './settings';
+import { connectCandidates, type PcAddress } from './pcAddress';
+import { getDeviceId, loadSettings, updateSettings } from './settings';
+import { SyncKeeper } from './syncKeeper';
 import { connectTcp } from './tcpLink';
 
 export type ConnStatus = 'searching' | 'connecting' | 'connected';
@@ -105,8 +109,10 @@ export class ConnectionManager {
     clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
     appState: () => AppState.currentState,
     pickerOpen: isPickerOpen,
-    pause: () => this.pause(),
+    pause: () => this.applyBackground(),
   });
+  /** Hay un «Compartir → ClipSync» esperando a enviarse (lo avisa ShareSender). */
+  private sharePending = false;
   /** Bucle de conexión activo. */
   private running = false;
   /** Sube en cada arranque/parada: un bucle con otra generación ya no vale. */
@@ -116,10 +122,10 @@ export class ConnectionManager {
 
   private session: Session | null = null;
   private ready = false;
-  /** Único anti-rebote del móvil (con un solo PC); se renueva tras un cierre anómalo. */
-  private sync = new ClipboardSync(null);
-  /** Texto que la regla de inicio va a enviar al saludar. */
-  private startClip: string | null = null;
+  /** Anti-rebote del móvil (con un solo PC), persistido en settings.json (R29). */
+  private keeper: SyncKeeper | null = null;
+  /** Última dirección WiFi del PC que funcionó; se prueba la primera. */
+  private lastPc: PcAddress | null | undefined = undefined;
   private nextHistoryId = 1;
   private self: PeerInfo | null = null;
 
@@ -183,7 +189,7 @@ export class ConnectionManager {
   /** Copia un texto del historial al portapapeles sin reenviarlo al PC. */
   async copyFromHistory(text: string): Promise<void> {
     // se marca antes de escribir: el listener del portapapeles salta enseguida
-    this.sync.markSynced(text);
+    this.sync().current.markSynced(text);
     await writeClipboard(text);
   }
 
@@ -196,6 +202,13 @@ export class ConnectionManager {
     this.setError(null);
   }
 
+  /** ShareSender avisa de si hay archivos compartidos por enviar (no se pausa mientras tanto). */
+  setSharePending(pending: boolean): void {
+    if (this.sharePending === pending) return;
+    this.sharePending = pending;
+    if (!pending) this.applyBackground();
+  }
+
   // --- ciclo de vida ---
 
   private onAppState = (s: AppStateStatus) => {
@@ -204,32 +217,60 @@ export class ConnectionManager {
       resetPickers();
       this.pauseCheck.cancel();
       this.resume();
-    }
-    // un selector del sistema abierto también manda la app a segundo plano
-    else if (s === 'background' && !isPickerOpen()) this.pause();
+    } else if (s === 'background') this.applyBackground(s);
   };
 
+  /**
+   * Segundo plano (también al cerrarse un selector o al acabar lo pendiente): pausa, o solo
+   * para el vigilante si hay archivos o un compartir en marcha (I1). Un selector abierto
+   * también manda la app a segundo plano: entonces no se hace nada (R26).
+   */
+  private applyBackground(appState: string = AppState.currentState): void {
+    if (!this.enabled) return;
+    const busy = hasPendingWork(this.state.transfers, this.sharePending);
+    const decision = backgroundDecision({ appState, pickerOpen: isPickerOpen(), busy });
+    if (decision === 'pause') this.pause();
+    else if (decision === 'watcher_only') this.stopClipboardWatcher();
+  }
+
   private resume(): void {
-    if (this.running) return;
+    if (this.running) {
+      // seguía conectado en segundo plano: solo vuelve el vigilante, y lo copiado mientras tanto
+      if (!this.stopWatcher) {
+        this.startClipboardWatcher();
+        void readClipboard().then((text) => {
+          if (text !== null && this.stopWatcher) this.onLocalText(text);
+        });
+      }
+      return;
+    }
     this.running = true;
     const gen = ++this.generation;
-    this.stopWatcher = startClipboardWatcher((text) => this.onLocalText(text));
+    this.startClipboardWatcher();
+    startDiscovery();
     void this.loop(gen);
+  }
+
+  private startClipboardWatcher(): void {
+    this.stopWatcher ??= startClipboardWatcher((text) => this.onLocalText(text));
+  }
+
+  private stopClipboardWatcher(): void {
+    this.stopWatcher?.();
+    this.stopWatcher = null;
   }
 
   private pause(): void {
     if (!this.running) return;
     this.running = false;
     this.pauseCheck.cancel();
-    this.stopWatcher?.();
-    this.stopWatcher = null;
-    // cierre ordenado (no hace falta renovar el anti-rebote); antes de cambiar de generación
-    // para que lleguen los 'failed' de las transferencias en curso
+    this.stopClipboardWatcher();
+    stopDiscovery();
+    // antes de cambiar de generación para que lleguen los 'failed' de las transferencias en
+    // curso; el anti-rebote vuelve al último hash confirmado al cerrarse (R29)
     this.session?.close('closed');
     this.session = null;
     this.ready = false;
-    // lo escrito en un socket muerto sin saberlo pudo no llegar: se reenviará al reconectar
-    this.sync = new ClipboardSync(null);
     this.generation += 1;
     this.wake?.();
     this.update({ status: 'searching', transport: null, peerName: null });
@@ -244,10 +285,8 @@ export class ConnectionManager {
         return;
       }
       if (conn) {
-        const { reason, wasReady, readyForMs } = await this.runSession(conn.link, conn.transport, gen);
+        const { wasReady, readyForMs } = await this.runSession(conn.link, conn.transport, gen);
         if (gen !== this.generation) return;
-        // R18: lo escrito en un enlace moribundo pudo no llegar al PC; no se da por sincronizado
-        if (reason === 'link_closed' || reason === 'heartbeat_timeout') this.sync = new ClipboardSync(null);
         // la sesión funcionó el tiempo suficiente: se reintenta enseguida; si cae al poco, se espera
         if (reconnectDelayMs(wasReady, readyForMs, RECONNECT_INTERVAL_MS) === 0) continue;
       }
@@ -255,16 +294,25 @@ export class ConnectionManager {
     }
   }
 
-  /** WiFi por mDNS y, si no, USB por 127.0.0.1. */
+  /**
+   * WiFi (la última dirección que funcionó y después todas las resueltas por mDNS) y, si no,
+   * USB por 127.0.0.1. Cada intento tiene su propio plazo de CONNECT_TIMEOUT_MS.
+   */
   private async connectOnce(gen: number): Promise<{ link: Link; transport: Transport } | null> {
-    const pc = await discoverPc(CONNECT_TIMEOUT_MS);
+    if (this.lastPc === undefined) this.lastPc = loadSettings().lastPc;
+    const last = this.lastPc;
+    // con una dirección guardada no se espera a mDNS: se prueba ya y, si no, lo resuelto
+    const resolved = await resolvedPcs(last ? 0 : CONNECT_TIMEOUT_MS);
     if (gen !== this.generation) return null;
-    if (pc) {
+    for (const pc of connectCandidates(last, resolved)) {
       this.update({ status: 'connecting' });
       try {
-        return { link: await connectTcp(pc.host, pc.port, CONNECT_TIMEOUT_MS), transport: 'wifi' };
+        const link = await connectTcp(pc.host, pc.port, CONNECT_TIMEOUT_MS);
+        if (gen !== this.generation) return { link, transport: 'wifi' }; // el bucle lo cierra
+        this.rememberPc(pc);
+        return { link, transport: 'wifi' };
       } catch {
-        // se prueba el USB
+        // la siguiente
       }
       if (gen !== this.generation) return null;
     }
@@ -275,15 +323,21 @@ export class ConnectionManager {
     }
   }
 
+  private rememberPc(pc: PcAddress): void {
+    const last = this.lastPc;
+    if (last && last.host === pc.host && last.port === pc.port) return;
+    this.lastPc = pc;
+    updateSettings({ lastPc: pc });
+  }
+
   private runSession(link: Link, transport: Transport, gen: number): Promise<{ reason: string; wasReady: boolean; readyForMs: number }> {
     return new Promise((resolve) => {
       let wasReady = false;
       let readyAt = 0;
-      this.startClip = null;
       const session = new Session(link, {
         role: 'client',
         self: this.selfInfo(),
-        clipSyncFor: () => this.sync,
+        clipSyncFor: () => this.sync().current,
         getLocalClip: () => this.localClipForStart(),
         openSink,
         newTransferId: () => toHex(Crypto.getRandomBytes(16)),
@@ -297,10 +351,11 @@ export class ConnectionManager {
         wasReady = true;
         readyAt = Date.now();
         this.ready = true;
-        const sent = this.startClip;
-        this.startClip = null;
         this.update({ status: 'connected', transport, peerName: peer.deviceName });
-        if (sent !== null) this.addTextOnce('out', sent);
+      });
+      // solo lo que la Session envió de verdad en la regla de inicio (M4)
+      session.on('startClipSent', (text) => {
+        if (gen === this.generation) this.addTextOnce('out', text);
       });
       session.on('clip', (text) => {
         if (gen !== this.generation) return;
@@ -314,6 +369,8 @@ export class ConnectionManager {
           this.session = null;
           this.ready = false;
         }
+        // tras cualquier cierre se parte del último hash confirmado (R29)
+        this.sync().renew();
         resolve({ reason, wasReady, readyForMs: wasReady ? Date.now() - readyAt : 0 });
       });
 
@@ -327,9 +384,8 @@ export class ConnectionManager {
   private async localClipForStart(): Promise<string | null> {
     const text = await readClipboard();
     if (text === null) return null;
-    const decision = this.sync.check(text);
-    if (decision === 'too_large') this.setError(CLIP_TOO_LARGE);
-    this.startClip = decision === 'send' ? text : null;
+    // la misma decisión que tomará la Session (también si el JSON no cabe)
+    if (decideClip(this.sync().current, text) === 'too_large') this.setError(CLIP_TOO_LARGE);
     return text;
   }
 
@@ -358,6 +414,7 @@ export class ConnectionManager {
       // las completadas pasan al historial, como en el PC
       this.update({ transfers: this.state.transfers.filter((t) => t.transferId !== u.transferId) });
       this.addHistory({ kind: 'file', direction: u.direction, fileName: u.name, location: u.location });
+      this.applyBackground(); // al terminar lo pendiente en segundo plano, ahora sí se pausa (I1)
       return;
     }
     const i = this.state.transfers.findIndex((t) => t.transferId === u.transferId);
@@ -374,9 +431,18 @@ export class ConnectionManager {
       });
     }
     this.update({ transfers });
+    if (isFinished(u)) this.applyBackground();
   }
 
   // --- utilidades ---
+
+  private sync(): SyncKeeper {
+    this.keeper ??= new SyncKeeper({
+      load: () => loadSettings().lastSyncedHash,
+      save: (hash) => updateSettings({ lastSyncedHash: hash }),
+    });
+    return this.keeper;
+  }
 
   private readySession(): Session | null {
     return this.ready && this.session ? this.session : null;

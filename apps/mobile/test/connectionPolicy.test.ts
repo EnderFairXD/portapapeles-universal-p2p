@@ -1,8 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
+import type { TransferUpdate } from '@clipsync/protocol';
+
 import {
+  backgroundDecision,
   classifySendError,
   createPauseCheck,
+  hasPendingWork,
   localSendOutcome,
   NO_CONNECTION_MESSAGE,
   reconnectDelayMs,
@@ -128,5 +132,46 @@ describe('createPauseCheck', () => {
     expect(h.env.paused).toBe(0);
     h.advance(400);
     expect(h.env.paused).toBe(1);
+  });
+});
+
+describe('backgroundDecision (I1)', () => {
+  const base = { appState: 'background', pickerOpen: false, busy: false };
+
+  it('en segundo plano sin nada pendiente: pausa', () => {
+    expect(backgroundDecision(base)).toBe('pause');
+  });
+
+  it('con transferencias o un compartir pendiente: solo para el vigilante del portapapeles', () => {
+    expect(backgroundDecision({ ...base, busy: true })).toBe('watcher_only');
+  });
+
+  it('con un selector abierto no hace nada (lo decide la comprobación tras el selector)', () => {
+    expect(backgroundDecision({ ...base, pickerOpen: true })).toBe('none');
+    expect(backgroundDecision({ ...base, pickerOpen: true, busy: true })).toBe('none');
+  });
+
+  it('en primer plano no hace nada: al terminar lo pendiente con la app activa no se pausa', () => {
+    expect(backgroundDecision({ ...base, appState: 'active' })).toBe('none');
+    expect(backgroundDecision({ ...base, appState: 'inactive' })).toBe('none');
+  });
+});
+
+describe('hasPendingWork', () => {
+  const t = (state: TransferUpdate['state']): TransferUpdate => ({
+    transferId: state,
+    direction: 'in',
+    name: 'a',
+    size: 1,
+    bytes: 0,
+    state,
+  });
+
+  it('cuenta las transferencias en cola o activas y el compartir pendiente', () => {
+    expect(hasPendingWork([], false)).toBe(false);
+    expect(hasPendingWork([t('failed'), t('cancelled'), t('done')], false)).toBe(false);
+    expect(hasPendingWork([t('queued')], false)).toBe(true);
+    expect(hasPendingWork([t('failed'), t('active')], false)).toBe(true);
+    expect(hasPendingWork([], true)).toBe(true);
   });
 });

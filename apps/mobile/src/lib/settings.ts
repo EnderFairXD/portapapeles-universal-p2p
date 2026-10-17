@@ -2,12 +2,18 @@
 import * as Crypto from 'expo-crypto';
 import { File, Paths } from 'expo-file-system';
 
+import { parseLastPc, type PcAddress } from './pcAddress';
+
 export interface Settings {
   /** Carpeta SAF elegida para guardar los archivos recibidos. */
   receiveDirUri: string | null;
+  /** SHA-256 del último texto que consta que el PC tiene (R29). */
+  lastSyncedHash: string | null;
+  /** Última dirección WiFi del PC con la que se conectó. */
+  lastPc: PcAddress | null;
 }
 
-const DEFAULTS: Settings = { receiveDirUri: null };
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 function readJson(name: string): Record<string, unknown> | null {
   try {
@@ -29,12 +35,23 @@ function writeJson(name: string, value: unknown): void {
 export function loadSettings(): Settings {
   const raw = readJson('settings.json');
   return {
-    receiveDirUri: typeof raw?.receiveDirUri === 'string' ? raw.receiveDirUri : DEFAULTS.receiveDirUri,
+    receiveDirUri: typeof raw?.receiveDirUri === 'string' ? raw.receiveDirUri : null,
+    lastSyncedHash: typeof raw?.lastSyncedHash === 'string' && SHA256_HEX.test(raw.lastSyncedHash) ? raw.lastSyncedHash : null,
+    lastPc: parseLastPc(raw?.lastPc),
   };
 }
 
 export function saveSettings(s: Settings): void {
-  writeJson('settings.json', { receiveDirUri: s.receiveDirUri });
+  writeJson('settings.json', { receiveDirUri: s.receiveDirUri, lastSyncedHash: s.lastSyncedHash, lastPc: s.lastPc });
+}
+
+/** Cambia solo esos campos; un fallo al escribir se ignora (vale para esta ejecución). */
+export function updateSettings(patch: Partial<Settings>): void {
+  try {
+    saveSettings({ ...loadSettings(), ...patch });
+  } catch {
+    // sin persistir
+  }
 }
 
 let deviceId: string | null = null;

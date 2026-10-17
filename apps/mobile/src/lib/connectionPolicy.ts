@@ -1,4 +1,5 @@
 // Decisiones puras de ConnectionManager (sin React Native), para poder probarlas.
+import type { TransferUpdate } from '@clipsync/protocol';
 
 /** Una sesión que duró menos que esto antes de caer no cuenta como estable. */
 export const STABLE_SESSION_MS = 5000;
@@ -77,4 +78,24 @@ export function createPauseCheck(deps: PauseCheckDeps): { schedule(): void; canc
     },
     cancel,
   };
+}
+
+// --- segundo plano con trabajo pendiente (I1) ---
+
+/** Hay algo que no debe cortarse: archivos en cola o en curso, o un compartir sin enviar. */
+export function hasPendingWork(transfers: readonly TransferUpdate[], sharePending: boolean): boolean {
+  return sharePending || transfers.some((t) => t.state === 'queued' || t.state === 'active');
+}
+
+export type BackgroundDecision = 'pause' | 'watcher_only' | 'none';
+
+/**
+ * Qué hacer al pasar a segundo plano, al cerrarse un selector o al terminar lo pendiente:
+ * con trabajo pendiente solo se para el vigilante del portapapeles y la pausa espera a que
+ * acabe (la conexión dura lo que Android permita, spec §9). Con un selector abierto no se
+ * hace nada: lo decide la comprobación diferida de `createPauseCheck` (R26).
+ */
+export function backgroundDecision(s: { appState: string; pickerOpen: boolean; busy: boolean }): BackgroundDecision {
+  if (s.appState !== 'background' || s.pickerOpen) return 'none';
+  return s.busy ? 'watcher_only' : 'pause';
 }
