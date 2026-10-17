@@ -56,6 +56,8 @@ pub struct HubConfig {
 /// Mayor entero que JS representa sin pérdida: el tamaño de un archivo no puede pasar de aquí.
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const FILE_MIME: &str = "application/octet-stream";
+/// Conexiones a la vez que aún no han enviado su hello (pares desconocidos de la LAN).
+const MAX_PRE_HELLO_SESSIONS: usize = 8;
 
 #[derive(Clone)]
 pub struct Hub {
@@ -237,14 +239,24 @@ impl Hub {
     }
 
     /// Lanza una sesión sobre el flujo. Debe llamarse dentro de un runtime de tokio.
+    /// Con `MAX_PRE_HELLO_SESSIONS` sesiones aún sin hello, el flujo se cierra al momento.
     pub fn accept_stream<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         &self,
         stream: S,
         transport: Transport,
     ) {
+        let mut st = lock(&self.inner.state);
+        let sin_saludo = st
+            .sessions
+            .values()
+            .filter(|e| e.device_id.is_none())
+            .count();
+        if sin_saludo >= MAX_PRE_HELLO_SESSIONS {
+            return; // `stream` se suelta aquí: la conexión se cierra
+        }
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::unbounded_channel();
-        lock(&self.inner.state).sessions.insert(
+        st.sessions.insert(
             id,
             Entry {
                 commands: tx,
@@ -253,6 +265,7 @@ impl Hub {
                 peer: None,
             },
         );
+        drop(st);
         let config = &self.inner.config;
         let cfg = SessionConfig {
             id,

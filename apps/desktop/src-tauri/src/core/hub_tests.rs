@@ -163,7 +163,7 @@ fn over<S: AsyncRead + AsyncWrite + Send + 'static>(s: S) -> Client<WriteHalf<S>
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         let mut frames = FramedRead::new(r, frame_codec());
-        let mut dec = MessageDecoder::new();
+        let mut dec = MessageDecoder::default();
         while let Some(Ok(f)) = frames.next().await {
             match dec.push(&f) {
                 Ok(Some(d)) => {
@@ -1369,4 +1369,116 @@ async fn sesion_vieja_que_cae_tarde_no_borra_la_sincronia_de_la_nueva() {
         Vec::<Vec<String>>::from([vec![]])
     );
     s.no_events();
+}
+
+// --- pares hostiles en la LAN (M2) ---
+
+#[tokio::test]
+async fn como_mucho_8_sesiones_sin_saludo_y_la_novena_se_cierra() {
+    let mut s = setup(None);
+    let mut sin_saludo: Vec<_> = (0..8).map(|_| connect(&s.hub)).collect();
+    let mut novena = connect(&s.hub);
+    novena.closed().await;
+    // las 8 siguen abiertas: una saluda con normalidad
+    sin_saludo[0].hello("m1", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    // ya saludó: deja hueco para otra conexión nueva
+    let mut otra = connect(&s.hub);
+    otra.hello("m2", Some(false)).await;
+    assert_eq!(
+        js(&timeout(WAIT, s.events.recv()).await.unwrap().unwrap())["type"],
+        "peerConnected"
+    );
+    assert!(
+        sin_saludo[1].rx.try_recv().is_err(),
+        "las demás siguen esperando"
+    );
+}
+
+#[tokio::test]
+async fn al_cerrarse_una_sesion_sin_saludo_queda_su_hueco() {
+    let mut s = setup(None);
+    let mut sin_saludo: Vec<_> = (0..8).map(|_| connect(&s.hub)).collect();
+    // un mensaje antes del hello la cierra y libera su hueco
+    sin_saludo[0].send(clip("hola")).await;
+    sin_saludo[0].closed().await;
+    // el Hub quita la sesión al recibir su Closed: se reintenta hasta que haya hueco
+    let _nueva = timeout(WAIT, async {
+        loop {
+            let mut c = connect(&s.hub);
+            c.send(hello("m1", Some(false))).await;
+            if let Some(Decoded::Control(m)) = c.recv().await {
+                assert_eq!(m, server_hello());
+                return c;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("no se liberó el hueco");
+    let e = s.event().await;
+    assert_eq!(
+        (e["type"].as_str(), e["deviceId"].as_str()),
+        (Some("peerConnected"), Some("m1"))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn sin_hello_en_30_s_se_cierra_aunque_haya_trafico() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    // fragmentos 0x03 de un byte: mantienen vivo el latido pero nunca completan el hello
+    for _ in 0..4 {
+        c.w.send(Bytes::from_static(&[0x03, b' '])).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(9)).await;
+    }
+    c.closed().await;
+    s.no_events();
+}
+
+#[tokio::test]
+async fn antes_del_hello_un_mensaje_de_mas_de_64_kib_se_rechaza() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    // un hello válido, pero de más de 64 KiB reensamblados
+    let mut grande = hello("m1", Some(false));
+    if let ControlMessage::Hello { device_name, .. } = &mut grande {
+        *device_name = "x".repeat(70_000);
+    }
+    c.send(grande).await;
+    c.closed().await;
+    s.no_events();
+}
+
+#[tokio::test]
+async fn tras_el_hello_un_mensaje_de_mas_de_64_kib_si_vale() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    c.hello("m1", Some(false)).await;
+    s.event().await;
+    let texto = "y".repeat(500_000);
+    c.send(clip(&texto)).await;
+    let e = s.event().await;
+    assert_eq!(e["type"], "clipReceived");
+    assert_eq!(e["text"].as_str().map(str::len), Some(500_000));
+}
+
+#[tokio::test]
+async fn nombre_de_archivo_entrante_se_recorta_a_255_caracteres() {
+    let mut s = setup(None);
+    let mut c = connect(&s.hub);
+    c.hello("m1", Some(false)).await;
+    s.event().await;
+    let data = datos(10);
+    let nombre = format!("{}.txt", "é".repeat(1000));
+    enviar_archivo(&mut c, &nombre, &data, &sha(&data)).await;
+    let v = s.transfer_until_end().await;
+    for e in &v {
+        let name = e["name"].as_str().unwrap();
+        assert_eq!(name.chars().count(), 255, "{e}");
+        assert!(name.chars().all(|ch| ch == 'é'));
+    }
+    assert_eq!(v.last().unwrap()["state"], "done");
+    // el archivo se guarda con el nombre saneado de siempre
+    assert_eq!(s.files().len(), 1);
 }
