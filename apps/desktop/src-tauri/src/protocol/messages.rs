@@ -256,14 +256,30 @@ pub fn encode_file_data(transfer_id: &[u8; 16], bytes: &[u8]) -> Vec<u8> {
 }
 
 /// Decodifica payloads de trama de uno en uno; devuelve `None` mientras falten fragmentos.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MessageDecoder {
     pending: Vec<u8>,
+    /// tope del mensaje de control reensamblado
+    max_control: usize,
+}
+
+impl Default for MessageDecoder {
+    fn default() -> Self {
+        Self::with_max_control_bytes(MAX_CONTROL_BYTES)
+    }
 }
 
 impl MessageDecoder {
-    pub fn new() -> Self {
-        Self::default()
+    /// Con otro tope (como mucho `MAX_CONTROL_BYTES`), p. ej. más bajo antes del hello.
+    pub fn with_max_control_bytes(max: usize) -> Self {
+        Self {
+            pending: Vec::new(),
+            max_control: max.min(MAX_CONTROL_BYTES),
+        }
+    }
+
+    pub fn set_max_control_bytes(&mut self, max: usize) {
+        self.max_control = max.min(MAX_CONTROL_BYTES);
     }
 
     pub fn push(&mut self, payload: &[u8]) -> Result<Option<Decoded>, ProtocolError> {
@@ -297,8 +313,8 @@ impl MessageDecoder {
                 if type_byte == TYPE_CONTROL_MORE && body.is_empty() {
                     return fail("fragmento de control vacío");
                 }
-                if self.pending.len() + body.len() > MAX_CONTROL_BYTES {
-                    return fail(format!("mensaje de control de más de {MAX_CONTROL_BYTES} bytes"));
+                if self.pending.len() + body.len() > self.max_control {
+                    return fail(format!("mensaje de control de más de {} bytes", self.max_control));
                 }
                 self.pending.extend_from_slice(body);
                 if type_byte == TYPE_CONTROL_MORE {
@@ -335,7 +351,7 @@ mod tests {
 
     /// Decodifica todas las tramas y devuelve los mensajes completos que salgan.
     fn decode_all(frames: &[Vec<u8>]) -> Result<Vec<Decoded>, ProtocolError> {
-        let mut d = MessageDecoder::new();
+        let mut d = MessageDecoder::default();
         let mut out = Vec::new();
         for f in frames {
             if let Some(m) = d.push(f)? {
@@ -366,7 +382,7 @@ mod tests {
                 .collect();
             let expect = &v["expect"];
 
-            let mut d = MessageDecoder::new();
+            let mut d = MessageDecoder::default();
             let results: Vec<Result<Option<Decoded>, ProtocolError>> =
                 frames.iter().map(|f| d.push(f)).collect();
 
@@ -453,7 +469,7 @@ mod tests {
 
     #[test]
     fn reensamblado_de_mas_de_2_mib_es_error() {
-        let mut d = MessageDecoder::new();
+        let mut d = MessageDecoder::default();
         let mut frame = vec![0x61u8; 65535];
         frame[0] = 0x03; // 65534 bytes de contenido
         let mut n = 0;
@@ -471,7 +487,7 @@ mod tests {
 
     #[test]
     fn tras_un_error_el_decoder_queda_limpio() {
-        let mut d = MessageDecoder::new();
+        let mut d = MessageDecoder::default();
         assert_eq!(d.push(&[0x03, 0x7b]), Ok(None));
         assert!(d.push(&[0x07]).is_err());
         let ping = &encode_control(&ControlMessage::Ping).unwrap()[0];
@@ -480,7 +496,7 @@ mod tests {
 
     #[test]
     fn datos_con_fragmentos_pendientes_son_error_y_descartan_lo_pendiente() {
-        let mut d = MessageDecoder::new();
+        let mut d = MessageDecoder::default();
         assert_eq!(d.push(&[0x03, 0x7b]), Ok(None));
         let data = encode_file_data(&tid_bytes(), &[1]);
         assert!(d.push(&data).is_err());
@@ -490,12 +506,23 @@ mod tests {
 
     #[test]
     fn fragmento_0x03_vacio_es_error() {
-        assert!(MessageDecoder::new().push(&[0x03]).is_err());
+        assert!(MessageDecoder::default().push(&[0x03]).is_err());
+    }
+
+    #[test]
+    fn tope_configurable_del_mensaje_reensamblado() {
+        let mut d = MessageDecoder::with_max_control_bytes(10);
+        assert!(d.push(&[0x03, b'1', b'2', b'3', b'4', b'5']).unwrap().is_none());
+        assert!(d.push(&[0x03, b'6', b'7', b'8', b'9', b'0', b'1']).is_err());
+        // nunca por encima del máximo del protocolo
+        let mut d = MessageDecoder::with_max_control_bytes(usize::MAX);
+        d.set_max_control_bytes(usize::MAX);
+        assert_eq!(d.max_control, MAX_CONTROL_BYTES);
     }
 
     #[test]
     fn campos_desconocidos_se_ignoran_y_los_opcionales_mal_tipados_fallan() {
-        let mut d = MessageDecoder::new();
+        let mut d = MessageDecoder::default();
         let mut frame = vec![0x01];
         frame.extend_from_slice(br#"{"kind":"ping","extra":1}"#);
         assert_eq!(d.push(&frame), Ok(Some(Decoded::Control(ControlMessage::Ping))));
@@ -507,7 +534,7 @@ mod tests {
 
     #[test]
     fn enteros_validos_como_en_ts() {
-        let mut d = MessageDecoder::new();
+        let mut d = MessageDecoder::default();
         let mk = |size: &str| {
             let mut f = vec![0x01];
             f.extend_from_slice(
@@ -577,11 +604,11 @@ mod tests {
     fn datos_de_archivo_acepta_49152_bytes_y_el_decoder_rechaza_49153() {
         let ok = encode_file_data(&tid_bytes(), &vec![0u8; FILE_CHUNK_BYTES]);
         assert_eq!(ok.len(), 1 + 16 + FILE_CHUNK_BYTES);
-        assert!(matches!(MessageDecoder::new().push(&ok), Ok(Some(_))));
+        assert!(matches!(MessageDecoder::default().push(&ok), Ok(Some(_))));
 
         let mut big = vec![0u8; 1 + 16 + FILE_CHUNK_BYTES + 1];
         big[0] = 0x02;
-        assert!(MessageDecoder::new().push(&big).is_err());
+        assert!(MessageDecoder::default().push(&big).is_err());
     }
 
     #[test]

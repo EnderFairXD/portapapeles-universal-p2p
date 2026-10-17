@@ -21,7 +21,8 @@ use super::files::FileReceiver;
 use crate::protocol::{
     encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder,
     FILE_ACK_EVERY_BYTES, FILE_CHUNK_BYTES, FILE_WINDOW_BYTES, HEARTBEAT_INTERVAL_MS,
-    HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES, PROTOCOL_VERSION,
+    HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES, MAX_CONTROL_BYTES, MAX_PRE_HELLO_CONTROL_BYTES,
+    PROTOCOL_VERSION,
 };
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
@@ -125,6 +126,8 @@ pub(super) fn new_id() -> (String, [u8; 16]) {
 /// Límites de lo que el móvil envía en su hello y se guarda en memoria.
 const MAX_DEVICE_ID_BYTES: usize = 128;
 const MAX_DEVICE_NAME_CHARS: usize = 64;
+/// Nombre de un archivo entrante que se muestra y viaja en los eventos.
+const MAX_FILE_NAME_CHARS: usize = 255;
 
 const PROTOCOL_ERROR: &str = "protocol_error";
 const INTERNAL_ERROR: &str = "internal_error";
@@ -281,12 +284,14 @@ pub(super) async fn run<S>(
         host,
         writer: FramedWrite::new(w, frame_codec()),
         commands,
-        decoder: MessageDecoder::new(),
+        // hasta el hello, un par desconocido no puede hacer reservar más de 64 KiB
+        decoder: MessageDecoder::with_max_control_bytes(MAX_PRE_HELLO_CONTROL_BYTES),
         closed: false,
         hello_received: false,
         ready: false,
         sync: Arc::new(Mutex::new(ClipboardSync::new(None))),
         last_rx: Instant::now(),
+        started: Instant::now(),
         out_queue: VecDeque::new(),
         out: None,
         inc: None,
@@ -335,6 +340,8 @@ struct Session<W> {
     /// ClipboardSync del dispositivo (compartido entre sus sesiones); provisional hasta el hello
     sync: Arc<Mutex<ClipboardSync>>,
     last_rx: Instant,
+    /// el hello debe llegar en `HEARTBEAT_TIMEOUT_MS` aunque haya tráfico
+    started: Instant,
     out_queue: VecDeque<OutTransfer>,
     out: Option<OutTransfer>,
     inc: Option<InTransfer>,
@@ -417,8 +424,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     async fn tick(&mut self) {
-        if Instant::now().duration_since(self.last_rx)
-            >= Duration::from_millis(HEARTBEAT_TIMEOUT_MS)
+        let timeout = Duration::from_millis(HEARTBEAT_TIMEOUT_MS);
+        let now = Instant::now();
+        // sin hello a tiempo: no ocupa un hueco de sesión sin saludo para siempre
+        if now.duration_since(self.last_rx) >= timeout
+            || (!self.hello_received && now.duration_since(self.started) >= timeout)
         {
             self.close(HEARTBEAT_TIMEOUT);
         } else if self.ready {
@@ -509,6 +519,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 return Err(PROTOCOL_ERROR);
             };
             self.hello_received = true;
+            self.decoder.set_max_control_bytes(MAX_CONTROL_BYTES);
             if device_id.len() > MAX_DEVICE_ID_BYTES {
                 return Err(PROTOCOL_ERROR);
             }
@@ -786,9 +797,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if self.inc.is_some() || self.ended_in.contains(&id) {
             return Err(PROTOCOL_ERROR);
         }
+        // recortado para mostrarlo; el archivo se guarda con el nombre saneado de siempre
+        let shown = truncate_chars(name.clone(), MAX_FILE_NAME_CHARS);
         self.inc = Some(InTransfer {
             id,
-            name: name.clone(),
+            name: shown,
             size,
             received: 0,
             sink: Sink::Pending,
