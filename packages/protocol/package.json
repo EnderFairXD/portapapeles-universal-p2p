@@ -13,9 +13,12 @@
   ],
   "scripts": {
     "test": "vitest run -c vitest.config.ts",
-    "test:e2e": "vitest run -c vitest.e2e.config.ts"
+    "test:e2e": "vitest run -c vitest.e2e.config.ts",
+    "bench": "vitest bench --run --reporter verbose"
   },
   "dependencies": {
+    "@noble/ciphers": "^2.4.0",
+    "@noble/curves": "^2.4.0",
     "@noble/hashes": "^2.4.0"
   },
   "devDependencies": {
