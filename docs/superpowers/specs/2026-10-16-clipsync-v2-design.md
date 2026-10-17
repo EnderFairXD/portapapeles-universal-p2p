@@ -153,6 +153,16 @@ a la vez por sesión; los siguientes esperan en cola.
 - **Al empezar una sesión**, cada lado envía su portapapeles actual si difiere de
   `lastSyncedHash`. Si los dos cambiaron, gana el del móvil (quien acaba de abrir la app
   quiere enviar). El texto del PC no se pierde: queda en el historial del PC.
+- **Tentativo y confirmado** (R29). Un texto recibido queda confirmado al momento. Uno
+  enviado solo evita el rebote: es tentativo hasta que llega el `pong` del `ping` que la
+  sesión manda justo detrás. Como el PC procesa los mensajes en orden, ese `pong` prueba
+  que leyó el clip. Antes de enviar o comparar un texto, sus sustitutos UTF-16 sueltos
+  se cambian por U+FFFD.
+- **Persistencia en el móvil.** El móvil guarda en `settings.json` el hash del último texto
+  confirmado y lo carga al arrancar. Tras cualquier cierre de sesión (también al ir a
+  segundo plano o por un cierre anómalo) parte de ese hash, nunca de cero. Así un texto
+  enviado sin confirmar se vuelve a anunciar, y el móvil solo gana la regla de inicio si
+  de verdad cambió su portapapeles.
 
 ## 4. Selección de medio (móvil)
 
