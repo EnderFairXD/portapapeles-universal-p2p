@@ -4,6 +4,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { Directory, File, FileMode } from 'expo-file-system';
 
 import { sanitizeFileName } from './fileName';
+import { createPickerGuard } from './pickerGuard';
 import { loadSettings, saveSettings } from './settings';
 
 /** Techo de cordura para lo que se envía desde el móvil. */
@@ -26,22 +27,38 @@ export class NoReceiveDirError extends Error {
 
 // --- selectores del sistema ---
 
-let pickersOpen = 0;
+const pickers = createPickerGuard();
+const settledListeners = new Set<() => void>();
 
 /**
  * true mientras hay un selector del sistema abierto: la app pasa a segundo plano, pero la
  * conexión no debe cortarse por ello.
  */
 export function isPickerOpen(): boolean {
-  return pickersOpen > 0;
+  return pickers.isOpen();
+}
+
+/** Olvida los selectores abiertos: al volver la app a primer plano ninguno puede seguir vivo. */
+export function resetPickers(): void {
+  pickers.reset();
+}
+
+/** Avisa cada vez que un selector termina (con éxito, cancelado o con error). */
+export function onPickerSettled(cb: () => void): () => void {
+  settledListeners.add(cb);
+  return () => {
+    settledListeners.delete(cb);
+  };
 }
 
 async function withPicker<T>(fn: () => Promise<T>): Promise<T> {
-  pickersOpen += 1;
+  const token = pickers.enter();
   try {
     return await fn();
   } finally {
-    pickersOpen -= 1;
+    pickers.leave(token);
+    // si el usuario salió a Inicio con el selector abierto, ahora toca pausar la conexión
+    for (const cb of [...settledListeners]) cb();
   }
 }
 
@@ -51,10 +68,28 @@ function positive(n: number | null | undefined): n is number {
   return typeof n === 'number' && Number.isSafeInteger(n) && n > 0;
 }
 
+/** No se pudo averiguar el tamaño (y el archivo no está vacío): enviarlo acabaría en size_mismatch. */
+export class UnknownFileSizeError extends Error {
+  constructor() {
+    super('No se pudo leer el tamaño del archivo');
+    this.name = 'UnknownFileSizeError';
+  }
+}
+
+/** Sin tamaño positivo, el archivo es vacío de verdad solo si no da ni un byte. */
+function isEmpty(handle: { readBytes(length: number): Uint8Array }): boolean {
+  try {
+    return handle.readBytes(1).length === 0;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Abre `uri` para enviarlo. Los content:// pueden declarar tamaño -1/0/undefined, así que
  * se usa el del descriptor abierto o el del proveedor antes que el declarado.
- * Lanza FileTooLargeError por encima de 200 MB.
+ * Lanza FileTooLargeError por encima de 200 MB y UnknownFileSizeError si no hay un tamaño
+ * positivo y el archivo no está vacío.
  */
 export function fileSourceFromUri(uri: string, name: string, mime: string, size: number): FileSource {
   const file = new File(uri);
@@ -68,6 +103,7 @@ export function fileSourceFromUri(uri: string, name: string, mime: string, size:
       // el proveedor no da tamaño
     }
     realSize = [handle.size, providerSize, size].find(positive) ?? 0;
+    if (realSize === 0 && !isEmpty(handle)) throw new UnknownFileSizeError();
   } catch (e) {
     handle.close();
     throw e;

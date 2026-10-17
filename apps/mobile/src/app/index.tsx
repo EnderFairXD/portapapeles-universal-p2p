@@ -1,17 +1,126 @@
-import { StyleSheet, Text, View } from 'react-native';
+import { useShareIntentContext } from 'expo-share-intent';
+import { LinearGradient } from 'expo-linear-gradient';
+import { useRouter } from 'expo-router';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-// Marcador temporal: la pantalla nueva llega en la Tarea 13.
-export default function Index() {
+import { HistoryList } from '@/components/HistoryList';
+import { SettingsIcon } from '@/components/SettingsIcon';
+import { StatusCard } from '@/components/StatusCard';
+import { Toast } from '@/components/Toast';
+import { TransferList } from '@/components/TransferList';
+import { connection } from '@/lib/connection';
+import { filesLabel } from '@/lib/format';
+import { pickAndSend } from '@/lib/sendFlow';
+import { useConnection } from '@/lib/useConnection';
+import { colors, radius, TOUCH, type } from '@/theme';
+
+export default function Home() {
+  const state = useConnection();
+  const router = useRouter();
+  const insets = useSafeAreaInsets();
+  const { hasShareIntent, shareIntent } = useShareIntentContext();
+
+  const [picking, setPicking] = useState(false);
+  const [toast, setToast] = useState({ text: 'Copiado', visible: false });
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+  }, []);
+
+  const connected = state.status === 'connected';
+  const waiting = hasShareIntent && !connected ? (shareIntent.files?.length ?? 0) : 0;
+
+  const onPick = useCallback(async () => {
+    setPicking(true);
+    try {
+      await pickAndSend();
+    } finally {
+      setPicking(false);
+    }
+  }, []);
+
+  const onCopy = useCallback(async (text: string) => {
+    try {
+      await connection.copyFromHistory(text);
+      setToast({ text: 'Copiado', visible: true });
+    } catch {
+      setToast({ text: 'No se pudo copiar', visible: true });
+    }
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast((t) => ({ ...t, visible: false })), 1600);
+  }, []);
+
+  // son métodos de la clase: hay que llamarlos con `connection.`
+  const onDismissError = useCallback(() => connection.clearError(), []);
+  const onCancel = useCallback((id: string) => connection.cancelTransfer(id), []);
+
+  const disabled = !connected || picking;
+
   return (
-    <View style={styles.container}>
-      <Text style={styles.title}>ClipSync</Text>
-      <Text style={styles.subtitle}>En construcción</Text>
+    <View style={styles.screen}>
+      <LinearGradient colors={[colors.headerTop, colors.bg]} style={[styles.top, { paddingTop: insets.top + 8 }]}>
+        <View style={styles.brandRow}>
+          <Text style={styles.brand}>ClipSync</Text>
+          <Pressable
+            style={styles.iconButton}
+            onPress={() => router.push('/settings')}
+            accessibilityRole="button"
+            accessibilityLabel="Ajustes"
+          >
+            <SettingsIcon color={colors.headerMuted} />
+          </Pressable>
+        </View>
+        <View style={styles.status}>
+          <StatusCard
+            state={state}
+            notice={waiting > 0 ? `Esperando conexión para enviar ${filesLabel(waiting)}` : null}
+            onDismissError={onDismissError}
+          />
+        </View>
+      </LinearGradient>
+
+      <ScrollView
+        contentContainerStyle={[styles.content, { paddingBottom: insets.bottom + 40 }]}
+        showsVerticalScrollIndicator={false}
+      >
+        <Pressable
+          style={({ pressed }) => [styles.send, pressed && styles.sendPressed, disabled && styles.sendDisabled]}
+          onPress={onPick}
+          disabled={disabled}
+          accessibilityRole="button"
+          accessibilityState={{ disabled }}
+        >
+          <Text style={styles.sendText}>{connected ? 'Enviar archivo' : 'Abre ClipSync en el PC'}</Text>
+        </Pressable>
+
+        <TransferList transfers={state.transfers} onCancel={onCancel} />
+        <HistoryList history={state.history} onCopy={onCopy} />
+      </ScrollView>
+
+      <Toast message={toast.text} visible={toast.visible} bottom={insets.bottom + 24} />
     </View>
   );
 }
 
 const styles = StyleSheet.create({
-  container: { flex: 1, alignItems: 'center', justifyContent: 'center', backgroundColor: '#0f172a' },
-  title: { color: '#f8fafc', fontSize: 28, fontWeight: '700' },
-  subtitle: { color: '#94a3b8', fontSize: 16, marginTop: 8 },
+  screen: { flex: 1, backgroundColor: colors.bg },
+  top: { paddingHorizontal: 16, paddingBottom: 20 },
+  brandRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  brand: { ...type.brand, color: colors.text },
+  iconButton: { width: TOUCH, height: TOUCH, marginRight: -10, alignItems: 'center', justifyContent: 'center' },
+  status: { marginTop: 10 },
+  content: { paddingHorizontal: 16, paddingTop: 8 },
+  send: {
+    minHeight: 52,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderRadius: radius.md,
+    backgroundColor: colors.indigoDeep,
+  },
+  sendPressed: { backgroundColor: colors.indigo },
+  sendDisabled: { opacity: 0.45 },
+  sendText: { ...type.body, color: '#fff', fontWeight: '700' },
 });
