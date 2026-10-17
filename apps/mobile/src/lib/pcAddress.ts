@@ -16,8 +16,12 @@ export interface ResolvedService {
 
 const IPV4 = /^\d{1,3}(\.\d{1,3}){3}$/;
 
-/** Todas las direcciones de un servicio, primero las IPv4; ninguna si es de otra versión. */
-export function servicePcs(service: ResolvedService): PcAddress[] {
+/**
+ * Todas las direcciones de un servicio, primero las IPv4. Ninguna si es de otra versión o si
+ * su huella (`fp` en la TXT) no es la de nuestro PC: dos PCs en la misma red no se confunden.
+ */
+export function servicePcs(service: ResolvedService, fp: string): PcAddress[] {
+  if (service.txt?.fp !== fp) return [];
   const v = service.txt?.v;
   if (v !== undefined && v !== String(PROTOCOL_VERSION)) return [];
   if (!service.port) return [];
@@ -26,10 +30,10 @@ export function servicePcs(service: ResolvedService): PcAddress[] {
   return sorted.map((host) => ({ host, port: service.port }));
 }
 
-/** Orden de prueba: la última dirección que funcionó y después las resueltas, sin repetir. */
-export function connectCandidates(last: PcAddress | null, resolved: PcAddress[]): PcAddress[] {
+/** Orden de prueba: la última dirección que funcionó, las de mDNS y las del QR, sin repetir. */
+export function connectCandidates(last: PcAddress | null, resolved: PcAddress[], qr: PcAddress[]): PcAddress[] {
   const out: PcAddress[] = [];
-  for (const a of last ? [last, ...resolved] : resolved) {
+  for (const a of [...(last ? [last] : []), ...resolved, ...qr]) {
     if (!out.some((o) => o.host === a.host && o.port === a.port)) out.push(a);
   }
   return out;

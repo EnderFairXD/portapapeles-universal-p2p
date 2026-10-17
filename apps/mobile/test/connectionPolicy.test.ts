@@ -1,13 +1,15 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, test } from 'vitest';
 
 import type { TransferUpdate } from '@clipsync/protocol';
 
 import {
   backgroundDecision,
   classifySendError,
+  closeOutcome,
   createPauseCheck,
   hasPendingWork,
   localSendOutcome,
+  MAX_HANDSHAKE_FAILURES,
   NO_CONNECTION_MESSAGE,
   reconnectDelayMs,
   sendFailureMessage,
@@ -173,5 +175,34 @@ describe('hasPendingWork', () => {
     expect(hasPendingWork([t('queued')], false)).toBe(true);
     expect(hasPendingWork([t('failed'), t('active')], false)).toBe(true);
     expect(hasPendingWork([], true)).toBe(true);
+  });
+});
+
+// --- cierre de la sesión: reintentar o desemparejar (D8) ---
+
+describe('closeOutcome', () => {
+  const notPairedToken = 'El QR no es válido. Genera uno nuevo en el PC.';
+  const notPairedPlain = 'Este PC no te reconoce. Vuelve a emparejar.';
+  const expired = 'QR caducado. Genera uno nuevo en el PC.';
+  const unverified = 'No se pudo verificar el PC. Vuelve a emparejar.';
+
+  test('MAX_HANDSHAKE_FAILURES es 3', () => {
+    expect(MAX_HANDSHAKE_FAILURES).toBe(3);
+  });
+
+  test.each([
+    ['not_paired', { tokenSent: true, handshakeFailures: 0 }, { kind: 'unpair', message: notPairedToken }],
+    ['not_paired', { tokenSent: false, handshakeFailures: 0 }, { kind: 'unpair', message: notPairedPlain }],
+    ['pairing_expired', { tokenSent: true, handshakeFailures: 1 }, { kind: 'unpair', message: expired }],
+    ['pairing_expired', { tokenSent: false, handshakeFailures: 0 }, { kind: 'unpair', message: expired }],
+    ['handshake_failed', { tokenSent: false, handshakeFailures: 2 }, { kind: 'unpair', message: unverified }],
+    ['handshake_failed', { tokenSent: true, handshakeFailures: 5 }, { kind: 'unpair', message: unverified }],
+    ['handshake_failed', { tokenSent: false, handshakeFailures: 0 }, { kind: 'retry', handshakeFailures: 1 }],
+    ['handshake_failed', { tokenSent: true, handshakeFailures: 1 }, { kind: 'retry', handshakeFailures: 2 }],
+    ['link_closed', { tokenSent: false, handshakeFailures: 2 }, { kind: 'retry', handshakeFailures: 2 }],
+    ['heartbeat_timeout', { tokenSent: true, handshakeFailures: 0 }, { kind: 'retry', handshakeFailures: 0 }],
+    ['protocol_error', { tokenSent: false, handshakeFailures: 1 }, { kind: 'retry', handshakeFailures: 1 }],
+  ])('closeOutcome(%s, %j)', (reason, ctx, expected) => {
+    expect(closeOutcome(reason, ctx)).toEqual(expected);
   });
 });

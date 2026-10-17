@@ -20,7 +20,8 @@
       "predictiveBackGestureEnabled": false,
       "permissions": [
         "android.permission.CHANGE_WIFI_MULTICAST_STATE",
-        "android.permission.ACCESS_WIFI_STATE"
+        "android.permission.ACCESS_WIFI_STATE",
+        "android.permission.CAMERA"
       ],
       "package": "com.enderfirexd.clipsync"
     },
@@ -50,6 +51,14 @@
           "androidMultiIntentFilters": [
             "*/*"
           ]
+        }
+      ],
+      "expo-secure-store",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "ClipSync usa la cámara para escanear el código QR del PC.",
+          "recordAudioAndroid": false
         }
       ]
     ]
