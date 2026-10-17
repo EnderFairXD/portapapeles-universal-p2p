@@ -11,7 +11,7 @@ beforeEach(() => {
 });
 
 function state(over: Partial<UiState> = {}): UiState {
-  return { pcName: "pop-os", peers: [], history: [], transfers: [], clipboardError: null, clipNotice: null, ...over };
+  return { pcName: "pop-os", peers: [], history: [], transfers: [], clipboardError: null, clipNotice: null, serverError: null, ...over };
 }
 
 function peer(over: Partial<Peer> = {}): Peer {
@@ -329,6 +329,26 @@ describe("avisos", () => {
   it("sin avisos no hay nada visible", () => {
     render(root, state());
     expect(q(".notices")!.hidden).toBe(true);
+    expect(qa(".notice")).toHaveLength(0);
+  });
+
+  it("serverError muestra un aviso de error, también junto al del portapapeles", () => {
+    const serverError = "No se pudo abrir el puerto 52847: puede que otra copia de ClipSync esté abierta";
+    render(root, state({ serverError }));
+    expect(q(".notices")!.hidden).toBe(false);
+    const n = qa(".notice");
+    expect(n).toHaveLength(1);
+    expect(n[0].textContent).toContain(serverError);
+    expect(n[0].classList.contains("notice-error")).toBe(true);
+    expect(n[0].getAttribute("role")).toBe("alert");
+
+    render(root, state({ serverError, clipboardError: "No se pudo acceder al portapapeles" }));
+    const texts = qa(".notice").map((e) => e.textContent);
+    expect(texts).toHaveLength(2);
+    expect(texts.some((t) => t!.includes(serverError))).toBe(true);
+    expect(texts.some((t) => t!.includes("No se pudo acceder al portapapeles"))).toBe(true);
+
+    render(root, state());
     expect(qa(".notice")).toHaveLength(0);
   });
 

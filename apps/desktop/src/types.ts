@@ -46,4 +46,6 @@ export interface UiState {
   transfers: Transfer[];
   clipboardError?: string | null;
   clipNotice?: string | null;
+  /** El PC no pudo abrir su puerto TCP (p. ej. otra copia abierta). */
+  serverError?: string | null;
 }

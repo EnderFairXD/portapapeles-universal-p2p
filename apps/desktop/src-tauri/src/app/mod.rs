@@ -23,6 +23,9 @@ use crate::protocol::{encode_control, ControlMessage, MAX_HISTORY};
 
 pub const CLIP_TOO_LARGE_NOTICE: &str = "Texto demasiado grande para sincronizar (máx. 1 MB)";
 pub const CLIP_NOTICE_MS: u64 = 5_000;
+/// Aviso fijo si no se puede escuchar en el puerto TCP del protocolo.
+pub const SERVER_PORT_ERROR: &str =
+    "No se pudo abrir el puerto 52847: puede que otra copia de ClipSync esté abierta";
 
 /// Transferencias terminadas sin éxito que se siguen mostrando.
 pub const MAX_FINISHED_TRANSFERS: usize = 5;
@@ -61,6 +64,7 @@ pub struct UiState {
     pub transfers: Vec<TransferUpdate>,
     pub clipboard_error: Option<String>,
     pub clip_notice: Option<String>,
+    pub server_error: Option<String>,
 }
 
 /// Qué hacer con un texto nuevo del portapapeles local.
@@ -108,6 +112,7 @@ pub struct AppState {
     out_paths: HashMap<String, String>,
     clipboard_error: Option<String>,
     clip_notice_until: Option<u64>,
+    server_error: Option<String>,
     next_id: u64,
 }
 
@@ -121,6 +126,7 @@ impl AppState {
             out_paths: HashMap::new(),
             clipboard_error: None,
             clip_notice_until: None,
+            server_error: None,
             next_id: 1,
         }
     }
@@ -248,6 +254,10 @@ impl AppState {
         true
     }
 
+    pub fn set_server_error(&mut self, error: Option<String>) {
+        self.server_error = error;
+    }
+
     pub fn show_clip_notice(&mut self, now_ms: u64) {
         self.clip_notice_until = Some(now_ms.saturating_add(CLIP_NOTICE_MS));
     }
@@ -261,6 +271,7 @@ impl AppState {
             transfers: self.transfers.clone(),
             clipboard_error: self.clipboard_error.clone(),
             clip_notice: notice.then(|| CLIP_TOO_LARGE_NOTICE.to_string()),
+            server_error: self.server_error.clone(),
         }
     }
 }
@@ -325,6 +336,12 @@ impl Ctx {
         if classify_local_clip(text) == LocalClip::Send {
             self.set_local(Some(text.to_string()));
         }
+    }
+
+    /// El servidor TCP no pudo arrancar: se avisa en la interfaz (el detalle va a stderr).
+    pub fn set_server_error(&self, error: &str) {
+        lock(&self.state).set_server_error(Some(error.to_string()));
+        self.notify();
     }
 
     pub fn set_clipboard_error(&self, error: Option<String>) {
@@ -733,6 +750,18 @@ mod tests {
     }
 
     #[test]
+    fn error_del_servidor_se_muestra_en_el_estado() {
+        let mut s = st();
+        assert_eq!(s.snapshot(0).server_error, None);
+        s.set_server_error(Some(SERVER_PORT_ERROR.into()));
+        let v = serde_json::to_value(s.snapshot(0)).unwrap();
+        assert_eq!(
+            v["serverError"],
+            "No se pudo abrir el puerto 52847: puede que otra copia de ClipSync esté abierta"
+        );
+    }
+
+    #[test]
     fn clasifica_texto_local() {
         assert_eq!(classify_local_clip(""), LocalClip::Blank);
         assert_eq!(classify_local_clip(" \n\t"), LocalClip::Blank);
@@ -766,6 +795,7 @@ mod tests {
         assert!(v["history"][0]["fileName"].is_null());
         assert!(v["clipboardError"].is_null());
         assert!(v["clipNotice"].is_null());
+        assert!(v["serverError"].is_null());
         assert!(v["transfers"].as_array().unwrap().is_empty());
     }
 }

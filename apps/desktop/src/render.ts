@@ -108,6 +108,7 @@ interface View {
   statusTitle: HTMLElement;
   statusHint: HTMLElement;
   notices: HTMLElement;
+  noticeServer: HTMLElement;
   noticeError: HTMLElement;
   noticeInfo: HTMLElement;
   drop: HTMLElement;
@@ -154,6 +155,7 @@ function build(root: HTMLElement): View {
   header.append(brand, status);
 
   const notices = el("div", "notices");
+  const noticeServer = notice("error");
   const noticeError = notice("error");
   const noticeInfo = notice("info");
 
@@ -183,6 +185,7 @@ function build(root: HTMLElement): View {
     statusTitle,
     statusHint,
     notices,
+    noticeServer,
     noticeError,
     noticeInfo,
     drop,
@@ -229,6 +232,8 @@ function setNotice(host: HTMLElement, node: HTMLElement, text: string | null | u
 
 function renderNotices(view: View, state: UiState): void {
   setNotice(view.notices, view.noticeError, state.clipboardError, true);
+  // el del servidor va el primero: sin él no hay conexión posible
+  setNotice(view.notices, view.noticeServer, state.serverError, true);
   setNotice(view.notices, view.noticeInfo, state.clipNotice, false);
   view.notices.hidden = view.notices.childElementCount === 0;
 }

@@ -12,7 +12,8 @@ use tokio::sync::oneshot;
 use super::Ctx;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-const NOT_AVAILABLE: &str = "Portapapeles no disponible";
+/// Único texto que llega a la interfaz; el detalle de arboard (en inglés) solo va a stderr.
+pub const CLIPBOARD_ERROR: &str = "No se pudo acceder al portapapeles";
 
 type Reply = oneshot::Sender<Result<(), String>>;
 
@@ -55,8 +56,8 @@ impl ClipboardHandle {
                 text,
                 reply: Some(reply),
             })
-            .map_err(|_| NOT_AVAILABLE.to_string())?;
-        rx.await.map_err(|_| NOT_AVAILABLE.to_string())?
+            .map_err(|_| CLIPBOARD_ERROR.to_string())?;
+        rx.await.map_err(|_| CLIPBOARD_ERROR.to_string())?
     }
 }
 
@@ -68,7 +69,7 @@ impl ClipboardWorker {
             .spawn(move || run(self.rx, ctx2));
         if let Err(e) = r {
             log(&format!("no se pudo lanzar el hilo: {e}"));
-            ctx.set_clipboard_error(Some(format!("{NOT_AVAILABLE}: {e}")));
+            ctx.set_clipboard_error(Some(CLIPBOARD_ERROR.to_string()));
         }
     }
 }
@@ -78,11 +79,11 @@ fn run(rx: Receiver<WriteCmd>, ctx: Arc<Ctx>) {
         Ok(cb) => cb,
         Err(e) => {
             log(&format!("no se pudo abrir: {e}"));
-            ctx.set_clipboard_error(Some(format!("{NOT_AVAILABLE}: {e}")));
+            ctx.set_clipboard_error(Some(CLIPBOARD_ERROR.to_string()));
             // la app sigue para archivos; quien pida escribir recibe el error
             for cmd in rx {
                 if let Some(reply) = cmd.reply {
-                    let _ = reply.send(Err(NOT_AVAILABLE.to_string()));
+                    let _ = reply.send(Err(CLIPBOARD_ERROR.to_string()));
                 }
             }
             return;
@@ -97,10 +98,15 @@ fn run(rx: Receiver<WriteCmd>, ctx: Arc<Ctx>) {
     }
 
     let mut next_poll = Instant::now() + POLL_INTERVAL;
+    // último detalle de lectura registrado, para no repetirlo cada 500 ms
+    let mut last_read_error: Option<String> = None;
     loop {
         match rx.recv_timeout(next_poll.saturating_duration_since(Instant::now())) {
             Ok(WriteCmd { text, reply }) => {
-                let r = cb.set_text(text.clone()).map_err(|e| e.to_string());
+                let r = cb.set_text(text.clone()).map_err(|e| {
+                    log(&format!("no se pudo escribir: {e}"));
+                    CLIPBOARD_ERROR.to_string()
+                });
                 if r.is_ok() {
                     // así el sondeo no lo toma por un cambio y no se reenvía
                     last = Some(text.clone());
@@ -110,12 +116,11 @@ fn run(rx: Receiver<WriteCmd>, ctx: Arc<Ctx>) {
                     (Some(reply), r) => {
                         let _ = reply.send(r);
                     }
-                    (None, Err(e)) => log(&format!("no se pudo escribir: {e}")),
-                    (None, Ok(())) => {}
+                    (None, _) => {}
                 }
             }
             Err(RecvTimeoutError::Timeout) => {
-                poll(&mut cb, &mut last, &ctx);
+                poll(&mut cb, &mut last, &mut last_read_error, &ctx);
                 next_poll = Instant::now() + POLL_INTERVAL;
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -123,9 +128,10 @@ fn run(rx: Receiver<WriteCmd>, ctx: Arc<Ctx>) {
     }
 }
 
-fn poll(cb: &mut Clipboard, last: &mut Option<String>, ctx: &Ctx) {
+fn poll(cb: &mut Clipboard, last: &mut Option<String>, last_error: &mut Option<String>, ctx: &Ctx) {
     match cb.get_text() {
         Ok(text) => {
+            *last_error = None;
             ctx.set_clipboard_error(None);
             if last.as_deref() != Some(text.as_str()) {
                 *last = Some(text.clone());
@@ -133,7 +139,17 @@ fn poll(cb: &mut Clipboard, last: &mut Option<String>, ctx: &Ctx) {
             }
         }
         // no hay texto (imagen, vacío): no es un error ni un cambio
-        Err(arboard::Error::ContentNotAvailable) => ctx.set_clipboard_error(None),
-        Err(e) => ctx.set_clipboard_error(Some(format!("No se puede leer el portapapeles: {e}"))),
+        Err(arboard::Error::ContentNotAvailable) => {
+            *last_error = None;
+            ctx.set_clipboard_error(None)
+        }
+        Err(e) => {
+            let detail = e.to_string();
+            if last_error.as_deref() != Some(detail.as_str()) {
+                log(&format!("no se pudo leer: {detail}"));
+                *last_error = Some(detail);
+            }
+            ctx.set_clipboard_error(Some(CLIPBOARD_ERROR.to_string()));
+        }
     }
 }

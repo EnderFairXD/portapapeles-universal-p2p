@@ -9,9 +9,18 @@ import { render } from "./render";
 import type { UiState } from "./types";
 
 const NO_PEER_TEXT = "Conecta el móvil para enviar";
+const CLIPBOARD_TEXT = "No se pudo acceder al portapapeles";
 
 /** Estado inicial: la ventana se ve completa aunque el backend aún no haya contestado. */
-const EMPTY_STATE: UiState = { pcName: "", peers: [], history: [], transfers: [], clipboardError: null, clipNotice: null };
+const EMPTY_STATE: UiState = {
+  pcName: "",
+  peers: [],
+  history: [],
+  transfers: [],
+  clipboardError: null,
+  clipNotice: null,
+  serverError: null,
+};
 
 const app = document.getElementById("app")!;
 const toastEl = document.getElementById("toast")!;
@@ -30,12 +39,20 @@ function toast(message: string): void {
   toastTimer = window.setTimeout(() => toastEl.classList.remove("show"), 1800);
 }
 
-/** Los errores de `send_files` llegan como código; el resto (arboard, etc.) ya viene en texto. */
-function errorMessage(e: unknown): string {
+/** Textos para el usuario de los códigos que devuelven los comandos. */
+const COMMAND_ERROR = new Map([
+  ["no_peer", NO_PEER_TEXT],
+  ["read_error", "No se pudo leer el archivo"],
+  [CLIPBOARD_TEXT, CLIPBOARD_TEXT],
+]);
+
+/** Un error desconocido (p. ej. en inglés, de arboard o del sistema) solo va a la consola. */
+function errorMessage(e: unknown, fallback: string): string {
   const code = e instanceof Error ? e.message : String(e);
-  if (code === "no_peer") return NO_PEER_TEXT;
-  if (code === "read_error") return "No se pudo leer el archivo";
-  return code;
+  const known = COMMAND_ERROR.get(code);
+  if (known) return known;
+  console.error("ClipSync:", e);
+  return fallback;
 }
 
 async function sendFiles(paths: string[]): Promise<void> {
@@ -47,7 +64,7 @@ async function sendFiles(paths: string[]): Promise<void> {
   try {
     await invoke("send_files", { paths });
   } catch (e) {
-    toast(errorMessage(e));
+    toast(errorMessage(e, "No se pudo enviar el archivo"));
   }
 }
 
@@ -56,6 +73,14 @@ async function pickFiles(): Promise<void> {
   const paths = picked == null ? [] : Array.isArray(picked) ? picked : [picked];
   await sendFiles(paths);
 }
+
+/** Aviso si falla una acción sin un código conocido. */
+const ACTION_FALLBACK = new Map([
+  ["pick-files", "No se pudo abrir el selector de archivos"],
+  ["cancel", "No se pudo cancelar"],
+  ["copy", CLIPBOARD_TEXT],
+  ["reveal", "No se pudo abrir la carpeta"],
+]);
 
 async function onAction(action: string, el: HTMLElement): Promise<void> {
   const item = state.history.find((h) => String(h.id) === el.dataset.historyId);
@@ -78,7 +103,7 @@ async function onAction(action: string, el: HTMLElement): Promise<void> {
         break;
     }
   } catch (e) {
-    toast(errorMessage(e));
+    toast(errorMessage(e, ACTION_FALLBACK.get(action) ?? "Algo salió mal"));
   }
 }
 
