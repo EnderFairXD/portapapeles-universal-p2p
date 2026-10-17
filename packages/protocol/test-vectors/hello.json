@@ -465,5 +465,37 @@
     "expect": {
       "error": true
     }
+  },
+  {
+    "name": "cliente con deviceName con sustituto alto suelto",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel \\ud83d\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con deviceName con sustituto bajo suelto",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-1\",\"deviceName\":\"Pixel \\ude00 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "cliente con deviceId con sustituto suelto",
+    "side": "client",
+    "json": "{\"v\":2,\"deviceId\":\"dev-\\ud800\",\"deviceName\":\"Pixel 8\"}",
+    "expect": {
+      "error": true
+    }
+  },
+  {
+    "name": "servidor aceptado con pcName con sustituto suelto",
+    "side": "server",
+    "json": "{\"v\":2,\"accepted\":true,\"deviceId\":\"pc-1\",\"pcName\":\"PC \\ud83d\"}",
+    "expect": {
+      "error": true
+    }
   }
 ]

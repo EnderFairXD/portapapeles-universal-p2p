@@ -45,6 +45,10 @@ describe('vectores compartidos', () => {
       'servidor aceptado sin pcName',
       'servidor rechazado con reason otra',
       'servidor con accepted texto',
+      'cliente con deviceName con sustituto alto suelto',
+      'cliente con deviceName con sustituto bajo suelto',
+      'cliente con deviceId con sustituto suelto',
+      'servidor aceptado con pcName con sustituto suelto',
     ]) {
       expect(names).toContain(n);
     }
@@ -75,6 +79,16 @@ describe('ida y vuelta', () => {
   test('un ClientHello sin opcionales no lleva esas claves en el JSON', () => {
     const json = JSON.parse(text(encodeClientHello({ v: 2, deviceId: 'a', deviceName: 'b' })));
     expect(json).toEqual({ v: 2, deviceId: 'a', deviceName: 'b' });
+  });
+
+  test('encodeClientHello cambia un sustituto suelto de deviceName por U+FFFD y el resultado se decodifica', () => {
+    const out = decodeClientHello(encodeClientHello({ v: 2, deviceId: 'a', deviceName: 'Pixel \ud83d' }));
+    expect(out.deviceName).toBe('Pixel \ufffd');
+  });
+
+  test('encodeServerHello cambia un sustituto suelto de pcName por U+FFFD y el resultado se decodifica', () => {
+    const out = decodeServerHello(encodeServerHello({ v: 2, accepted: true, deviceId: 'pc\ude00', pcName: 'PC \ud83d' }));
+    expect(out).toEqual({ v: 2, accepted: true, deviceId: 'pc\ufffd', pcName: 'PC \ufffd' });
   });
 
   test('un ServerHello rechazado no lleva deviceId ni pcName en el JSON', () => {
