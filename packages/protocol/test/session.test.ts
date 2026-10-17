@@ -24,6 +24,7 @@ interface Side {
   local?: string | null;
   sync?: ClipboardSync;
   timers?: Timers;
+  openSink?: SessionOptions['openSink'];
 }
 
 /** Crea una sesión y registra todo lo que emite. */
@@ -38,14 +39,21 @@ function makeSession(link: Link, side: Side) {
       return sync;
     },
     getLocalClip: async () => side.local ?? null,
-    openSink: async (meta) => memorySink(meta.name),
+    openSink: side.openSink ?? (async (meta) => memorySink(meta.name)),
     newTransferId: newId,
     // sin temporizadores reales: ningún test deja un intervalo vivo
     timers: side.timers ?? fakeTimers(),
   };
   const session = new Session(link, opts);
-  const ev = { ready: [] as PeerInfo[], clip: [] as string[], superseded: [] as string[], closed: [] as string[] };
+  const ev = {
+    ready: [] as PeerInfo[],
+    clip: [] as string[],
+    superseded: [] as string[],
+    startSent: [] as string[],
+    closed: [] as string[],
+  };
   session.on('ready', (p) => ev.ready.push(p));
+  session.on('startClipSent', (t) => ev.startSent.push(t));
   session.on('clip', (t) => ev.clip.push(t));
   session.on('localClipSuperseded', (t) => ev.superseded.push(t));
   session.on('closed', (r) => ev.closed.push(r));
@@ -62,10 +70,10 @@ async function connect(client: Omit<Side, 'role'> = {}, server: Omit<Side, 'role
 }
 
 /** Cliente de sesión real contra un servidor «a mano» que contesta al hello. */
-async function clientAgainstRaw(opts: { answerHello?: boolean; answerPings?: boolean } = {}) {
+async function clientAgainstRaw(opts: { answerHello?: boolean; answerPings?: boolean; local?: string } = {}) {
   const [a, b] = linkPair();
   const timers = fakeTimers();
-  const c = makeSession(a, { role: 'client', timers });
+  const c = makeSession(a, { role: 'client', timers, local: opts.local });
   const raw = rawPeer(b);
   raw.onMessage((m) => {
     if (m.type !== 'control') return;
@@ -90,9 +98,9 @@ function failAfter(link: Link, ok: number): Link {
 }
 
 /** Servidor de sesión real contra un cliente «a mano». */
-async function serverAgainstRaw(local: string | null = null) {
+async function serverAgainstRaw(local: string | null = null, openSink?: SessionOptions['openSink']) {
   const [a, b] = linkPair();
-  const s = makeSession(b, { role: 'server', local });
+  const s = makeSession(b, { role: 'server', local, openSink });
   const raw = rawPeer(a);
   await s.session.start();
   return { s, raw };
@@ -401,5 +409,153 @@ describe('errores y cierre', () => {
     await flush();
     expect(seen).toEqual([]);
     expect(c.ev.ready).toEqual([PC]);
+  });
+});
+
+describe('confirmación de lo enviado (R29)', () => {
+  const kinds = (raw: { controls(): { kind: string }[] }) => raw.controls().map((m) => m.kind);
+
+  test('un clip enviado queda tentativo y se confirma con el pong del ping que lo sigue', async () => {
+    const { c, raw } = await clientAgainstRaw({ answerHello: true });
+    expect(c.session.sendClip('hola')).toBe('send');
+    await flush();
+    expect(kinds(raw)).toEqual(['hello', 'clip', 'ping']);
+    expect(c.sync.lastSyncedHash).toBe(sha256Hex('hola'));
+    expect(c.sync.lastConfirmedHash).toBeNull();
+    raw.send({ kind: 'pong' });
+    await flush();
+    expect(c.sync.lastConfirmedHash).toBe(sha256Hex('hola'));
+  });
+
+  test('si el enlace cae antes del pong, el clip no se confirma', async () => {
+    const { c, raw } = await clientAgainstRaw({ answerHello: true });
+    c.session.sendClip('hola');
+    raw.close();
+    await flush();
+    expect(c.ev.closed).toEqual(['link_closed']);
+    expect(c.sync.lastConfirmedHash).toBeNull();
+  });
+
+  test('regla de inicio: el clip del cliente también espera al pong', async () => {
+    const { c, raw } = await clientAgainstRaw({ answerHello: true, local: 'móvil' });
+    expect(kinds(raw)).toEqual(['hello', 'clip', 'ping']);
+    expect(c.ev.ready).toEqual([PC]);
+    expect(c.sync.lastConfirmedHash).toBeNull();
+    raw.send({ kind: 'pong' });
+    await flush();
+    expect(c.sync.lastConfirmedHash).toBe(sha256Hex('móvil'));
+  });
+
+  test('con pings del latido por medio, solo confirma el pong del ping que siguió al clip', async () => {
+    const { c, raw, timers } = await clientAgainstRaw({ answerHello: true });
+    timers.advance(10_000); // ping del latido (1)
+    c.session.sendClip('hola'); // clip + ping (2)
+    await flush();
+    expect(kinds(raw)).toEqual(['hello', 'ping', 'clip', 'ping']);
+    raw.send({ kind: 'pong' }); // contesta al ping 1
+    await flush();
+    expect(c.sync.lastConfirmedHash).toBeNull();
+    timers.advance(10_000); // ping 3, después del clip
+    raw.send({ kind: 'pong' }); // contesta al ping 2
+    await flush();
+    expect(c.sync.lastConfirmedHash).toBe(sha256Hex('hola'));
+  });
+
+  test('dos clips seguidos: el primer pong no confirma el segundo', async () => {
+    const { c, raw } = await clientAgainstRaw({ answerHello: true });
+    c.session.sendClip('uno');
+    c.session.sendClip('dos');
+    await flush();
+    raw.send({ kind: 'pong' });
+    await flush();
+    expect(c.sync.lastConfirmedHash).toBeNull();
+    raw.send({ kind: 'pong' });
+    await flush();
+    expect(c.sync.lastConfirmedHash).toBe(sha256Hex('dos'));
+  });
+
+  test('un clip recibido se confirma al momento', async () => {
+    const { c, raw } = await clientAgainstRaw({ answerHello: true });
+    raw.send({ kind: 'clip', id: 'x', text: 'del PC', hash: sha256Hex('del PC') });
+    await flush();
+    expect(c.ev.clip).toEqual(['del PC']);
+    expect(c.sync.lastConfirmedHash).toBe(sha256Hex('del PC'));
+  });
+});
+
+describe('ping fuera de la cola (M7)', () => {
+  test('contesta al ping al momento aunque una operación del sink siga pendiente', async () => {
+    let opened = false;
+    const { s, raw } = await serverAgainstRaw(null, () => {
+      opened = true;
+      return new Promise(() => {}); // p. ej. el selector de carpeta sigue abierto
+    });
+    raw.send({ kind: 'hello', v: 2, ...MOVIL });
+    await flush();
+    raw.send({ kind: 'file_start', transferId: newId(), name: 'a.bin', size: 10, mime: 'x' });
+    await flush();
+    expect(opened).toBe(true);
+    raw.send({ kind: 'ping' });
+    await flush();
+    expect(raw.controls().map((m) => m.kind)).toEqual(['hello', 'pong']);
+    expect(s.ev.closed).toEqual([]);
+  });
+
+  test('un ping antes del saludo sigue siendo un error de protocolo', async () => {
+    const { s, raw } = await serverAgainstRaw();
+    raw.send({ kind: 'hello', v: 2, ...MOVIL });
+    raw.send({ kind: 'ping' });
+    await flush();
+    // llegó tras el hello: se contesta en orden, después del hello del servidor
+    expect(raw.controls().map((m) => m.kind)).toEqual(['hello', 'pong']);
+    expect(s.ev.closed).toEqual([]);
+  });
+});
+
+describe('textos con sustitutos sueltos (M1)', () => {
+  test('sendClip envía U+FFFD en lugar del sustituto suelto', async () => {
+    const { c, raw } = await clientAgainstRaw({ answerHello: true });
+    expect(c.session.sendClip('a\ud800b')).toBe('send');
+    await flush();
+    const clip = raw.controls().find((m) => m.kind === 'clip');
+    expect(clip).toMatchObject({ text: 'a�b', hash: sha256Hex('a�b') });
+    expect(c.session.sendClip('a�b')).toBe('duplicate');
+  });
+
+  test('la regla de inicio también envía el texto bien formado', async () => {
+    const { c, raw } = await clientAgainstRaw({ answerHello: true, local: '\udc00x' });
+    const clip = raw.controls().find((m) => m.kind === 'clip');
+    expect(clip).toMatchObject({ text: '�x' });
+    expect(c.ev.startSent).toEqual(['�x']);
+  });
+});
+
+describe('startClipSent (M4)', () => {
+  test('se emite con el texto que la regla de inicio envió de verdad', async () => {
+    const { c, s } = await connect({ local: 'móvil' }, { local: null });
+    expect(c.ev.startSent).toEqual(['móvil']);
+    expect(s.ev.startSent).toEqual([]);
+  });
+
+  test('el servidor también lo emite cuando envía el suyo', async () => {
+    const { c, s } = await connect({ local: null }, { local: 'pc' });
+    expect(s.ev.startSent).toEqual(['pc']);
+    expect(c.ev.startSent).toEqual([]);
+  });
+
+  test('no se emite si el texto no cabe al codificarlo', async () => {
+    const big = '"'.repeat(MAX_CLIP_BYTES);
+    const { c } = await connect({ local: big }, { local: null });
+    expect(c.ev.startSent).toEqual([]);
+  });
+
+  test('no se emite si falla la escritura del clip', async () => {
+    const [a, b] = linkPair();
+    const c = makeSession(failAfter(a, 1), { role: 'client', local: 'móvil' });
+    const s = makeSession(b, { role: 'server' });
+    await Promise.all([s.session.start(), c.session.start()]);
+    await flush();
+    expect(c.ev.closed).toEqual(['link_closed']);
+    expect(c.ev.startSent).toEqual([]);
   });
 });

@@ -156,6 +156,7 @@ async function startClient(port: number, opts: { localClip?: string } = {}) {
   return {
     session,
     peer,
+    sync,
     sinks,
     clips,
     transfers,
@@ -349,4 +350,29 @@ test('el cliente corta la conexión a mitad de un archivo: failed en ambos lados
   expect(gone.reason).toBe('link_closed');
   await waitUntil(() => (existsSync(join(pc.downloadDir, 'cortado.bin.part')) ? undefined : true), 'borrado del .part');
   expect(await listDir(pc.downloadDir)).toEqual([]);
+});
+
+test('texto con un sustituto suelto: el PC recibe U+FFFD y la sesión sigue abierta', async () => {
+  const pc = await startHeadless();
+  const client = await startClient(pc.port);
+
+  expect(client.session.sendClip('roto \ud800 aquí')).toBe('send');
+  const got = await pc.waitEvent((e) => e.type === 'clipReceived', 'clipReceived');
+  expect(got.text).toBe('roto \ufffd aquí');
+  expect(client.session.sendClip('después')).toBe('send');
+  await pc.waitEvent((e) => e.type === 'clipReceived' && e.text === 'después', 'segundo clipReceived');
+  expect(client.closed).toBeNull();
+  expect(pc.events.some((e) => e.type === 'peerDisconnected')).toBe(false);
+});
+
+test('el pong del PC confirma el clip enviado (R29)', async () => {
+  const pc = await startHeadless();
+  const client = await startClient(pc.port);
+
+  expect(client.session.sendClip('confirmado')).toBe('send');
+  await waitUntil(
+    () => (client.sync.lastConfirmedHash === sha256Hex('confirmado') ? true : undefined),
+    'confirmación del clip',
+  );
+  await pc.waitEvent((e) => e.type === 'clipReceived' && e.text === 'confirmado', 'clipReceived');
 });
