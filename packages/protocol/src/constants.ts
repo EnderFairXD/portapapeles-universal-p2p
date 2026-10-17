@@ -30,3 +30,10 @@ export const CONNECT_TIMEOUT_MS = 2000;
 
 /** Elementos del historial de portapapeles. */
 export const MAX_HISTORY = 50;
+
+/** Bytes de la etiqueta Poly1305 que ChaChaPoly añade a cada mensaje Noise. */
+export const NOISE_TAG_BYTES = 16;
+/** Máximo de texto en claro por trama cifrada (65 535 − etiqueta). */
+export const MAX_PAYLOAD_BYTES = MAX_FRAME_BYTES - NOISE_TAG_BYTES;
+/** Validez del token del QR de emparejamiento (5 minutos). */
+export const PAIRING_TTL_MS = 300000;
