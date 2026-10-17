@@ -2,8 +2,11 @@
 //! mismo formato de trama y misma validación que la implementación de referencia en TS.
 
 mod messages;
+// Canal cifrado Noise IK: aún sin consumidores fuera de sus tests (los usa el Hub desde la tarea 3).
+#[allow(dead_code)]
+pub mod secure;
 
-pub use messages::{encode_control, encode_file_data, ControlMessage, Decoded, MessageDecoder};
+pub use messages::{encode_control, encode_file_data, ControlMessage, Decoded, MessageDecoder, ProtocolError};
 
 use tokio_util::codec::LengthDelimitedCodec;
 
@@ -16,6 +19,10 @@ pub const MDNS_FULL_SERVICE_TYPE: &str = "_clipsync._tcp.local.";
 
 /// Máximo de bytes de datos por trama (u16).
 pub const MAX_FRAME_BYTES: usize = 65535;
+/// Etiqueta de autenticación Poly1305 que Noise añade a cada mensaje cifrado.
+pub const NOISE_TAG_BYTES: usize = 16;
+/// Máximo de texto en claro por trama una vez cifrada: MAX_FRAME_BYTES - NOISE_TAG_BYTES.
+pub const MAX_PAYLOAD_BYTES: usize = 65_519;
 /// Bytes de archivo por trama de datos (48 KiB).
 pub const FILE_CHUNK_BYTES: usize = 49152;
 /// Se confirma (file_ack) cada vez que se reciben 1 MiB.
@@ -61,6 +68,8 @@ mod tests {
         assert_eq!(DEFAULT_TCP_PORT, 52847);
         assert_eq!(MDNS_FULL_SERVICE_TYPE, "_clipsync._tcp.local.");
         assert_eq!(MAX_FRAME_BYTES, 65535);
+        assert_eq!(NOISE_TAG_BYTES, 16);
+        assert_eq!(MAX_PAYLOAD_BYTES, MAX_FRAME_BYTES - NOISE_TAG_BYTES);
         assert_eq!(FILE_CHUNK_BYTES, 48 * 1024);
         assert_eq!(MAX_CLIP_BYTES, 1024 * 1024);
         assert_eq!(MAX_CONTROL_BYTES, 2 * 1024 * 1024);
