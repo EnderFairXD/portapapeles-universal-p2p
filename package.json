@@ -8,8 +8,8 @@
     "packages/*"
   ],
   "scripts": {
-    "mobile": "pnpm --filter mobile start",
-    "desktop": "pnpm --filter desktop tauri dev"
+    "mobile": "pnpm --filter @clipsync/mobile start",
+    "desktop": "pnpm --filter @clipsync/desktop tauri dev"
   },
   "license": "UNLICENSED",
   "packageManager": "pnpm@12.5.1"

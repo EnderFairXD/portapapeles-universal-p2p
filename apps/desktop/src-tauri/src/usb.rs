@@ -1,19 +1,12 @@
-//! Fase 3 (USB / túnel ADB). El túnel USB no es un transporte nuevo: es una tubería para
-//! el mismo `LanTransport` (TCP) — ver docs/architecture.md §4. Este módulo cubre las dos
-//! piezas que sí son nuevas: detectar el móvil por cable y establecer el túnel.
+//! USB por túnel ADB. No es un transporte aparte: el móvil conecta a `127.0.0.1:52847` y
+//! `adb reverse` lleva esa conexión al servidor TCP del PC, con la misma sesión del
+//! protocolo v2 que por WiFi (el Hub la marca como USB por venir de loopback).
 //!
-//! Invoca el binario `adb` del sistema vía `tokio::process::Command` (async, no bloquea
-//! el runtime de Tauri), en vez de un cliente ADB puro en Rust (se evaluó
-//! `adb_client`/`rsadb`, ver conversación de la Fase 3) — es la vía más simple para
-//! arrancar sin depender de reimplementar el protocolo ADB. Si el binario del sistema
-//! resulta poco fiable en algún entorno, migrar a un crate puro es el siguiente paso
-//! natural sin tocar el resto de LanTransport.
-//!
-//! Enlazado a `lib.rs`: `spawn_reverse_tunnel_watcher()` corre en background desde
-//! `setup()`, sondeando cada POLL_INTERVAL por un dispositivo autorizado y
-//! (re)estableciendo `adb reverse` para el puerto de la sesión. `adb reverse` es
-//! idempotente — repetirlo con la misma pareja de puertos no rompe nada — así que un
-//! sondeo simple es suficiente sin necesitar detectar hotplug de verdad.
+//! Usa el binario `adb` del sistema con `tokio::process::Command` (asíncrono, no bloquea
+//! el runtime de Tauri). `spawn_reverse_tunnel_watcher()` se lanza desde `setup()` en
+//! `lib.rs` y sondea cada POLL_INTERVAL por un dispositivo autorizado para (re)establecer
+//! `adb reverse` en `DEFAULT_TCP_PORT`. `adb reverse` es idempotente: repetirlo no rompe
+//! nada, así que basta un sondeo simple, sin detectar la conexión del cable.
 
 use std::io::Write;
 use std::time::Duration;
