@@ -24,6 +24,28 @@ El móvil prueba los medios por orden de preferencia y cae al siguiente si el an
 
 No hay Modo Invitado: ClipSync necesita estar instalado en los dos dispositivos.
 
+## Seguridad
+
+| Función | Estado |
+|---|---|
+| Emparejamiento por QR | ✅ |
+| Cifrado Noise IK (`Noise_IK_25519_ChaChaPoly_SHA256`) | ✅ |
+
+Todo lo que viaja entre el móvil y el PC va cifrado, por el medio que sea. El móvil solo habla con
+el PC que escaneó, y el PC solo acepta móviles emparejados.
+
+## Cómo emparejar
+
+1. En el PC, abre ClipSync y pulsa **«Emparejar móvil»**: aparece un QR que vale 5 minutos y se
+   puede usar una sola vez.
+2. En el móvil, abre ClipSync y pulsa **«Escanear QR del PC»** (la primera vez pide permiso de
+   cámara).
+3. Escanea el QR. Desde entonces los dos se reconectan solos, sin QR.
+
+Para quitar un móvil, usa «Olvidar» en el PC o en el móvil. Si escaneas el QR del mismo PC otra
+vez, se vuelve a emparejar sin preguntar; si es el de otro PC, la app pregunta antes de sustituir
+el actual.
+
 ## Comprobación manual
 
 La lista de pruebas a mano está en [`docs/testing-checklist.md`](docs/testing-checklist.md).
