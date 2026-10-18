@@ -27,6 +27,7 @@ import {
 import { readClipboard, startClipboardWatcher, writeClipboard } from './clipboardWatcher';
 import { resolvedPcs, startDiscovery, stopDiscovery } from './discovery';
 import { loadIdentity } from './identity';
+import { installNativeCrypto } from './nativeCrypto';
 import {
   backgroundDecision,
   classifySendError,
@@ -122,6 +123,8 @@ function normalize(u: TransferUpdate): TransferUpdate {
 export class ConnectionManager {
   /** El PC emparejado (settings.json); null hasta escanear su QR. */
   private pc: PairedPc | null = loadSettings().pc;
+  /** Cuándo empezó cada transferencia en curso (solo para el registro de velocidad). */
+  private transferStarts = new Map<string, number>();
   private state: ConnState = {
     status: this.pc ? 'searching' : 'unpaired',
     transport: null,
@@ -530,6 +533,7 @@ export class ConnectionManager {
   // --- archivos ---
 
   private onTransfer(u: TransferUpdate): void {
+    this.logSpeed(u);
     if (u.state === 'done') {
       // las completadas pasan al historial, como en el PC
       this.update({ transfers: this.state.transfers.filter((t) => t.transferId !== u.transferId) });
@@ -552,6 +556,21 @@ export class ConnectionManager {
     }
     this.update({ transfers });
     if (isFinished(u)) this.applyBackground();
+  }
+
+  /** Velocidad de cada archivo terminado, para medir en release con `adb logcat -s ReactNativeJS`. */
+  private logSpeed(u: TransferUpdate): void {
+    if (!isFinished(u)) {
+      if (!this.transferStarts.has(u.transferId)) this.transferStarts.set(u.transferId, Date.now());
+      return;
+    }
+    const start = this.transferStarts.get(u.transferId);
+    this.transferStarts.delete(u.transferId);
+    if (u.state !== 'done' || start === undefined) return;
+    const s = (Date.now() - start) / 1000;
+    const mib = u.size / 1048576;
+    const arrow = u.direction === 'out' ? 'móvil→PC' : 'PC→móvil';
+    console.log(`[clipsync] archivo ${arrow}: ${mib.toFixed(1)} MiB en ${s.toFixed(1)} s → ${(mib / s).toFixed(2)} MiB/s`);
   }
 
   // --- utilidades ---
@@ -618,6 +637,9 @@ export class ConnectionManager {
     for (const cb of [...this.listeners]) cb();
   }
 }
+
+// antes de la primera sesión: ChaCha20 y SHA-256 nativos (o @noble si no superan la comparación)
+installNativeCrypto();
 
 /** Instancia única de la app. */
 export const connection = new ConnectionManager();
