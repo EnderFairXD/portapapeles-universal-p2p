@@ -96,6 +96,9 @@ pub fn run() {
                 device_id: load_device_id(data_dir.as_deref()),
                 pc_name: pc_name.clone(),
                 download_dir: download_dir(),
+                // provisional: la Tarea 6 pone `dirs::picture_dir()/ClipSync`
+                image_dir: download_dir().join("ClipSync"),
+                local_image: Arc::new(|| None),
                 // solo lee la copia en memoria: nunca toca arboard
                 local_clip: Arc::new(move || match local_read.lock() {
                     Ok(g) => g.clone(),

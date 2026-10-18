@@ -7,12 +7,13 @@ use crate::protocol::hello::{decode_server_hello, ClientHello, RejectReason, Ser
 use crate::protocol::secure::{self, StaticKeys};
 use crate::protocol::{
     encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder,
-    FILE_CHUNK_BYTES, MAX_FRAME_BYTES,
+    FILE_CHUNK_BYTES, MAX_CLIP_IMAGE_BYTES, MAX_FRAME_BYTES,
 };
 use futures::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use snow::TransportState;
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Mutex;
@@ -64,6 +65,10 @@ struct Setup {
     data: tempfile::TempDir,
     /// lo que devuelve `local_clip` (el último texto del portapapeles del PC)
     local: Arc<Mutex<Option<String>>>,
+    /// contiene `image_dir` (`<imgs>/ClipSync`, que el Hub crea al recibir una imagen)
+    imgs: tempfile::TempDir,
+    /// lo que devuelve `local_image` (la última imagen del portapapeles del PC)
+    local_img: Arc<Mutex<Option<LocalImage>>>,
 }
 
 /// Hub con `m1` y `m2` ya emparejados.
@@ -87,11 +92,16 @@ fn setup_with(local: Option<&str>, emparejados: &[&str]) -> Setup {
     }
     let local = Arc::new(Mutex::new(local.map(String::from)));
     let l = local.clone();
+    let imgs = tempfile::tempdir().unwrap();
+    let local_img = Arc::new(Mutex::new(None::<LocalImage>));
+    let li = local_img.clone();
     let (hub, events) = Hub::new(HubConfig {
         device_id: "pc-1".into(),
         pc_name: "PC de prueba".into(),
         download_dir: dir.path().to_path_buf(),
+        image_dir: imgs.path().join("ClipSync"),
         local_clip: Arc::new(move || l.lock().unwrap().clone()),
+        local_image: Arc::new(move || li.lock().unwrap().clone()),
         keys: pc_keys(),
         paired,
     });
@@ -101,6 +111,8 @@ fn setup_with(local: Option<&str>, emparejados: &[&str]) -> Setup {
         dir,
         data,
         local,
+        imgs,
+        local_img,
     }
 }
 
@@ -132,6 +144,29 @@ impl Setup {
         }
     }
 
+    /// El PC copia una imagen: se actualiza `local_image` y luego se difunde, como hará la app.
+    fn copy_image(&self, img: &LocalImage) -> Result<(), String> {
+        *self.local_img.lock().unwrap() = Some(img.clone());
+        self.hub.broadcast_clip_image(img)
+    }
+
+    /// Eventos de transferencia hasta que cada id de `ids` llega a un estado final; por id.
+    async fn transfers_until_end(&mut self, ids: &[&str]) -> HashMap<String, Vec<Value>> {
+        let mut v: HashMap<String, Vec<Value>> = HashMap::new();
+        let fin = |v: &HashMap<String, Vec<Value>>, id: &str| {
+            v.get(id)
+                .and_then(|l| l.last())
+                .is_some_and(|e| !matches!(e["state"].as_str(), Some("queued" | "active")))
+        };
+        while !ids.iter().all(|id| fin(&v, id)) {
+            let e = self.event().await;
+            assert_eq!(e["type"], "transfer", "{e}");
+            let id = e["transferId"].as_str().unwrap().to_string();
+            v.entry(id).or_default().push(e);
+        }
+        v
+    }
+
     fn no_events(&mut self) {
         if let Ok(e) = self.events.try_recv() {
             panic!("evento inesperado: {}", js(&e));
@@ -145,6 +180,22 @@ impl Setup {
             .collect();
         v.sort();
         v
+    }
+
+    /// Archivos de `image_dir` (vacío si aún no existe).
+    fn images(&self) -> Vec<String> {
+        let Ok(rd) = std::fs::read_dir(self.image_dir()) else {
+            return Vec::new();
+        };
+        let mut v: Vec<String> = rd
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    fn image_dir(&self) -> PathBuf {
+        self.imgs.path().join("ClipSync")
     }
 
     /// Contenido de `paired.json` (vacío si no existe).
@@ -200,7 +251,16 @@ fn device_paired(device_id: &str) -> Value {
 
 fn transfer(id: &str, dir: &str, name: &str, size: u64, bytes: u64, state: &str) -> Value {
     json!({"type": "transfer", "transferId": id, "direction": dir, "name": name, "size": size,
-           "bytes": bytes, "state": state, "error": null, "location": null})
+           "bytes": bytes, "state": state, "error": null, "location": null, "purpose": null})
+}
+
+/// Como `transfer`, de una imagen para el portapapeles.
+fn img_transfer(id: &str, dir: &str, name: &str, size: u64, bytes: u64, state: &str) -> Value {
+    with(
+        transfer(id, dir, name, size, bytes, state),
+        "purpose",
+        json!("clipboard"),
+    )
 }
 
 fn with(mut v: Value, key: &str, val: Value) -> Value {
@@ -750,14 +810,31 @@ async fn enviar_archivo<W: AsyncWrite + Unpin>(
     data: &[u8],
     hash: &str,
 ) -> Vec<ControlMessage> {
-    c.send(ControlMessage::FileStart {
-        transfer_id: TID.into(),
+    let start = file_start(TID, name, data.len() as u64, None);
+    enviar_con(c, start, data, hash).await
+}
+
+fn file_start(id: &str, name: &str, size: u64, purpose: Option<&str>) -> ControlMessage {
+    ControlMessage::FileStart {
+        transfer_id: id.into(),
         name: name.into(),
-        size: data.len() as u64,
-        mime: "application/octet-stream".into(),
-        purpose: None,
-    })
-    .await;
+        size,
+        mime: if purpose.is_some() {
+            "image/png".into()
+        } else {
+            "application/octet-stream".into()
+        },
+        purpose: purpose.map(String::from),
+    }
+}
+
+async fn enviar_con<W: AsyncWrite + Unpin>(
+    c: &mut Client<W>,
+    start: ControlMessage,
+    data: &[u8],
+    hash: &str,
+) -> Vec<ControlMessage> {
+    c.send(start).await;
     for chunk in data.chunks(FILE_CHUNK_BYTES) {
         c.send_data(TID, chunk).await;
     }
@@ -2088,4 +2165,645 @@ async fn sin_mensaje_1_en_30s_se_cierra() {
     let mut otra = connect(&s.hub);
     otra.hello("m1", Some(false)).await;
     assert_eq!(s.event().await, peer_connected(2, "m1", "wifi"));
+}
+
+// --- imágenes del portapapeles (fase 2b) ---
+
+const MAX_IMG: u64 = MAX_CLIP_IMAGE_BYTES;
+
+/// Imagen local de prueba (PNG ficticio): el hash es el de sus bytes.
+fn imagen(dir: &Path, name: &str, data: &[u8]) -> LocalImage {
+    LocalImage {
+        hash: sha(data),
+        png_path: archivo_local(dir, name, data),
+    }
+}
+
+/// Recibe una imagen entera (file_start con purpose, datos y file_end); devuelve id, nombre y bytes.
+/// Las imágenes de prueba caben en la ventana: no hacen falta file_ack.
+async fn recibir_imagen<W: AsyncWrite + Unpin>(c: &mut Client<W>) -> (String, String, Vec<u8>) {
+    let ControlMessage::FileStart {
+        transfer_id,
+        name,
+        size,
+        mime,
+        purpose,
+    } = c.ctrl().await
+    else {
+        panic!("se esperaba file_start");
+    };
+    assert_eq!(purpose.as_deref(), Some("clipboard"));
+    assert_eq!(mime, "image/png");
+    let mut bytes = Vec::new();
+    loop {
+        match c.recv().await {
+            Some(Decoded::Data { bytes: b, .. }) => bytes.extend(b),
+            Some(Decoded::Control(ControlMessage::Ping)) => {}
+            Some(Decoded::Control(ControlMessage::FileEnd {
+                transfer_id: t,
+                sha256,
+            })) => {
+                assert_eq!(t, transfer_id);
+                assert_eq!(sha256, sha(&bytes));
+                break;
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    assert_eq!(bytes.len() as u64, size);
+    (transfer_id, name, bytes)
+}
+
+async fn resultado<W: AsyncWrite + Unpin>(c: &mut Client<W>, id: &str, ok: bool) {
+    c.send(ControlMessage::FileResult {
+        transfer_id: id.into(),
+        ok,
+        error: (!ok).then(|| "write_error".to_string()),
+    })
+    .await;
+}
+
+/// Conecta un móvil ya emparejado y consume su `peerConnected`.
+async fn conectado(s: &mut Setup, device_id: &str) -> Client<WriteHalf<DuplexStream>> {
+    let mut c = connect(&s.hub);
+    c.hello(device_id, Some(false)).await;
+    let e = s.event().await;
+    assert_eq!(e["type"], "peerConnected", "{e}");
+    c
+}
+
+/// Recibe la imagen que va a salir, responde y espera a su estado final en el Hub.
+async fn imagen_completa<W: AsyncWrite + Unpin>(
+    s: &mut Setup,
+    c: &mut Client<W>,
+    ok: bool,
+) -> Vec<u8> {
+    let (id, _, bytes) = recibir_imagen(c).await;
+    resultado(c, &id, ok).await;
+    let ev = s.transfers_until_end(&[&id]).await;
+    let ultimo = ev[&id].last().unwrap();
+    assert_eq!(
+        ultimo["state"],
+        if ok { "done" } else { "failed" },
+        "{ultimo}"
+    );
+    bytes
+}
+
+#[tokio::test]
+async fn imagen_entrante_se_guarda_en_image_dir_y_emite_clip_image_received() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let data = datos(100_000);
+    let n = data.len() as u64;
+    let msgs = enviar_con(
+        &mut c,
+        file_start(TID, "captura.png", n, Some("clipboard")),
+        &data,
+        &sha(&data),
+    )
+    .await;
+    assert_eq!(
+        msgs.last().unwrap(),
+        &ControlMessage::FileResult {
+            transfer_id: TID.into(),
+            ok: true,
+            error: None
+        }
+    );
+    let destino = s.image_dir().join("captura.png");
+    let loc = json!(destino.to_string_lossy());
+    assert_eq!(
+        s.transfer_until_end().await,
+        vec![
+            img_transfer(TID, "in", "captura.png", n, 0, "active"),
+            with(
+                img_transfer(TID, "in", "captura.png", n, n, "done"),
+                "location",
+                loc.clone()
+            ),
+        ]
+    );
+    assert_eq!(
+        s.event().await,
+        json!({"type": "clipImageReceived", "sessionId": 1, "location": loc})
+    );
+    assert_eq!(std::fs::read(&destino).unwrap(), data);
+    assert!(s.files().is_empty(), "nada en Descargas: {:?}", s.files());
+    s.no_events();
+}
+
+#[tokio::test]
+async fn archivo_normal_no_emite_clip_image_received() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let data = datos(10);
+    enviar_archivo(&mut c, "a.png", &data, &sha(&data)).await;
+    s.transfer_until_end().await;
+    assert!(c.sync().await.is_empty());
+    s.no_events();
+    assert!(s.images().is_empty());
+}
+
+#[tokio::test]
+async fn imagen_entrante_de_mas_de_20_mib_se_cancela_con_too_large_sin_cerrar() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    c.send(file_start(
+        TID,
+        "enorme.png",
+        MAX_IMG + 1,
+        Some("clipboard"),
+    ))
+    .await;
+    assert_eq!(
+        c.ctrl().await,
+        ControlMessage::FileCancel {
+            transfer_id: TID.into(),
+            reason: "too_large".into()
+        }
+    );
+    assert_eq!(
+        s.event().await,
+        with(
+            img_transfer(TID, "in", "enorme.png", MAX_IMG + 1, 0, "failed"),
+            "error",
+            json!("too_large")
+        )
+    );
+    // los datos que ya iban en vuelo se descartan sin error y la sesión sigue
+    c.send_data(TID, &[1, 2, 3]).await;
+    assert!(c.sync().await.is_empty());
+    s.no_events();
+    assert!(s.images().is_empty(), "{:?}", s.images());
+    // un too_large no ocupa el hueco de entrante
+    let data = datos(10);
+    let tid2 = "fedcba9876543210fedcba9876543210";
+    c.send(file_start(tid2, "b.png", 10, Some("clipboard")))
+        .await;
+    c.send_data(tid2, &data).await;
+    c.send(ControlMessage::FileEnd {
+        transfer_id: tid2.into(),
+        sha256: sha(&data),
+    })
+    .await;
+    let ev = s.transfers_until_end(&[tid2]).await;
+    assert_eq!(ev[tid2].last().unwrap()["state"], "done");
+    // el mismo transferId otra vez sí es protocol_error
+    c.send(file_start(TID, "enorme.png", 1, Some("clipboard")))
+        .await;
+    assert_eq!(s.event().await["type"], "clipImageReceived");
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
+    );
+}
+
+#[tokio::test]
+async fn imagen_de_20_mib_exactos_y_archivo_normal_mayor_se_aceptan() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    c.send(file_start(TID, "justa.png", MAX_IMG, Some("clipboard")))
+        .await;
+    assert_eq!(
+        s.event().await,
+        img_transfer(TID, "in", "justa.png", MAX_IMG, 0, "active")
+    );
+    c.send(ControlMessage::FileCancel {
+        transfer_id: TID.into(),
+        reason: "cancelled".into(),
+    })
+    .await;
+    assert_eq!(s.event().await["state"], "cancelled");
+    let tid2 = "fedcba9876543210fedcba9876543210";
+    c.send(file_start(tid2, "grande.bin", MAX_IMG + 1, None))
+        .await;
+    assert_eq!(
+        s.event().await,
+        transfer(tid2, "in", "grande.bin", MAX_IMG + 1, 0, "active")
+    );
+}
+
+#[tokio::test]
+async fn too_large_con_otro_entrante_en_curso_es_protocol_error() {
+    // el orden de comprobaciones de TS: primero «otro entrante en curso», luego el tamaño
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    c.send(file_start(TID, "a.bin", 10, None)).await;
+    assert_eq!(s.event().await["state"], "active");
+    c.send(file_start(
+        "fedcba9876543210fedcba9876543210",
+        "x.png",
+        MAX_IMG + 1,
+        Some("clipboard"),
+    ))
+    .await;
+    assert_eq!(s.event().await["state"], "failed");
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
+    );
+}
+
+#[tokio::test]
+async fn broadcast_clip_image_llega_a_dos_moviles_con_purpose_y_no_se_repite() {
+    let mut s = setup(None);
+    let mut a = conectado(&mut s, "m1").await;
+    let mut b = conectado(&mut s, "m2").await;
+    let src = tempfile::tempdir().unwrap();
+    let data = datos(5000);
+    let img = imagen(src.path(), "captura.png", &data);
+    s.copy_image(&img).unwrap();
+    let (ida, name_a, bytes_a) = recibir_imagen(&mut a).await;
+    let (idb, name_b, bytes_b) = recibir_imagen(&mut b).await;
+    assert_ne!(ida, idb);
+    assert_eq!(
+        (name_a.as_str(), name_b.as_str()),
+        ("captura.png", "captura.png")
+    );
+    assert_eq!((bytes_a, bytes_b), (data.clone(), data.clone()));
+    resultado(&mut a, &ida, true).await;
+    resultado(&mut b, &idb, true).await;
+    let ev = s.transfers_until_end(&[&ida, &idb]).await;
+    let n = data.len() as u64;
+    for id in [&ida, &idb] {
+        assert_eq!(
+            ev[id.as_str()],
+            vec![
+                img_transfer(id, "out", "captura.png", n, 0, "queued"),
+                img_transfer(id, "out", "captura.png", n, 0, "active"),
+                img_transfer(id, "out", "captura.png", n, n, "done"),
+            ]
+        );
+    }
+    // la misma imagen otra vez: ya la tienen los dos
+    s.copy_image(&img).unwrap();
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut a, &mut b]).await,
+        vec![Vec::<String>::new(), vec![]]
+    );
+    s.no_events();
+}
+
+#[tokio::test]
+async fn tras_un_fallo_o_una_cancelacion_la_imagen_se_reenvia() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let img = imagen(src.path(), "i.png", &datos(3000));
+    s.copy_image(&img).unwrap();
+    imagen_completa(&mut s, &mut c, false).await;
+    s.copy_image(&img).unwrap();
+    // el receptor la cancela a mitad (tras file_end ya no se puede: aquí antes de responder)
+    let (id, _, _) = recibir_imagen(&mut c).await;
+    c.send(ControlMessage::FileCancel {
+        transfer_id: id.clone(),
+        reason: "cancelled".into(),
+    })
+    .await;
+    let ev = s.transfers_until_end(&[&id]).await;
+    assert_eq!(ev[&id].last().unwrap()["state"], "cancelled");
+    s.copy_image(&img).unwrap();
+    imagen_completa(&mut s, &mut c, true).await;
+}
+
+#[tokio::test]
+async fn tras_confirmar_una_imagen_un_fallo_posterior_vuelve_a_ella() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let x = imagen(src.path(), "x.png", &datos(3000));
+    let y = imagen(src.path(), "y.png", &datos(4000));
+    s.copy_image(&x).unwrap();
+    imagen_completa(&mut s, &mut c, true).await;
+    s.copy_image(&y).unwrap();
+    imagen_completa(&mut s, &mut c, false).await;
+    // X quedó confirmada: no vuelve a salir
+    s.copy_image(&x).unwrap();
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
+    s.no_events();
+}
+
+#[tokio::test]
+async fn broadcast_clip_image_de_mas_de_20_mib_es_too_large() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let p = src.path().join("enorme.png");
+    std::fs::File::create(&p)
+        .unwrap()
+        .set_len(MAX_IMG + 1)
+        .unwrap();
+    let img = LocalImage {
+        hash: "h".into(),
+        png_path: p,
+    };
+    assert_eq!(
+        s.hub.broadcast_clip_image(&img),
+        Err("too_large".to_string())
+    );
+    let falta = LocalImage {
+        hash: "h".into(),
+        png_path: src.path().join("no-existe.png"),
+    };
+    assert_eq!(
+        s.hub.broadcast_clip_image(&falta),
+        Err("read_error".to_string())
+    );
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
+    s.no_events();
+}
+
+#[tokio::test]
+async fn envio_de_inicio_al_conectar_con_una_imagen_local() {
+    // las imágenes no entran en «gana el móvil»: con texto e imagen locales y el móvil con texto
+    // nuevo, el texto cede pero la imagen sale
+    let mut s = setup(Some("pc"));
+    let src = tempfile::tempdir().unwrap();
+    let data = datos(2000);
+    *s.local_img.lock().unwrap() = Some(imagen(src.path(), "local.png", &data));
+    let mut c = connect(&s.hub);
+    c.hello("m1", Some(true)).await;
+    let (id, name, bytes) = recibir_imagen(&mut c).await;
+    assert_eq!((name.as_str(), bytes), ("local.png", data.clone()));
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    assert_eq!(
+        s.event().await,
+        json!({"type": "localClipSuperseded", "text": "pc"})
+    );
+    resultado(&mut c, &id, true).await;
+    let n = data.len() as u64;
+    assert_eq!(
+        s.transfers_until_end(&[&id]).await[&id],
+        vec![
+            img_transfer(&id, "out", "local.png", n, 0, "queued"),
+            img_transfer(&id, "out", "local.png", n, 0, "active"),
+            img_transfer(&id, "out", "local.png", n, n, "done"),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn envio_de_inicio_no_repite_una_imagen_ya_sincronizada() {
+    let mut s = setup(None);
+    let src = tempfile::tempdir().unwrap();
+    *s.local_img.lock().unwrap() = Some(imagen(src.path(), "local.png", &datos(2000)));
+    let mut c = conectado(&mut s, "m1").await;
+    imagen_completa(&mut s, &mut c, true).await;
+    // un protocol_error no restablece la sincronía (solo link_closed y heartbeat_timeout)
+    c.send_payload(&hello_fase_1("m1")).await;
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "protocol_error"})
+    );
+    let mut c = conectado(&mut s, "m1").await;
+    assert!(c.sync().await.is_empty(), "la imagen ya la tiene");
+    s.no_events();
+}
+
+#[tokio::test]
+async fn mark_image_synced_evita_reenviarla_a_ese_movil_pero_no_al_otro() {
+    let mut s = setup(None);
+    let mut a = conectado(&mut s, "m1").await;
+    let mut b = conectado(&mut s, "m2").await;
+    let src = tempfile::tempdir().unwrap();
+    let img = imagen(src.path(), "de-a.png", &datos(3000));
+    // la app escribió en el portapapeles la imagen que llegó por la sesión 1 y leyó este hash
+    s.hub.mark_image_synced(1, &img.hash);
+    s.copy_image(&img).unwrap();
+    imagen_completa(&mut s, &mut b, true).await;
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut a, &mut b]).await,
+        vec![Vec::<String>::new(), vec![]]
+    );
+    s.no_events();
+}
+
+#[tokio::test]
+async fn mark_image_synced_tras_caer_la_sesion_evita_el_rebote_al_reconectar() {
+    let mut s = setup(None);
+    let c = conectado(&mut s, "m1").await;
+    c.cut().await;
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"})
+    );
+    // la imagen recibida por la sesión 1 se escribe después de que cayera
+    let src = tempfile::tempdir().unwrap();
+    let img = imagen(src.path(), "de-m1.png", &datos(3000));
+    s.hub.mark_image_synced(1, &img.hash);
+    *s.local_img.lock().unwrap() = Some(img);
+    let mut c = conectado(&mut s, "m1").await;
+    assert!(
+        c.sync().await.is_empty(),
+        "no vuelve al móvil del que llegó"
+    );
+    s.no_events();
+}
+
+#[tokio::test]
+async fn una_imagen_nueva_sustituye_a_la_que_espera_en_cola() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let x = imagen(src.path(), "x.png", &datos(3000));
+    let y = imagen(src.path(), "y.png", &datos(4000));
+    let z = imagen(src.path(), "z.png", &datos(5000));
+    s.copy_image(&x).unwrap();
+    // X queda en vuelo (sin file_result)
+    let (idx, _, _) = recibir_imagen(&mut c).await;
+    s.copy_image(&y).unwrap();
+    s.copy_image(&z).unwrap();
+    let mut ev = Vec::new();
+    for _ in 0..5 {
+        ev.push(s.event().await);
+    }
+    let idy = ev[2]["transferId"].as_str().unwrap().to_string();
+    let idz = ev[4]["transferId"].as_str().unwrap().to_string();
+    assert_eq!(
+        ev,
+        vec![
+            img_transfer(&idx, "out", "x.png", 3000, 0, "queued"),
+            img_transfer(&idx, "out", "x.png", 3000, 0, "active"),
+            img_transfer(&idy, "out", "y.png", 4000, 0, "queued"),
+            img_transfer(&idy, "out", "y.png", 4000, 0, "cancelled"),
+            img_transfer(&idz, "out", "z.png", 5000, 0, "queued"),
+        ]
+    );
+    // la que estaba en vuelo termina; después sale Z, no Y
+    resultado(&mut c, &idx, true).await;
+    assert_eq!(
+        s.event().await,
+        img_transfer(&idx, "out", "x.png", 3000, 3000, "done")
+    );
+    let (id, name, _) = recibir_imagen(&mut c).await;
+    assert_eq!((id.as_str(), name.as_str()), (idz.as_str(), "z.png"));
+    resultado(&mut c, &idz, true).await;
+    let ev = s.transfers_until_end(&[&idz]).await;
+    assert_eq!(ev[&idz].last().unwrap()["state"], "done");
+    // Z quedó confirmada (el ok de X no la pisó): no vuelve a salir
+    s.copy_image(&z).unwrap();
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
+    s.no_events();
+}
+
+#[tokio::test]
+async fn volver_a_la_imagen_en_vuelo_cancela_la_de_la_cola_sin_repetirla() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let x = imagen(src.path(), "x.png", &datos(3000));
+    let y = imagen(src.path(), "y.png", &datos(4000));
+    s.copy_image(&x).unwrap();
+    let (idx, _, _) = recibir_imagen(&mut c).await;
+    s.copy_image(&y).unwrap();
+    s.copy_image(&x).unwrap();
+    let mut ev = Vec::new();
+    for _ in 0..4 {
+        ev.push(s.event().await);
+    }
+    let idy = ev[2]["transferId"].as_str().unwrap().to_string();
+    assert_eq!(
+        ev[3],
+        img_transfer(&idy, "out", "y.png", 4000, 0, "cancelled")
+    );
+    resultado(&mut c, &idx, true).await;
+    assert_eq!(
+        s.event().await,
+        img_transfer(&idx, "out", "x.png", 3000, 3000, "done")
+    );
+    assert!(c.sync().await.is_empty(), "ni Y ni otra copia de X");
+    s.copy_image(&x).unwrap();
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
+    s.no_events();
+}
+
+#[tokio::test]
+async fn cancelar_desde_el_pc_una_imagen_en_cola_permite_reenviarla() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let x = imagen(src.path(), "x.png", &datos(3000));
+    let y = imagen(src.path(), "y.png", &datos(4000));
+    s.copy_image(&x).unwrap();
+    let (idx, _, _) = recibir_imagen(&mut c).await;
+    s.copy_image(&y).unwrap();
+    let mut ev = Vec::new();
+    for _ in 0..3 {
+        ev.push(s.event().await);
+    }
+    let idy = ev[2]["transferId"].as_str().unwrap().to_string();
+    s.hub.cancel_transfer(&idy);
+    assert_eq!(
+        s.event().await,
+        img_transfer(&idy, "out", "y.png", 4000, 0, "cancelled")
+    );
+    resultado(&mut c, &idx, true).await;
+    assert_eq!(s.event().await["state"], "done");
+    s.copy_image(&y).unwrap();
+    imagen_completa(&mut s, &mut c, true).await;
+}
+
+#[tokio::test]
+async fn tras_caer_el_enlace_la_imagen_se_reenvia_al_reconectar() {
+    let mut s = setup(None);
+    let src = tempfile::tempdir().unwrap();
+    *s.local_img.lock().unwrap() = Some(imagen(src.path(), "local.png", &datos(2000)));
+    let mut c = conectado(&mut s, "m1").await;
+    imagen_completa(&mut s, &mut c, true).await;
+    c.cut().await;
+    assert_eq!(
+        s.event().await,
+        json!({"type": "peerDisconnected", "sessionId": 1, "reason": "link_closed"})
+    );
+    let mut c = conectado(&mut s, "m1").await;
+    imagen_completa(&mut s, &mut c, true).await;
+}
+
+#[tokio::test]
+async fn hello_nuevo_con_sesion_existente_restablece_la_imagen() {
+    let mut s = setup(None);
+    let src = tempfile::tempdir().unwrap();
+    *s.local_img.lock().unwrap() = Some(imagen(src.path(), "local.png", &datos(2000)));
+    let mut viejo = conectado(&mut s, "m1").await;
+    imagen_completa(&mut s, &mut viejo, true).await;
+    let mut nuevo = connect(&s.hub);
+    nuevo.hello("m1", Some(false)).await;
+    let (id, _, _) = recibir_imagen(&mut nuevo).await;
+    resultado(&mut nuevo, &id, true).await;
+    let mut ev = Vec::new();
+    while !ev
+        .iter()
+        .any(|e: &Value| e["transferId"] == json!(id) && e["state"] == "done")
+    {
+        ev.push(s.event().await);
+    }
+    assert!(ev.contains(&peer_connected(2, "m1", "wifi")), "{ev:?}");
+    assert!(
+        ev.contains(&json!({"type": "peerDisconnected", "sessionId": 1, "reason": "replaced"})),
+        "{ev:?}"
+    );
+}
+
+#[tokio::test]
+async fn olvidar_borra_la_sincronia_de_imagen() {
+    let mut s = setup(None);
+    let src = tempfile::tempdir().unwrap();
+    *s.local_img.lock().unwrap() = Some(imagen(src.path(), "local.png", &datos(2000)));
+    let mut c = conectado(&mut s, "m1").await;
+    imagen_completa(&mut s, &mut c, true).await;
+    // protocol_error: sin restablecer; luego se olvida y se vuelve a emparejar
+    c.send_payload(&hello_fase_1("m1")).await;
+    assert_eq!(s.event().await["reason"], "protocol_error");
+    assert!(s.hub.forget_device(&key_hex("m1")));
+    let offer = s.hub.start_pairing();
+    let mut c = connect(&s.hub);
+    assert_eq!(
+        c.handshake(&con_token("m1", &offer.token)).await,
+        Some(server_hello())
+    );
+    assert_eq!(s.event().await["type"], "devicePaired");
+    assert_eq!(s.event().await["type"], "peerConnected");
+    imagen_completa(&mut s, &mut c, true).await;
+}
+
+#[tokio::test]
+async fn una_imagen_ya_sincronizada_descarta_la_que_esperaba_en_cola() {
+    // el móvil manda Y mientras X va en vuelo y C espera: al difundir Y (ya la tiene) C sobra
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let x = imagen(src.path(), "x.png", &datos(3000));
+    let cc = imagen(src.path(), "c.png", &datos(3500));
+    let y = imagen(src.path(), "y.png", &datos(4000));
+    s.copy_image(&x).unwrap();
+    let (idx, _, _) = recibir_imagen(&mut c).await;
+    s.copy_image(&cc).unwrap();
+    let mut ev = Vec::new();
+    for _ in 0..3 {
+        ev.push(s.event().await);
+    }
+    let idc = ev[2]["transferId"].as_str().unwrap().to_string();
+    s.hub.mark_image_synced(1, &y.hash);
+    s.copy_image(&y).unwrap();
+    assert_eq!(
+        s.event().await,
+        img_transfer(&idc, "out", "c.png", 3500, 0, "cancelled")
+    );
+    resultado(&mut c, &idx, true).await;
+    assert_eq!(s.event().await["state"], "done");
+    assert!(c.sync().await.is_empty(), "ni C ni Y");
+    s.no_events();
 }

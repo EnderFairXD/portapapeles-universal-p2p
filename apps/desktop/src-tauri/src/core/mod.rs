@@ -13,5 +13,5 @@ pub mod pairing;
 
 pub use clip_sync::{ClipDecision, ClipboardSync};
 pub use files::{sanitize_file_name, unique_path, FileReceiver};
-pub use hub::{Hub, HubConfig, HubEvent};
+pub use hub::{Hub, HubConfig, HubEvent, LocalImage};
 pub use session::{Direction, TransferState, TransferUpdate, Transport};

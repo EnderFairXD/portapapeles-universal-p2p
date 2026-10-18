@@ -9,8 +9,6 @@
 //! En lugar del callback de TS, `confirm_sent` y `mark_synced` devuelven el nuevo hash
 //! confirmado solo si ha cambiado (para que el llamador lo persista).
 
-// Aún no lo usa el Hub (llega con el envío de imágenes).
-#[allow(dead_code)]
 pub struct ImageSync {
     hash: Option<String>,
     confirmed: Option<String>,
@@ -18,7 +16,6 @@ pub struct ImageSync {
     tentative: Option<String>,
 }
 
-#[allow(dead_code)]
 impl ImageSync {
     pub fn new(last_confirmed: Option<String>) -> Self {
         Self { hash: last_confirmed.clone(), confirmed: last_confirmed, tentative: None }
@@ -28,6 +25,8 @@ impl ImageSync {
         self.hash.as_deref()
     }
 
+    // el PC no persiste el confirmado: solo lo miran los tests
+    #[cfg(test)]
     pub fn last_confirmed_hash(&self) -> Option<&str> {
         self.confirmed.as_deref()
     }

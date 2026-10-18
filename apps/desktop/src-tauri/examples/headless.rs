@@ -97,7 +97,10 @@ async fn main() -> ExitCode {
     let (hub, mut events) = Hub::new(HubConfig {
         device_id: "headless-pc".into(),
         pc_name: "PC headless".into(),
+        // provisional: la Tarea 5 añade --image-dir
+        image_dir: args.download_dir.join("ClipSync"),
         download_dir: args.download_dir,
+        local_image: Arc::new(|| None),
         local_clip: Arc::new(move || match local_read.lock() {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
