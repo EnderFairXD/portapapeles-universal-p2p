@@ -2,10 +2,11 @@
 //! La parte pura (`AppState`) no depende de Tauri; el cableado está en `lib.rs`.
 
 pub mod clipboard;
+pub mod images;
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,12 +19,19 @@ use clipboard::ClipboardHandle;
 
 use crate::core::pairing::{lan_ipv4s, pairing_uri, qr_svg, PairedDevice};
 use crate::core::{
-    ClipDecision, ClipboardSync, Direction, Hub, HubEvent, TransferState, TransferUpdate, Transport,
+    ClipDecision, ClipboardSync, Direction, Hub, HubEvent, LocalImage, TransferState,
+    TransferUpdate, Transport,
 };
-use crate::protocol::{encode_control, ControlMessage, DEFAULT_TCP_PORT, MAX_HISTORY};
+use crate::protocol::{
+    encode_control, ControlMessage, DEFAULT_TCP_PORT, MAX_CLIP_IMAGE_BYTES, MAX_HISTORY,
+    PURPOSE_CLIPBOARD,
+};
 
 pub const CLIP_TOO_LARGE_NOTICE: &str = "Texto demasiado grande para sincronizar (máx. 1 MB)";
 pub const CLIP_NOTICE_MS: u64 = 5_000;
+/// Avisos de imagen: van en `clipNotice`, como el del texto grande.
+pub const IMAGE_TOO_LARGE_NOTICE: &str = "Imagen demasiado grande para sincronizar (máx. 20 MB)";
+pub const IMAGE_WRITE_ERROR: &str = "No se pudo poner la imagen en el portapapeles";
 /// Cuánto se muestra el aviso «emparejado».
 pub const PAIR_NOTICE_MS: u64 = 5_000;
 /// Error de `start_pairing` si el PC no tiene ninguna IPv4 de LAN que poner en el QR.
@@ -82,6 +90,8 @@ pub struct HistoryItem {
     pub text: Option<String>,
     pub file_name: Option<String>,
     pub location: Option<String>,
+    /// miniatura PNG en data URL; solo en `kind: "image"`
+    pub thumbnail: Option<String>,
     pub at_ms: u64,
 }
 
@@ -144,13 +154,20 @@ pub struct AppState {
     /// ruta de origen de cada archivo enviado, para el historial
     out_paths: HashMap<String, String>,
     clipboard_error: Option<String>,
-    clip_notice_until: Option<u64>,
+    /// aviso informativo (texto o imagen) y hasta cuándo se muestra
+    clip_notice: Option<(String, u64)>,
     server_error: Option<String>,
     paired: Vec<PairedDevice>,
     pairing: Option<PairingView>,
     /// texto del aviso «emparejado» y hasta cuándo se muestra
     pair_notice: Option<(String, u64)>,
     next_id: u64,
+    /// PNG de la caché de cada item de imagen (para `copy_image` y la poda)
+    images: HashMap<u64, PathBuf>,
+    /// PNG que ya no usa el historial; los borra el hilo del portapapeles
+    trash: Vec<PathBuf>,
+    /// borrados fallidos: vuelven a la papelera en la siguiente poda
+    failed_deletes: Vec<PathBuf>,
 }
 
 impl AppState {
@@ -162,12 +179,15 @@ impl AppState {
             transfers: Vec::new(),
             out_paths: HashMap::new(),
             clipboard_error: None,
-            clip_notice_until: None,
+            clip_notice: None,
             server_error: None,
             paired: Vec::new(),
             pairing: None,
             pair_notice: None,
             next_id: 1,
+            images: HashMap::new(),
+            trash: Vec::new(),
+            failed_deletes: Vec::new(),
         }
     }
 
@@ -208,7 +228,7 @@ impl AppState {
                     now_ms.saturating_add(PAIR_NOTICE_MS),
                 ));
             }
-            // la pone en el portapapeles la Tarea 6
+            // la pone en el portapapeles el hilo del portapapeles, que luego la anota
             HubEvent::ClipImageReceived { .. } => {}
         }
     }
@@ -222,6 +242,10 @@ impl AppState {
         };
         if u.state == TransferState::Done {
             self.transfers.retain(|t| t.transfer_id != u.transfer_id);
+            if u.purpose.as_deref() == Some(PURPOSE_CLIPBOARD) {
+                // imagen del portapapeles: su item `image` lo pone quien la copia o la recibe
+                return;
+            }
             let (direction, location) = match u.direction {
                 Direction::In => (DIR_IN, u.location),
                 Direction::Out => (DIR_OUT, u.location.or(source)),
@@ -233,6 +257,7 @@ impl AppState {
                 text: None,
                 file_name: Some(u.name),
                 location,
+                thumbnail: None,
                 at_ms: now_ms,
             });
             return;
@@ -268,7 +293,101 @@ impl AppState {
         item.id = self.next_id;
         self.next_id += 1;
         self.history.push_front(item);
-        self.history.truncate(MAX_HISTORY);
+        while self.history.len() > MAX_HISTORY {
+            let Some(old) = self.history.pop_back() else {
+                break;
+            };
+            if let Some(png) = self.images.remove(&old.id) {
+                self.discard_image(png);
+            }
+        }
+    }
+
+    fn push_image(&mut self, item: HistoryItem, png: PathBuf) {
+        let id = self.next_id;
+        self.push(item);
+        self.images.insert(id, png);
+    }
+
+    /// Imagen copiada en el PC y entregada al Hub; como el texto, sin móvil no se anota.
+    pub fn add_sent_image(&mut self, png: PathBuf, thumbnail: Option<String>, now_ms: u64) {
+        if self.peers.is_empty() {
+            return;
+        }
+        let item = HistoryItem {
+            id: 0,
+            kind: "image".into(),
+            direction: DIR_OUT.into(),
+            text: None,
+            file_name: None,
+            location: None,
+            thumbnail,
+            at_ms: now_ms,
+        };
+        self.push_image(item, png);
+    }
+
+    /// Imagen recibida y puesta en el portapapeles; `location` es el archivo de `image_dir`.
+    pub fn add_received_image(
+        &mut self,
+        png: PathBuf,
+        thumbnail: Option<String>,
+        location: String,
+        now_ms: u64,
+    ) {
+        let item = HistoryItem {
+            id: 0,
+            kind: "image".into(),
+            direction: DIR_IN.into(),
+            text: None,
+            file_name: Path::new(&location)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            location: Some(location),
+            thumbnail,
+            at_ms: now_ms,
+        };
+        self.push_image(item, png);
+    }
+
+    /// Imagen recibida que no se pudo poner en el portapapeles: queda como archivo.
+    pub fn add_received_file(&mut self, location: String, now_ms: u64) {
+        let item = HistoryItem {
+            id: 0,
+            kind: "file".into(),
+            direction: DIR_IN.into(),
+            text: None,
+            file_name: Path::new(&location)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned()),
+            location: Some(location),
+            thumbnail: None,
+            at_ms: now_ms,
+        };
+        self.push(item);
+    }
+
+    /// PNG de la caché de un item de imagen.
+    pub fn image_path(&self, id: u64) -> Option<PathBuf> {
+        self.images.get(&id).cloned()
+    }
+
+    pub fn image_in_use(&self, png: &Path) -> bool {
+        self.images.values().any(|p| p == png)
+    }
+
+    /// Manda un PNG a la papelera (y con él los borrados fallidos, para reintentarlos).
+    pub fn discard_image(&mut self, png: PathBuf) {
+        self.trash.push(png);
+        self.trash.append(&mut self.failed_deletes);
+    }
+
+    pub fn take_trash(&mut self) -> Vec<PathBuf> {
+        std::mem::take(&mut self.trash)
+    }
+
+    pub fn retry_later(&mut self, paths: Vec<PathBuf>) {
+        self.failed_deletes.extend(paths);
     }
 
     /// Texto copiado en el PC y entregado al Hub. Sin móvil conectado no se anota: no salió
@@ -287,6 +406,7 @@ impl AppState {
             text: Some(text),
             file_name: None,
             location: None,
+            thumbnail: None,
             at_ms: now_ms,
         });
     }
@@ -314,7 +434,12 @@ impl AppState {
     }
 
     pub fn show_clip_notice(&mut self, now_ms: u64) {
-        self.clip_notice_until = Some(now_ms.saturating_add(CLIP_NOTICE_MS));
+        self.show_notice(CLIP_TOO_LARGE_NOTICE, now_ms);
+    }
+
+    /// Aviso informativo de 5 s (sustituye al que hubiera).
+    pub fn show_notice(&mut self, text: &str, now_ms: u64) {
+        self.clip_notice = Some((text.to_string(), now_ms.saturating_add(CLIP_NOTICE_MS)));
     }
 
     pub fn set_paired(&mut self, devices: Vec<PairedDevice>) {
@@ -326,7 +451,11 @@ impl AppState {
     }
 
     pub fn snapshot(&self, now_ms: u64) -> UiState {
-        let notice = self.clip_notice_until.is_some_and(|until| now_ms < until);
+        let clip_notice = self
+            .clip_notice
+            .as_ref()
+            .filter(|(_, until)| now_ms < *until)
+            .map(|(text, _)| text.clone());
         let paired = self
             .paired
             .iter()
@@ -353,7 +482,7 @@ impl AppState {
             history: self.history.iter().cloned().collect(),
             transfers: self.transfers.clone(),
             clipboard_error: self.clipboard_error.clone(),
-            clip_notice: notice.then(|| CLIP_TOO_LARGE_NOTICE.to_string()),
+            clip_notice,
             server_error: self.server_error.clone(),
             paired,
             pairing,
@@ -384,13 +513,16 @@ fn log(msg: &str) {
 }
 
 /// Lo que comparten los comandos, el bucle de eventos y el hilo del portapapeles.
-/// Orden de bloqueo: `state` antes que el Hub, nunca al revés.
+/// Orden de bloqueo: `state` antes que el Hub, nunca al revés; `local_clip` y `local_image` no
+/// se tienen tomados mientras se toma otro.
 pub struct Ctx {
     hub: Hub,
     pc_name: String,
     state: Mutex<AppState>,
     /// texto local que el Hub ofrece a las sesiones nuevas; se actualiza antes de cada broadcast
     local_clip: Arc<Mutex<Option<String>>>,
+    /// imagen local que el Hub ofrece a las sesiones nuevas; ídem
+    local_image: Arc<Mutex<Option<LocalImage>>>,
     clipboard: ClipboardHandle,
     changed: Arc<Notify>,
 }
@@ -400,6 +532,7 @@ impl Ctx {
         hub: Hub,
         pc_name: String,
         local_clip: Arc<Mutex<Option<String>>>,
+        local_image: Arc<Mutex<Option<LocalImage>>>,
         clipboard: ClipboardHandle,
     ) -> Self {
         let mut state = AppState::new(pc_name.clone());
@@ -409,6 +542,7 @@ impl Ctx {
             pc_name,
             state: Mutex::new(state),
             local_clip,
+            local_image,
             clipboard,
             changed: Arc::new(Notify::new()),
         }
@@ -520,6 +654,8 @@ impl Ctx {
 
     /// Texto nuevo en el portapapeles del PC (desde el hilo del portapapeles).
     pub fn on_local_text(&self, text: String) {
+        // el portapapeles ya no tiene imagen: no se ofrece a las sesiones nuevas
+        self.replace_local_image(None);
         match classify_local_clip(&text) {
             LocalClip::Blank => self.set_local(None),
             LocalClip::TooLarge => {
@@ -538,11 +674,42 @@ impl Ctx {
         }
     }
 
+    /// Cambia la imagen local; el PNG anterior, si cambia, va a la papelera (el hilo del
+    /// portapapeles comprueba antes de borrarlo que nadie lo use).
+    fn replace_local_image(&self, img: Option<LocalImage>) {
+        let new_path = img.as_ref().map(|i| i.png_path.clone());
+        let old = std::mem::replace(&mut *lock(&self.local_image), img);
+        if let Some(old) = old.filter(|o| Some(&o.png_path) != new_path.as_ref()) {
+            lock(&self.state).discard_image(old.png_path);
+        }
+    }
+
+    fn show_notice_for(&self, text: &str) {
+        lock(&self.state).show_notice(text, now_ms());
+        self.notify();
+        self.notify_after(CLIP_NOTICE_MS);
+    }
+
     /// Consume los eventos del Hub mientras la app viva.
     pub async fn run_events(self: Arc<Self>, mut events: mpsc::UnboundedReceiver<HubEvent>) {
         while let Some(ev) = events.recv().await {
-            if let HubEvent::ClipReceived { text, .. } = &ev {
-                self.clipboard.write(text.clone());
+            match &ev {
+                HubEvent::ClipReceived { text, .. } => self.clipboard.write(text.clone()),
+                // decodificar y escribir lo hace el hilo del portapapeles, no el runtime
+                HubEvent::ClipImageReceived {
+                    session_id,
+                    location,
+                } => {
+                    if !self
+                        .clipboard
+                        .write_received_image(*session_id, location.clone())
+                    {
+                        log("no se pudo poner la imagen: el portapapeles no está disponible");
+                        self.show_notice_for(IMAGE_WRITE_ERROR);
+                        lock(&self.state).add_received_file(location.clone(), now_ms());
+                    }
+                }
+                _ => {}
             }
             let paired = matches!(ev, HubEvent::DevicePaired { .. });
             let mut st = lock(&self.state);
@@ -632,6 +799,117 @@ pub fn forget_device(device_key: String, state: State<'_, Arc<Ctx>>) -> Result<(
 #[tauri::command]
 pub async fn copy_text(text: String, state: State<'_, Arc<Ctx>>) -> Result<(), String> {
     state.clipboard.write_and_wait(text).await
+}
+
+/// Vuelve a poner en el portapapeles la imagen de un item del historial, sin reenviarla a los
+/// móviles. `Err("No se pudo poner la imagen en el portapapeles")` si el id no es de una imagen
+/// o no se pudo poner.
+#[tauri::command]
+pub async fn copy_image(id: u64, state: State<'_, Arc<Ctx>>) -> Result<(), String> {
+    let png = lock(&state.state)
+        .image_path(id)
+        .ok_or_else(|| IMAGE_WRITE_ERROR.to_string())?;
+    state.clipboard.copy_image(png).await
+}
+
+impl clipboard::Host for Ctx {
+    fn set_clipboard_error(&self, error: Option<String>) {
+        Ctx::set_clipboard_error(self, error);
+    }
+
+    fn set_initial_local(&self, text: &str) {
+        Ctx::set_initial_local(self, text);
+    }
+
+    fn on_local_text(&self, text: String) {
+        Ctx::on_local_text(self, text);
+    }
+
+    fn text_written(&self, text: String) {
+        self.set_local(Some(text));
+        self.replace_local_image(None);
+    }
+
+    fn set_local_image(&self, img: Option<LocalImage>) {
+        self.replace_local_image(img);
+    }
+
+    fn on_local_image(&self, img: LocalImage, thumbnail: Option<String>) {
+        // antes del broadcast: el envío de inicio de las sesiones nuevas lee `local_image`
+        self.replace_local_image(Some(img.clone()));
+        match self.hub.broadcast_clip_image(&img) {
+            Ok(()) => {
+                lock(&self.state).add_sent_image(img.png_path, thumbnail, now_ms());
+                self.notify();
+            }
+            Err(e) => {
+                log(&format!("no se pudo difundir la imagen: {e}"));
+                self.replace_local_image(None);
+                if e == "too_large" {
+                    self.show_notice_for(IMAGE_TOO_LARGE_NOTICE);
+                }
+            }
+        }
+    }
+
+    fn on_image_received(
+        &self,
+        session_id: u64,
+        hash: String,
+        png: Option<(PathBuf, u64)>,
+        thumbnail: Option<String>,
+        location: String,
+    ) {
+        // ese móvil ya la tiene: con el hash leído de vuelta no rebota
+        self.hub.mark_image_synced(session_id, &hash);
+        match png {
+            Some((path, size)) => {
+                if size <= MAX_CLIP_IMAGE_BYTES {
+                    // a los demás móviles; el de origen ya está sincronizado y se salta
+                    let img = LocalImage {
+                        hash,
+                        png_path: path.clone(),
+                    };
+                    self.replace_local_image(Some(img.clone()));
+                    if let Err(e) = self.hub.broadcast_clip_image(&img) {
+                        log(&format!("no se pudo reenviar la imagen: {e}"));
+                    }
+                } else {
+                    self.replace_local_image(None);
+                }
+                lock(&self.state).add_received_image(path, thumbnail, location, now_ms());
+            }
+            None => {
+                self.replace_local_image(None);
+                lock(&self.state).add_received_file(location, now_ms());
+            }
+        }
+        self.notify();
+    }
+
+    fn on_image_receive_failed(&self, location: String) {
+        lock(&self.state).add_received_file(location, now_ms());
+        self.notify();
+    }
+
+    fn show_notice(&self, text: &'static str) {
+        self.show_notice_for(text);
+    }
+
+    fn take_trash(&self) -> Vec<PathBuf> {
+        lock(&self.state).take_trash()
+    }
+
+    fn image_in_use(&self, png: &Path) -> bool {
+        let local = lock(&self.local_image)
+            .as_ref()
+            .is_some_and(|i| i.png_path == png);
+        local || lock(&self.state).image_in_use(png)
+    }
+
+    fn retry_later(&self, failed: Vec<PathBuf>) {
+        lock(&self.state).retry_later(failed);
+    }
 }
 
 #[cfg(test)]
@@ -1115,5 +1393,181 @@ mod tests {
         let vacio = serde_json::to_value(st().snapshot(0)).unwrap();
         assert!(vacio["pairing"].is_null());
         assert!(vacio["paired"].as_array().unwrap().is_empty());
+    }
+
+    // --- imágenes ---
+
+    fn png(n: u32) -> PathBuf {
+        PathBuf::from(format!("/cache/images/{n:064x}.png"))
+    }
+
+    #[test]
+    fn imagen_enviada_va_al_historial_con_miniatura() {
+        let mut s = st();
+        s.apply(connected(1, "movil"), 1);
+        s.add_sent_image(png(1), Some("data:image/png;base64,AAAA".into()), 9);
+        let ui = s.snapshot(0);
+        let h = &ui.history[0];
+        assert_eq!(h.kind, "image");
+        assert_eq!(h.direction, "out");
+        assert_eq!(h.thumbnail.as_deref(), Some("data:image/png;base64,AAAA"));
+        assert_eq!(h.text, None);
+        assert_eq!(h.location, None);
+        assert_eq!(h.at_ms, 9);
+        assert_eq!(s.image_path(h.id), Some(png(1)));
+        let v = serde_json::to_value(&ui).unwrap();
+        assert_eq!(v["history"][0]["kind"], "image");
+        assert_eq!(v["history"][0]["thumbnail"], "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn imagen_copiada_sin_movil_no_se_anota() {
+        let mut s = st();
+        s.add_sent_image(png(1), Some("data:image/png;base64,AAAA".into()), 1);
+        assert!(s.snapshot(0).history.is_empty());
+        // su PNG no queda referenciado por el historial
+        assert!(!s.image_in_use(&png(1)));
+    }
+
+    #[test]
+    fn imagen_recibida_va_al_historial_con_su_ubicacion() {
+        let mut s = st();
+        s.add_received_image(
+            png(2),
+            Some("data:image/png;base64,BBBB".into()),
+            "/home/u/Imágenes/ClipSync/foto.jpg".into(),
+            4,
+        );
+        let h = &s.snapshot(0).history[0];
+        assert_eq!(h.kind, "image");
+        assert_eq!(h.direction, "in");
+        assert_eq!(h.file_name.as_deref(), Some("foto.jpg"));
+        assert_eq!(h.location.as_deref(), Some("/home/u/Imágenes/ClipSync/foto.jpg"));
+        assert_eq!(s.image_path(h.id), Some(png(2)));
+    }
+
+    #[test]
+    fn imagen_recibida_que_no_se_pudo_poner_queda_como_archivo() {
+        let mut s = st();
+        s.add_received_file("/home/u/Imágenes/ClipSync/rota.png".into(), 4);
+        let h = &s.snapshot(0).history[0];
+        assert_eq!(h.kind, "file");
+        assert_eq!(h.direction, "in");
+        assert_eq!(h.file_name.as_deref(), Some("rota.png"));
+        assert_eq!(h.location.as_deref(), Some("/home/u/Imágenes/ClipSync/rota.png"));
+        assert_eq!(h.thumbnail, None);
+        assert_eq!(s.image_path(h.id), None);
+    }
+
+    #[test]
+    fn items_que_no_son_imagen_llevan_thumbnail_null() {
+        let mut s = st();
+        s.add_text(DIR_OUT, "x".into(), 1);
+        let v = serde_json::to_value(s.snapshot(0)).unwrap();
+        assert!(v["history"][0]["thumbnail"].is_null());
+        assert_eq!(s.image_path(v["history"][0]["id"].as_u64().unwrap()), None);
+        assert_eq!(s.image_path(999), None);
+    }
+
+    #[test]
+    fn transferencias_de_portapapeles_terminadas_no_anaden_archivo() {
+        let mut s = st();
+        for (id, dir) in [("i", Direction::In), ("o", Direction::Out)] {
+            let mut done = tu(id, dir, TransferState::Done, 100);
+            done.purpose = Some("clipboard".into());
+            done.location = Some("/home/u/Imágenes/ClipSync/a.png".into());
+            s.apply(HubEvent::Transfer(done), 2);
+        }
+        let ui = s.snapshot(0);
+        assert!(ui.history.is_empty());
+        assert!(ui.transfers.is_empty());
+        // la imagen la anota el hilo del portapapeles tras ponerla
+        s.apply(
+            HubEvent::ClipImageReceived {
+                session_id: 1,
+                location: "/home/u/Imágenes/ClipSync/a.png".into(),
+            },
+            3,
+        );
+        assert!(s.snapshot(0).history.is_empty());
+    }
+
+    #[test]
+    fn historial_con_imagenes_limitado_a_50_y_poda_sus_png() {
+        let mut s = st();
+        s.apply(connected(1, "movil"), 1);
+        for i in 1..=51 {
+            s.add_sent_image(png(i), Some(format!("data:image/png;base64,{i}")), i as u64);
+        }
+        let h = s.snapshot(0).history;
+        assert_eq!(h.len(), 50);
+        assert_eq!(h[49].thumbnail.as_deref(), Some("data:image/png;base64,2"));
+        assert_eq!(s.take_trash(), vec![png(1)]);
+        assert!(s.take_trash().is_empty());
+        assert!(!s.image_in_use(&png(1)));
+        assert!(s.image_in_use(&png(2)));
+        // un archivo o un texto también expulsa a la imagen más antigua
+        s.add_text(DIR_OUT, "t".into(), 60);
+        assert_eq!(s.take_trash(), vec![png(2)]);
+    }
+
+    #[test]
+    fn un_png_compartido_sigue_en_uso_aunque_se_pode_un_item() {
+        let mut s = st();
+        s.apply(connected(1, "movil"), 1);
+        s.add_sent_image(png(1), Some("data:image/png;base64,A".into()), 1);
+        for i in 0..49 {
+            s.add_text(DIR_OUT, i.to_string(), 2);
+        }
+        // la misma imagen copiada otra vez
+        s.add_sent_image(png(1), Some("data:image/png;base64,A".into()), 3);
+        assert_eq!(s.take_trash(), vec![png(1)]);
+        // quien borra comprueba antes si sigue en uso
+        assert!(s.image_in_use(&png(1)));
+    }
+
+    #[test]
+    fn los_borrados_fallidos_se_reintentan_en_la_siguiente_poda() {
+        let mut s = st();
+        s.apply(connected(1, "movil"), 1);
+        for i in 1..=51 {
+            s.add_sent_image(png(i), Some("data:image/png;base64,A".into()), 1);
+        }
+        let fallidos = s.take_trash();
+        s.retry_later(fallidos);
+        // no se reintenta en cada sondeo, solo al podar de nuevo
+        assert!(s.take_trash().is_empty());
+        s.add_sent_image(png(52), Some("data:image/png;base64,A".into()), 2);
+        assert_eq!(s.take_trash(), vec![png(2), png(1)]);
+    }
+
+    #[test]
+    fn descartar_un_png_lo_manda_a_la_papelera_con_los_pendientes() {
+        let mut s = st();
+        s.retry_later(vec![png(7)]);
+        s.discard_image(png(8));
+        assert_eq!(s.take_trash(), vec![png(8), png(7)]);
+    }
+
+    #[test]
+    fn avisos_de_imagen_usan_clip_notice_5_s() {
+        let mut s = st();
+        s.show_notice(IMAGE_TOO_LARGE_NOTICE, 1_000);
+        assert_eq!(
+            s.snapshot(5_999).clip_notice.as_deref(),
+            Some("Imagen demasiado grande para sincronizar (máx. 20 MB)")
+        );
+        assert_eq!(s.snapshot(6_000).clip_notice, None);
+        s.show_notice(IMAGE_WRITE_ERROR, 7_000);
+        assert_eq!(
+            s.snapshot(7_000).clip_notice.as_deref(),
+            Some("No se pudo poner la imagen en el portapapeles")
+        );
+        // el de texto sigue igual
+        s.show_clip_notice(8_000);
+        assert_eq!(
+            s.snapshot(8_000).clip_notice.as_deref(),
+            Some(CLIP_TOO_LARGE_NOTICE)
+        );
     }
 }
