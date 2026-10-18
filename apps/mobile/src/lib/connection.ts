@@ -16,7 +16,13 @@ import {
 } from '@clipsync/protocol';
 import * as Crypto from 'expo-crypto';
 import * as Device from 'expo-device';
-import { AppState, type AppStateStatus, type NativeEventSubscription } from 'react-native';
+import {
+  AppState,
+  type AppStateStatus,
+  type NativeEventSubscription,
+  type TurboModule,
+  TurboModuleRegistry,
+} from 'react-native';
 
 import { readClipboard, startClipboardWatcher, writeClipboard } from './clipboardWatcher';
 import { resolvedPcs, startDiscovery, stopDiscovery } from './discovery';
@@ -79,6 +85,23 @@ const CLIP_WRITE_FAILED = 'No se pudo escribir en el portapapeles';
 /** Margen tras cerrarse un selector antes de pausar si la app sigue en segundo plano. */
 const PICKER_SETTLE_MS = 1000;
 
+/** El módulo nativo que alimenta AppState (spec NativeAppState de React Native). */
+interface NativeAppStateModule extends TurboModule {
+  getCurrentAppState(success: (s: { app_state: string }) => void, error: (e: unknown) => void): void;
+}
+const nativeAppState = TurboModuleRegistry.get<NativeAppStateModule>('AppState');
+
+/** Estado que tiene ahora Android, sin esperar a que JS procese el evento de cambio. */
+function confirmAppState(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!nativeAppState) {
+      reject(new Error('AppState nativo no disponible'));
+      return;
+    }
+    nativeAppState.getCurrentAppState((s) => resolve(s.app_state), reject);
+  });
+}
+
 function isFinished(u: TransferUpdate): boolean {
   return u.state === 'done' || u.state === 'failed' || u.state === 'cancelled';
 }
@@ -119,8 +142,10 @@ export class ConnectionManager {
     setTimer: (fn, ms) => setTimeout(fn, ms),
     clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
     appState: () => AppState.currentState,
+    confirmAppState,
     pickerOpen: isPickerOpen,
-    pause: () => this.applyBackground(),
+    // ya confirmado con Android: no se vuelve a mirar AppState.currentState, que puede ir atrasado
+    pause: () => this.applyBackground('background'),
   });
   /** Hay un «Compartir → ClipSync» esperando a enviarse (lo avisa ShareSender). */
   private sharePending = false;

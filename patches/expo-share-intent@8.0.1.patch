@@ -1,0 +1,111 @@
+diff --git a/android/src/main/java/expo/modules/shareintent/ExpoShareIntentModule.kt b/android/src/main/java/expo/modules/shareintent/ExpoShareIntentModule.kt
+index ff5b1001e7bb3443482727cec48c22579465c73b..f2989b44d0e13ee88d12113fb0cd8448d5622703 100644
+--- a/android/src/main/java/expo/modules/shareintent/ExpoShareIntentModule.kt
++++ b/android/src/main/java/expo/modules/shareintent/ExpoShareIntentModule.kt
+@@ -66,37 +66,52 @@ class ExpoShareIntentModule : Module() {
+                     "filePath" to instance?.getAbsolutePath(uri),
+                 )
+             }
+-            val queryResult: Cursor = resolver.query(uri, null, null, null, null)!!
+-            queryResult.moveToFirst()
+-            val fileName = queryResult.getString(queryResult.getColumnIndex(OpenableColumns.DISPLAY_NAME))
+-            val fileSize = queryResult.getString(queryResult.getColumnIndex(OpenableColumns.SIZE))
+-            queryResult.close()
++            // ClipSync: un cursor nulo o vacío (URI que el proveedor no conoce) lanzaba
++            // NullPointerException / CursorIndexOutOfBoundsException y cerraba la app; ahora se
++            // lanza un error normal que handleShareIntent convierte en onError.
++            val queryResult: Cursor = resolver.query(uri, null, null, null, null)
++                ?: throw IllegalStateException("query() devolvió null para $uri")
++            val fileName: String?
++            val fileSize: String?
++            queryResult.use { cursor ->
++                if (!cursor.moveToFirst()) throw IllegalStateException("query() vacío para $uri")
++                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
++                val sizeIndex = cursor.getColumnIndex(OpenableColumns.SIZE)
++                fileName = if (nameIndex >= 0) cursor.getString(nameIndex) else null
++                fileSize = if (sizeIndex >= 0) cursor.getString(sizeIndex) else null
++            }
+ 
+-            val mimeType = resolver.getType(uri)!!
++            // ClipSync: algunos proveedores no dan tipo; antes era un `!!`
++            val mimeType: String? = resolver.getType(uri)
+ 
+             var mediaWidth: String? = null;
+             var mediaHeight: String? = null;
+             var mediaDuration: String? = null;
+-            if (mimeType.startsWith("image/")) {
+-                val options = BitmapFactory.Options().apply {
+-                    inJustDecodeBounds = true
++            // ClipSync: las medidas son opcionales; si no se pueden leer, el archivo se comparte igual
++            try {
++                if (mimeType?.startsWith("image/") == true) {
++                    val options = BitmapFactory.Options().apply {
++                        inJustDecodeBounds = true
++                    }
++                    BitmapFactory.decodeStream(resolver.openInputStream(uri), null, options)
++                    mediaHeight = options.outHeight.toString()
++                    mediaWidth = options.outWidth.toString()
+                 }
+-                BitmapFactory.decodeStream(resolver.openInputStream(uri), null, options)
+-                mediaHeight = options.outHeight.toString()
+-                mediaWidth = options.outWidth.toString()
+-            }
+-            if (mimeType.startsWith("video/")) {
+-                val retriever = MediaMetadataRetriever()
+-                retriever.setDataSource(instance?.getAbsolutePath(uri))
+-                mediaWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt().toString() ?: null
+-                mediaHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt().toString() ?: null
+-                // Check orientation and flip size if required
+-                val metaRotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toInt() ?: 0;
+-                if (metaRotation == 90 || metaRotation == 270) {
+-                    mediaWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt().toString() ?: null
+-                    mediaHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt().toString() ?: null
++                if (mimeType?.startsWith("video/") == true) {
++                    val retriever = MediaMetadataRetriever()
++                    retriever.setDataSource(instance?.getAbsolutePath(uri))
++                    mediaWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt().toString() ?: null
++                    mediaHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt().toString() ?: null
++                    // Check orientation and flip size if required
++                    val metaRotation = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_ROTATION)?.toInt() ?: 0;
++                    if (metaRotation == 90 || metaRotation == 270) {
++                        mediaWidth = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toInt().toString() ?: null
++                        mediaHeight = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toInt().toString() ?: null
++                    }
++                    mediaDuration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toInt().toString() ?: null
+                 }
+-                mediaDuration = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toInt().toString() ?: null
++            } catch (e: Exception) {
++                Log.w("ExpoShareIntent", "No se pudieron leer las medidas de $uri", e)
+             }
+ 
+             return mapOf(
+@@ -142,14 +157,27 @@ class ExpoShareIntentModule : Module() {
+                 if (intent.action == Intent.ACTION_SEND) {
+                     val uri = intent.parcelable<Uri>(Intent.EXTRA_STREAM);
+                     if (uri != null) {
+-                        notifyShareIntent(mapOf( "files" to arrayOf(getFileInfo(uri), "type" to "file")))
++                        // ClipSync: un archivo ilegible se avisa como error en vez de cerrar la app
++                        val info = try {
++                            getFileInfo(uri)
++                        } catch (e: Exception) {
++                            notifyError("Cannot read shared file: " + e.message)
++                            return
++                        }
++                        notifyShareIntent(mapOf( "files" to arrayOf(info, "type" to "file")))
+                     } else {
+                         notifyError("empty uri for file sharing: " + intent.action)
+                     }
+                 } else if (intent.action == Intent.ACTION_SEND_MULTIPLE) {
+                     val uris = intent.parcelableArrayList<Uri>(Intent.EXTRA_STREAM)
+                     if (uris != null) {
+-                        notifyShareIntent(mapOf( "files" to uris.map { getFileInfo(it) }, "type" to "file"))
++                        val infos = try {
++                            uris.map { getFileInfo(it) }
++                        } catch (e: Exception) {
++                            notifyError("Cannot read shared file: " + e.message)
++                            return
++                        }
++                        notifyShareIntent(mapOf( "files" to infos, "type" to "file"))
+                     } else {
+                         notifyError("empty uris array for file sharing: " + intent.action)
+                     }
