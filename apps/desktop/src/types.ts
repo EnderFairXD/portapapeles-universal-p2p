@@ -37,6 +37,8 @@ export interface Transfer {
   state: TransferState;
   error?: string | null;
   location?: string | null;
+  /** `"clipboard"` para imágenes del portapapeles; ausente o `null` en archivos normales. */
+  purpose?: string | null;
 }
 
 /** Móvil emparejado; `deviceKey` es su clave pública en hex (la misma que `Peer.deviceId`). */
