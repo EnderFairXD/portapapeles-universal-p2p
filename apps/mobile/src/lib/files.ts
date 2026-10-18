@@ -1,9 +1,11 @@
 // Archivos: origen para enviar (File.open + readBytes) y destino SAF para recibir.
-import type { FileMeta, FileSink, FileSource } from '@clipsync/protocol';
+import { PURPOSE_CLIPBOARD, type FileMeta, type FileSink, type FileSource } from '@clipsync/protocol';
+import * as Crypto from 'expo-crypto';
 import * as DocumentPicker from 'expo-document-picker';
-import { Directory, File, FileMode } from 'expo-file-system';
+import { Directory, File, FileMode, Paths } from 'expo-file-system';
 
 import { sanitizeFileName } from './fileName';
+import { imageExtension } from './imagePolicy';
 import { createPickerGuard } from './pickerGuard';
 import { loadSettings, saveSettings } from './settings';
 
@@ -154,7 +156,7 @@ export async function chooseReceiveDir(): Promise<string | null> {
   return dir.uri;
 }
 
-function deleteQuietly(file: File): void {
+export function deleteQuietly(file: File): void {
   try {
     if (file.exists) file.delete();
   } catch {
@@ -170,11 +172,31 @@ function createIn(dirUri: string, name: string): Promise<File> {
   return new Directory(dirUri).createFileAsync(name, 'application/octet-stream');
 }
 
+// --- imágenes del portapapeles ---
+
+/** `Paths.cache/<name>` o `Paths.document/<name>`, creada si falta. */
+export function appDir(base: 'cache' | 'document', name: string): Directory {
+  const dir = new Directory(base === 'cache' ? Paths.cache : Paths.document, name);
+  dir.create({ idempotent: true, intermediates: true });
+  return dir;
+}
+
+/** Nombre único y ordenable por fecha: marca de tiempo de 13 cifras + aleatorio. */
+export function newImageFileName(ext: string): string {
+  return `${String(Date.now()).padStart(13, '0')}-${Crypto.randomUUID().slice(0, 8)}.${ext}`;
+}
+
 /**
  * Crea el archivo en la carpeta SAF de los ajustes; si no hay (o ya no es accesible),
- * pide una y la guarda. El nombre se sanea igual que en el PC.
+ * pide una y la guarda. El nombre se sanea igual que en el PC. Una imagen para el
+ * portapapeles (`purpose`) va a `Paths.cache/images/`, no a la carpeta SAF.
  */
 export async function openSink(meta: FileMeta): Promise<FileSink> {
+  if (meta.purpose === PURPOSE_CLIPBOARD) {
+    const file = new File(appDir('cache', 'images'), newImageFileName(imageExtension(meta.mime)));
+    file.create();
+    return sinkFor(file);
+  }
   const name = sanitizeFileName(meta.name);
   let file: File | null = null;
   const saved = loadSettings().receiveDirUri;
@@ -190,8 +212,11 @@ export async function openSink(meta: FileMeta): Promise<FileSink> {
     if (!picked) throw new NoReceiveDirError();
     file = await createIn(picked, name);
   }
+  return sinkFor(file);
+}
 
-  const target = file;
+/** Escribe en `target`; si algo falla o se aborta, lo borra. */
+function sinkFor(target: File): FileSink {
   let handle;
   try {
     handle = target.open(FileMode.WriteOnly);

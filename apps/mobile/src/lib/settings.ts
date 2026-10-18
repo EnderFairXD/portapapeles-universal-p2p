@@ -14,6 +14,14 @@ export interface Settings {
   lastPc: PcAddress | null;
   /** El PC emparejado; null hasta escanear su QR. */
   pc: PairedPc | null;
+  /** SHA-256 de la última imagen que consta que el PC tiene (R29 de imágenes). */
+  lastImageHash: string | null;
+  /** Date.now() de la última revisión de capturas (Tarea 9); null hasta la primera. */
+  lastScreenshotCheck: number | null;
+  /** «Enviar capturas automáticamente». */
+  sendScreenshots: boolean;
+  /** «Guardar imágenes recibidas en la galería». */
+  saveToGallery: boolean;
 }
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
@@ -42,6 +50,12 @@ export function loadSettings(): Settings {
     lastSyncedHash: typeof raw?.lastSyncedHash === 'string' && SHA256_HEX.test(raw.lastSyncedHash) ? raw.lastSyncedHash : null,
     lastPc: parseLastPc(raw?.lastPc),
     pc: parsePairedPc(raw?.pc),
+    lastImageHash: typeof raw?.lastImageHash === 'string' && SHA256_HEX.test(raw.lastImageHash) ? raw.lastImageHash : null,
+    lastScreenshotCheck:
+      typeof raw?.lastScreenshotCheck === 'number' && Number.isFinite(raw.lastScreenshotCheck) ? raw.lastScreenshotCheck : null,
+    // activados por defecto
+    sendScreenshots: raw?.sendScreenshots !== false,
+    saveToGallery: raw?.saveToGallery !== false,
   };
 }
 
@@ -51,6 +65,10 @@ export function saveSettings(s: Settings): void {
     lastSyncedHash: s.lastSyncedHash,
     lastPc: s.lastPc,
     pc: s.pc,
+    lastImageHash: s.lastImageHash,
+    lastScreenshotCheck: s.lastScreenshotCheck,
+    sendScreenshots: s.sendScreenshots,
+    saveToGallery: s.saveToGallery,
   });
 }
 
