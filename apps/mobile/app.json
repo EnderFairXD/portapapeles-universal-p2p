@@ -60,6 +60,17 @@
           "cameraPermission": "ClipSync usa la cámara para escanear el código QR del PC.",
           "recordAudioAndroid": false
         }
+      ],
+      [
+        "expo-media-library",
+        {
+          "photosPermission": "ClipSync lee tus capturas de pantalla para enviarlas al PC.",
+          "savePhotosPermission": "ClipSync guarda en la galería las imágenes que recibe del PC.",
+          "isAccessMediaLocationEnabled": false,
+          "granularPermissions": [
+            "photo"
+          ]
+        }
       ]
     ]
   }

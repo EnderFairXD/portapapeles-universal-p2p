@@ -2,7 +2,9 @@
 import {
   CONNECT_TIMEOUT_MS,
   DEFAULT_TCP_PORT,
+  MAX_CLIP_IMAGE_BYTES,
   MAX_HISTORY,
+  PURPOSE_CLIPBOARD,
   RECONNECT_INTERVAL_MS,
   Session,
   decideClip,
@@ -16,6 +18,7 @@ import {
 } from '@clipsync/protocol';
 import * as Crypto from 'expo-crypto';
 import * as Device from 'expo-device';
+import { File } from 'expo-file-system';
 import {
   AppState,
   type AppStateStatus,
@@ -24,7 +27,13 @@ import {
   TurboModuleRegistry,
 } from 'react-native';
 
-import { readClipboard, startClipboardWatcher, writeClipboard } from './clipboardWatcher';
+import {
+  clipboardHasImage,
+  readClipboard,
+  startClipboardWatcher,
+  withClipboardSuppressed,
+  writeClipboard,
+} from './clipboardWatcher';
 import { resolvedPcs, startDiscovery, stopDiscovery } from './discovery';
 import { loadIdentity } from './identity';
 import { installNativeCrypto } from './nativeCrypto';
@@ -39,7 +48,9 @@ import {
   reconnectDelayMs,
   type SendFileResult,
 } from './connectionPolicy';
-import { isPickerOpen, onPickerSettled, openSink, resetPickers } from './files';
+import { deleteQuietly, isPickerOpen, onPickerSettled, openSink, resetPickers } from './files';
+import { ImageKeeper, ImageOutbox, isOwnWrite } from './imagePolicy';
+import { cachedImageSource, keepForHistory, readClipboardImage, setClipboardImage, writeReceivedImage } from './images';
 import { bytesToHex, hexToBytes, pairedPcFromInfo, type PairedPc } from './pairing';
 import { connectCandidates, type PcAddress } from './pcAddress';
 import { getDeviceId, loadSettings, updateSettings } from './settings';
@@ -51,12 +62,17 @@ export type Transport = 'wifi' | 'usb';
 
 export interface HistoryEntry {
   id: string;
-  kind: 'text' | 'file';
+  kind: 'text' | 'file' | 'image';
   direction: 'in' | 'out';
   text?: string;
   fileName?: string;
   /** Archivo recibido: URI content:// del documento guardado. */
   location?: string;
+  /**
+   * Imagen: copia en Paths.document/images (file://), o la URI que dio quien la envió con
+   * `sendClipboardImageFile` (p. ej. el content:// de una captura).
+   */
+  imageUri?: string;
   /** Date.now() */
   at: number;
 }
@@ -75,6 +91,9 @@ export interface ConnState {
   pc: { name: string; pairing: boolean } | null;
 }
 
+/** Resultado de `sendClipboardImageFile`: además, `duplicate` si el PC ya la tiene o ya va de camino. */
+export type ImageSendResult = SendFileResult | { ok: false; reason: 'duplicate' };
+
 /** Terminadas (fallidas o canceladas) que se conservan en la lista, como en el PC. */
 export const MAX_FINISHED_TRANSFERS = 5;
 const USB_HOST = '127.0.0.1';
@@ -83,6 +102,9 @@ const CLIP_TOO_LARGE = 'Texto demasiado grande para sincronizar (máx. 1 MB)';
 const PC_UNREACHABLE = 'PC no alcanzable. Comprueba que el móvil y el PC están en la misma red WiFi.';
 const IDENTITY_FAILED = 'No se pudo acceder al almacén seguro del móvil.';
 const CLIP_WRITE_FAILED = 'No se pudo escribir en el portapapeles';
+export const IMAGE_TOO_LARGE = 'Imagen demasiado grande para sincronizar (máx. 20 MB)';
+export const IMAGE_WRITE_FAILED = 'No se pudo poner la imagen en el portapapeles';
+export const GALLERY_FAILED = 'No se pudo guardar en la galería';
 /** Margen tras cerrarse un selector antes de pausar si la app sigue en segundo plano. */
 const PICKER_SETTLE_MS = 1000;
 
@@ -163,6 +185,17 @@ export class ConnectionManager {
   private ready = false;
   /** Anti-rebote del móvil (con un solo PC), persistido en settings.json (R29). */
   private keeper: SyncKeeper | null = null;
+  /** Anti-rebote de imágenes, persistido en settings.json (`lastImageHash`, R29). */
+  private imageKeeper: ImageKeeper | null = null;
+  /** R7: como mucho una imagen del portapapeles en cola y otra en vuelo. */
+  private readonly outbox = new ImageOutbox(() => this.images().current);
+  /** Imágenes salientes: qué guardar en el historial al terminar (y qué borrar de la caché). */
+  private readonly imageSends = new Map<string, { cacheUri?: string; imageUri?: string }>();
+  /** Lecturas y escrituras de imágenes, de una en una (nunca dos a la vez sobre el portapapeles). */
+  private imageWork: Promise<void> = Promise.resolve();
+  private imageCheckQueued = false;
+  /** Hash de lectura de vuelta de la última imagen que escribió la app (hasta que se vea otra). */
+  private lastWrittenImage: string | null = null;
   /** Última dirección WiFi del PC que funcionó; se prueba la primera. */
   private lastPc: PcAddress | null | undefined = undefined;
   /** Handshakes fallidos seguidos con el PC alcanzable (D8); `ready` lo pone a 0. */
@@ -227,8 +260,29 @@ export class ConnectionManager {
     this.session?.cancelTransfer(id);
   }
 
-  /** Copia un texto del historial al portapapeles sin reenviarlo al PC. */
-  async copyFromHistory(text: string): Promise<void> {
+  /**
+   * Envía una imagen al portapapeles del PC (`purpose: 'clipboard'`; se fuerza aquí). Para la
+   * Tarea 9 (capturas) y para las imágenes copiadas en el móvil.
+   * - Con `hash` (SHA-256 hex de lo que da `getImageAsync({ format: 'png' })`): entra en el
+   *   anti-rebote (ImageSync) y en R7 (sustituye a la que espere en cola); `duplicate` si el PC
+   *   ya la tiene o ya va de camino.
+   * - Sin `hash` (capturas): se encola sin más; varias seguidas esperan su turno.
+   * - `imageUri`: miniatura del historial cuando llegue (si no, no hay entrada de historial).
+   * Más de 20 MiB → `rejected` con el aviso de tamaño. Si no se envía, cierra `src`.
+   */
+  sendClipboardImageFile(src: FileSource, hash?: string, imageUri?: string): ImageSendResult {
+    return this.queueImage(src, hash, { imageUri });
+  }
+
+  /** Vuelve a poner un texto o una imagen del historial en el portapapeles sin reenviarlo al PC. */
+  async copyFromHistory(item: string | HistoryEntry): Promise<void> {
+    if (typeof item !== 'string' && item.kind === 'image') {
+      const uri = item.imageUri;
+      if (uri) await this.runImageWork(() => this.copyImageFromHistory(uri));
+      return;
+    }
+    const text = typeof item === 'string' ? item : item.text;
+    if (!text) return; // un archivo, o la fila de una imagen sin miniatura todavía (Tarea 10)
     // se marca antes de escribir: el listener del portapapeles salta enseguida
     this.sync().current.markSynced(text);
     await writeClipboard(text);
@@ -259,8 +313,10 @@ export class ConnectionManager {
     this.pc = pairedPcFromInfo(info);
     this.lastPc = null;
     this.keeper = null;
+    this.imageKeeper = null;
+    this.lastWrittenImage = null;
     this.handshakeFailures = 0;
-    updateSettings({ pc: this.pc, lastSyncedHash: null, lastPc: null });
+    updateSettings({ pc: this.pc, lastSyncedHash: null, lastImageHash: null, lastPc: null });
     this.update({ status: 'searching', transport: null, peerName: null, pc: pcView(this.pc), lastError: null });
     if (this.enabled && AppState.currentState !== 'background') this.resume();
   }
@@ -306,8 +362,15 @@ export class ConnectionManager {
       // seguía conectado en segundo plano: solo vuelve el vigilante, y lo copiado mientras tanto
       if (!this.stopWatcher) {
         this.startClipboardWatcher();
-        void readClipboard().then((text) => {
-          if (text !== null && this.stopWatcher) this.onLocalText(text);
+        const watching = () => this.stopWatcher !== null;
+        void clipboardHasImage().then(async (image) => {
+          if (!watching()) return;
+          if (image) {
+            this.queueImageCheck();
+            return;
+          }
+          const text = await readClipboard();
+          if (text !== null && watching()) this.onLocalText(text);
         });
       }
       return;
@@ -320,7 +383,10 @@ export class ConnectionManager {
   }
 
   private startClipboardWatcher(): void {
-    this.stopWatcher ??= startClipboardWatcher((text) => this.onLocalText(text));
+    this.stopWatcher ??= startClipboardWatcher({
+      onText: (text) => this.onLocalText(text),
+      onImage: () => this.queueImageCheck(),
+    });
   }
 
   private stopClipboardWatcher(): void {
@@ -475,6 +541,10 @@ export class ConnectionManager {
         }
         if (this.state.lastError === PC_UNREACHABLE || this.state.lastError === IDENTITY_FAILED) this.setError(null);
         this.update({ status: 'connected', transport, peerName: peer.deviceName, pc: pcView(this.pc) });
+        // regla de inicio de imágenes: la actual del portapapeles, si el PC no la tiene
+        void clipboardHasImage().then((image) => {
+          if (image && gen === this.generation) this.queueImageCheck();
+        });
       });
       // solo lo que la Session envió de verdad en la regla de inicio (M4)
       session.on('startClipSent', (text) => {
@@ -492,8 +562,10 @@ export class ConnectionManager {
           this.session = null;
           this.ready = false;
         }
-        // tras cualquier cierre se parte del último hash confirmado (R29)
+        // tras cualquier cierre se parte del último hash confirmado (R29), también en imágenes
         this.sync().renew();
+        this.images().renew();
+        this.outbox.clear();
         resolve({ reason, wasReady, readyForMs: wasReady ? Date.now() - readyAt : 0, tokenSent: pc.token !== null });
       });
 
@@ -534,6 +606,19 @@ export class ConnectionManager {
 
   private onTransfer(u: TransferUpdate): void {
     this.logSpeed(u);
+    if (u.purpose === PURPOSE_CLIPBOARD) this.onImageTransfer(u);
+    if (u.state === 'done' && u.purpose === PURPOSE_CLIPBOARD) {
+      // no van a Descargas: el historial las recoge al escribirlas o al llegar al PC
+      this.update({ transfers: this.state.transfers.filter((t) => t.transferId !== u.transferId) });
+      this.applyBackground();
+      return;
+    }
+    if (u.state === 'cancelled' && u.purpose === PURPOSE_CLIPBOARD && u.direction === 'out') {
+      // sustituida por otra más nueva (R7): no se muestra como cancelada
+      this.update({ transfers: this.state.transfers.filter((t) => t.transferId !== u.transferId) });
+      this.applyBackground();
+      return;
+    }
     if (u.state === 'done') {
       // las completadas pasan al historial, como en el PC
       this.update({ transfers: this.state.transfers.filter((t) => t.transferId !== u.transferId) });
@@ -556,6 +641,155 @@ export class ConnectionManager {
     }
     this.update({ transfers });
     if (isFinished(u)) this.applyBackground();
+  }
+
+  // --- imágenes del portapapeles ---
+
+  private onImageTransfer(u: TransferUpdate): void {
+    if (u.direction === 'in') {
+      if (u.state === 'done' && u.location) {
+        const path = u.location;
+        const name = u.name;
+        this.queueImageWork(() => this.onImageReceived(path, name));
+      }
+      return;
+    }
+    if (u.state === 'active') {
+      this.outbox.started(u.transferId);
+      return;
+    }
+    if (!isFinished(u)) return;
+    this.outbox.finished(u.transferId, u.state === 'done');
+    const send = this.imageSends.get(u.transferId);
+    this.imageSends.delete(u.transferId);
+    if (!send) return;
+    if (u.state === 'done') {
+      const imageUri = send.cacheUri ? keepForHistory(send.cacheUri) : send.imageUri;
+      if (imageUri) this.addHistory({ kind: 'image', direction: 'out', fileName: u.name, imageUri });
+    } else if (send.cacheUri) {
+      deleteQuietly(new File(send.cacheUri));
+    }
+  }
+
+  /** Recibida del PC: galería, portapapeles y lectura de vuelta (en `writeReceivedImage`). */
+  private async onImageReceived(path: string, name: string): Promise<void> {
+    const r = await writeReceivedImage(path, loadSettings().saveToGallery);
+    if (r.hash !== null) {
+      this.images().current.markSynced(r.hash);
+      this.lastWrittenImage = r.hash;
+      // la que esperaba en cola ya no es lo último del portapapeles
+      const queued = this.outbox.dropQueued();
+      if (queued) this.session?.cancelTransfer(queued.id);
+    } else {
+      this.setError(IMAGE_WRITE_FAILED);
+    }
+    if (r.galleryFailed) this.setError(GALLERY_FAILED);
+    if (r.imageUri) this.addHistory({ kind: 'image', direction: 'in', fileName: name, imageUri: r.imageUri });
+  }
+
+  /** Lanza si no se pudo poner en el portapapeles (la interfaz avisa «No se pudo copiar»). */
+  private async copyImageFromHistory(uri: string): Promise<void> {
+    const hash = await withClipboardSuppressed(async () => {
+      const h = await setClipboardImage(uri);
+      // se marca antes de soltar el oyente: así no se reenvía al PC
+      if (h !== null) {
+        this.images().current.markSynced(h);
+        this.lastWrittenImage = h;
+      }
+      return h;
+    });
+    if (hash === null) throw new Error(IMAGE_WRITE_FAILED);
+  }
+
+  /** Una lectura pendiente basta para cualquier número de avisos seguidos del portapapeles. */
+  private queueImageCheck(): void {
+    if (this.imageCheckQueued) return;
+    this.imageCheckQueued = true;
+    this.queueImageWork(async () => {
+      this.imageCheckQueued = false;
+      await this.onLocalImage();
+    });
+  }
+
+  /** Detrás de lo que ya esté en marcha con imágenes; el resultado (o el error) es solo de `fn`. */
+  private runImageWork(fn: () => Promise<void>): Promise<void> {
+    const run = this.imageWork.then(fn);
+    this.imageWork = run.catch((e: unknown) => {
+      console.warn(`[clipsync] imagen del portapapeles: ${String(e)}`);
+    });
+    return run;
+  }
+
+  /** Como runImageWork, sin esperar: el error ya queda en el registro. */
+  private queueImageWork(fn: () => Promise<void>): void {
+    this.runImageWork(fn).catch(() => {});
+  }
+
+  /** Imagen copiada en el móvil (o la actual al conectar): se envía si el PC no la tiene. */
+  private async onLocalImage(): Promise<void> {
+    // sin sesión lista no se envía: la regla de inicio la mandará al conectar
+    if (!this.readySession()) return;
+    const img = await readClipboardImage();
+    if (!img || !this.readySession()) return;
+    if (isOwnWrite(img.hash, this.lastWrittenImage)) return;
+    this.lastWrittenImage = null; // ya hay otra: si vuelve la escrita, es una copia nueva
+    if (this.images().current.isDuplicate(img.hash)) return;
+    if (img.bytes.length > MAX_CLIP_IMAGE_BYTES) {
+      this.setError(IMAGE_TOO_LARGE);
+      return;
+    }
+    let cached: { source: FileSource; uri: string };
+    try {
+      cached = cachedImageSource(img.bytes);
+    } catch {
+      return; // sin espacio en la caché: se reintenta con la siguiente copia
+    }
+    const result = this.queueImage(cached.source, img.hash, { cacheUri: cached.uri });
+    if (!result.ok) deleteQuietly(new File(cached.uri));
+  }
+
+  /** Encola una imagen con `purpose: 'clipboard'` (R7 si lleva hash). Cierra `src` si no sale. */
+  private queueImage(src: FileSource, hash: string | undefined, keep: { cacheUri?: string; imageUri?: string }): ImageSendResult {
+    const session = this.readySession();
+    if (!session) {
+      void src.close().catch(() => {});
+      return { ok: false, reason: 'no_session' };
+    }
+    if (hash !== undefined) {
+      const offer = this.outbox.offer(hash);
+      if (!offer.send) {
+        if (offer.cancel) session.cancelTransfer(offer.cancel);
+        void src.close().catch(() => {});
+        return { ok: false, reason: 'duplicate' };
+      }
+    }
+    if (src.size > MAX_CLIP_IMAGE_BYTES) {
+      void src.close().catch(() => {});
+      this.setError(IMAGE_TOO_LARGE);
+      return { ok: false, reason: 'rejected' };
+    }
+    // la que esperaba en cola sobra (ya olvidada: su 'cancelled' no revierte la nueva)
+    const replaced = hash !== undefined ? this.outbox.dropQueued() : null;
+    if (replaced) session.cancelTransfer(replaced.id);
+    let id: string;
+    try {
+      id = session.sendFile({ ...src, purpose: PURPOSE_CLIPBOARD });
+    } catch (e) {
+      void src.close().catch(() => {});
+      if (replaced) this.outbox.settle(replaced.hash, false);
+      return { ok: false, reason: classifySendError(e) };
+    }
+    if (this.readySession() !== session) {
+      // la escritura falló y la sesión se cerró dentro de sendFile: no se marca nada
+      return { ok: false, reason: 'no_session' };
+    }
+    this.imageSends.set(id, keep);
+    if (hash !== undefined) {
+      // sendFile ya pudo emitir 'active' si no había otro archivo en curso
+      const active = this.state.transfers.some((t) => t.transferId === id && t.state === 'active');
+      this.outbox.sent(id, hash, active);
+    }
+    return { ok: true, id };
   }
 
   /** Velocidad de cada archivo terminado, para medir en release con `adb logcat -s ReactNativeJS`. */
@@ -583,6 +817,14 @@ export class ConnectionManager {
     return this.keeper;
   }
 
+  private images(): ImageKeeper {
+    this.imageKeeper ??= new ImageKeeper({
+      load: () => loadSettings().lastImageHash,
+      save: (hash) => updateSettings({ lastImageHash: hash }),
+    });
+    return this.imageKeeper;
+  }
+
   private readySession(): Session | null {
     return this.ready && this.session ? this.session : null;
   }
@@ -600,6 +842,7 @@ export class ConnectionManager {
   private addHistory(entry: Omit<HistoryEntry, 'id' | 'at'>): void {
     const item: HistoryEntry = { ...entry, id: String(this.nextHistoryId++), at: Date.now() };
     if (item.location === undefined) delete item.location;
+    if (item.imageUri === undefined) delete item.imageUri;
     this.update({ history: [item, ...this.state.history].slice(0, MAX_HISTORY) });
   }
 
