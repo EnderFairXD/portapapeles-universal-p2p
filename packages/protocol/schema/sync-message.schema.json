@@ -82,7 +82,11 @@
         "transferId": { "$ref": "#/$defs/transferId" },
         "name": { "type": "string" },
         "size": { "type": "integer", "minimum": 0 },
-        "mime": { "type": "string" }
+        "mime": { "type": "string" },
+        "purpose": {
+          "type": "string",
+          "description": "Opcional. Ausente o desconocido: archivo normal (el receptor ignora un valor que no conozca). \"clipboard\": imagen para el portapapeles; `mime` debe ser image/png, image/jpeg o image/webp (si no, protocol_error) y `size` no puede pasar de 20 MiB (20 971 520 bytes; si pasa, el receptor responde file_cancel con reason \"too_large\")."
+        }
       }
     },
     "file_ack": {

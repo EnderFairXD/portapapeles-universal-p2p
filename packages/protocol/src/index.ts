@@ -4,6 +4,7 @@ export * from './hash';
 export * from './messages';
 export * from './hello';
 export * from './clipSync';
+export * from './imageSync';
 export * from './text';
 export * from './session';
 export * from './noise';
