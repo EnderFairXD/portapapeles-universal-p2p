@@ -6,6 +6,8 @@ import {
   HEARTBEAT_INTERVAL_MS,
   HEARTBEAT_TIMEOUT_MS,
   MAX_CLIP_BYTES,
+  MAX_CLIP_IMAGE_BYTES,
+  PURPOSE_CLIPBOARD,
 } from './constants';
 import { FrameDecoder, encodeFrame } from './framing';
 import { createSha256, sha256Hex } from './hash';
@@ -29,6 +31,7 @@ import {
   type FileCancelMsg,
   type FileEndMsg,
   type FileResultMsg,
+  type FilePurpose,
   type FileStartMsg,
 } from './messages';
 import { NoiseIK, type CipherState, type KeyPair, type RandomBytes } from './noise';
@@ -59,6 +62,8 @@ export interface FileMeta {
   name: string;
   size: number;
   mime: string;
+  /** 'clipboard': imagen para el portapapeles; ausente: archivo normal. */
+  purpose?: FilePurpose;
 }
 
 export interface FileSource extends FileMeta {
@@ -89,6 +94,7 @@ export interface TransferUpdate {
   state: TransferState;
   error?: string;
   location?: string;
+  purpose?: FilePurpose;
 }
 
 /** Respuesta de `authorize` (servidor): se acepta al cliente o se rechaza con un motivo. */
@@ -279,11 +285,15 @@ export class Session {
   /**
    * Pone un archivo en la cola de salida y devuelve su transferId. Se emite 'queued' al momento;
    * si no hay otro en curso, también 'active'. Lanza Error si la sesión no está lista o ya se cerró,
-   * y RangeError si `src.size` no es un entero seguro ≥ 0.
+   * y RangeError si `src.size` no es un entero seguro ≥ 0 o si es una imagen de portapapeles
+   * (`purpose`) de más de MAX_CLIP_IMAGE_BYTES.
    */
   sendFile(src: FileSource): string {
     if (this.closed || !this.ready) throw new Error('La sesión no está lista');
     if (!Number.isSafeInteger(src.size) || src.size < 0) throw new RangeError('Tamaño de archivo inválido');
+    if (src.purpose === PURPOSE_CLIPBOARD && src.size > MAX_CLIP_IMAGE_BYTES) {
+      throw new RangeError(`Imagen de más de ${MAX_CLIP_IMAGE_BYTES} bytes`);
+    }
     const t: OutTransfer = {
       id: this.opts.newTransferId(),
       src,
@@ -632,8 +642,10 @@ export class Session {
 
   private async runOut(t: OutTransfer): Promise<void> {
     const { name, size, mime } = t.src;
+    const start: FileStartMsg = { kind: 'file_start', transferId: t.id, name, size, mime };
+    if (t.src.purpose === PURPOSE_CLIPBOARD) start.purpose = PURPOSE_CLIPBOARD;
     // file_start sale antes del aviso: si un oyente cancela en 'active', file_cancel va detrás
-    this.send({ kind: 'file_start', transferId: t.id, name, size, mime });
+    this.send(start);
     if (t.ended) return; // la escritura falló y cerró la sesión
     this.emitOut(t, 'active');
     if (t.ended) return; // un oyente canceló o cerró
@@ -710,7 +722,7 @@ export class Session {
 
   private emitOut(t: OutTransfer, state: TransferState, error?: string): void {
     const bytes = state === 'done' ? t.src.size : t.acked;
-    this.emitTransfer({ transferId: t.id, direction: 'out', name: t.src.name, size: t.src.size, bytes, state }, error);
+    this.emitTransfer({ transferId: t.id, direction: 'out', name: t.src.name, size: t.src.size, bytes, state }, error, undefined, t.src.purpose);
   }
 
   // --- archivos: receptor ---
@@ -719,6 +731,7 @@ export class Session {
     if (this.inc) throw new ProtocolError('file_start con otro archivo entrante en curso');
     if (this.endedIn.has(msg.transferId)) throw new ProtocolError('transferId repetido');
     const meta: FileMeta = { name: msg.name, size: msg.size, mime: msg.mime };
+    if (msg.purpose === PURPOSE_CLIPBOARD) meta.purpose = PURPOSE_CLIPBOARD;
     const t: InTransfer = {
       id: msg.transferId,
       meta,
@@ -729,6 +742,11 @@ export class Session {
       ending: false,
       ended: false,
     };
+    if (meta.purpose === PURPOSE_CLIPBOARD && meta.size > MAX_CLIP_IMAGE_BYTES) {
+      // demasiado grande para el portapapeles: se rechaza sin abrir el sink ni cerrar la sesión
+      this.endIn(t, 'failed', { error: 'too_large', cancel: 'too_large' });
+      return;
+    }
     this.inc = t;
     t.io = this.opts.openSink(meta).then((sink) => {
       t.sink = sink;
@@ -825,13 +843,14 @@ export class Session {
   }
 
   private emitIn(t: InTransfer, state: TransferState, error?: string, location?: string): void {
-    const { name, size } = t.meta;
-    this.emitTransfer({ transferId: t.id, direction: 'in', name, size, bytes: t.received, state }, error, location);
+    const { name, size, purpose } = t.meta;
+    this.emitTransfer({ transferId: t.id, direction: 'in', name, size, bytes: t.received, state }, error, location, purpose);
   }
 
-  private emitTransfer(u: TransferUpdate, error?: string, location?: string): void {
+  private emitTransfer(u: TransferUpdate, error?: string, location?: string, purpose?: FilePurpose): void {
     if (error !== undefined) u.error = error;
     if (location !== undefined) u.location = location;
+    if (purpose !== undefined) u.purpose = purpose;
     this.emit('transfer', u);
   }
 
