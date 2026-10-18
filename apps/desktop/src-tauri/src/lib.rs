@@ -14,7 +14,7 @@ use tauri::Manager;
 
 use app::Ctx;
 use core::pairing::{fingerprint, PairedStore};
-use core::{identity, Hub, HubConfig};
+use core::{identity, Hub, HubConfig, LocalImage};
 use protocol::DEFAULT_TCP_PORT;
 
 fn log(msg: &str) {
@@ -58,6 +58,13 @@ fn download_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Imágenes recibidas para el portapapeles: `~/Imágenes/ClipSync` (o `Descargas/ClipSync`).
+fn image_dir() -> PathBuf {
+    dirs::picture_dir()
+        .unwrap_or_else(download_dir)
+        .join("ClipSync")
+}
+
 async fn serve(hub: Hub, ctx: Arc<Ctx>) {
     let addr = SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_TCP_PORT));
     match tokio::net::TcpListener::bind(addr).await {
@@ -82,6 +89,7 @@ pub fn run() {
             app::send_files,
             app::cancel_transfer,
             app::copy_text,
+            app::copy_image,
             app::start_pairing,
             app::cancel_pairing,
             app::forget_device
@@ -90,15 +98,26 @@ pub fn run() {
             let data_dir = tauri_app.path().app_data_dir().ok();
             let local_clip = Arc::new(Mutex::new(None::<String>));
             let local_read = local_clip.clone();
+            let local_image = Arc::new(Mutex::new(None::<LocalImage>));
+            let image_read = local_image.clone();
+            // PNG de las imágenes copiadas o recibidas (uno por imagen, podados con el historial)
+            let images_cache = tauri_app
+                .path()
+                .app_cache_dir()
+                .unwrap_or_else(|_| std::env::temp_dir().join("clipsync"))
+                .join("images");
             let pc_name = pc_name();
             let (keys, identity_saved) = identity::load_or_create_status(data_dir.as_deref());
             let (hub, events) = Hub::new(HubConfig {
                 device_id: load_device_id(data_dir.as_deref()),
                 pc_name: pc_name.clone(),
                 download_dir: download_dir(),
-                // provisional: la Tarea 6 pone `dirs::picture_dir()/ClipSync`
-                image_dir: download_dir().join("ClipSync"),
-                local_image: Arc::new(|| None),
+                image_dir: image_dir(),
+                // como el texto: la copia en memoria, sin tocar arboard
+                local_image: Arc::new(move || match image_read.lock() {
+                    Ok(g) => g.clone(),
+                    Err(p) => p.into_inner().clone(),
+                }),
                 // solo lee la copia en memoria: nunca toca arboard
                 local_clip: Arc::new(move || match local_read.lock() {
                     Ok(g) => g.clone(),
@@ -109,7 +128,13 @@ pub fn run() {
             });
             let (clipboard, clipboard_worker) = app::clipboard::channel();
             let fp = fingerprint(&hub.public_key());
-            let ctx = Arc::new(Ctx::new(hub.clone(), pc_name, local_clip, clipboard));
+            let ctx = Arc::new(Ctx::new(
+                hub.clone(),
+                pc_name,
+                local_clip,
+                local_image,
+                clipboard,
+            ));
             if !identity_saved {
                 ctx.add_server_error(app::IDENTITY_NOT_SAVED_ERROR);
             }
@@ -136,7 +161,7 @@ pub fn run() {
             // watcher lo loguea una vez y sigue reintentando sin tumbar la app.
             usb::spawn_reverse_tunnel_watcher();
 
-            clipboard_worker.spawn(ctx);
+            clipboard_worker.spawn(ctx, images_cache);
             Ok(())
         })
         .run(tauri::generate_context!());
