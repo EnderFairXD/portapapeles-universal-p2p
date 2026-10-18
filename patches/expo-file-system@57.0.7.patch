@@ -44,3 +44,61 @@ index a39dfeb96731d8c75afa084742573ae0cebb0bc7..e207996076544deaf1b3174af870339e
    }
  
    fun read(length: Long): ByteArray {
+diff --git a/android/src/main/java/expo/modules/filesystem/FileSystemModule.kt b/android/src/main/java/expo/modules/filesystem/FileSystemModule.kt
+index 5ad4088a817c8ae2ef1ba4044609c2a249f10783..b055d82922e8dad2f38c4c723c7f2015b041a1f8 100644
+--- a/android/src/main/java/expo/modules/filesystem/FileSystemModule.kt
++++ b/android/src/main/java/expo/modules/filesystem/FileSystemModule.kt
+@@ -13,7 +13,9 @@ import expo.modules.kotlin.modules.ModuleDefinition
+ import expo.modules.kotlin.services.FilePermissionService
+ import expo.modules.kotlin.typedarray.TypedArray
+ import expo.modules.kotlin.types.Either
++import kotlinx.coroutines.Dispatchers
+ import kotlinx.coroutines.runBlocking
++import kotlinx.coroutines.withContext
+ import java.io.File
+ import java.net.URI
+ 
+@@ -305,6 +307,14 @@ class FileSystemModule : Module() {
+         return@Function file.createFile(mimeType, name)
+       }
+ 
++      // ClipSync: en SAF, createDocument es una llamada al proveedor que en MIUI ha tardado 3 s;
++      // en Dispatchers.IO no bloquea el hilo de JS ni la cola compartida de las funciones async.
++      AsyncFunction("createFileAsync") Coroutine { file: FileSystemDirectory, name: String, mimeType: String? ->
++        withContext(Dispatchers.IO) {
++          file.createFile(mimeType, name)
++        }
++      }
++
+       Property("exists") { directory: FileSystemDirectory ->
+         directory.exists
+       }
+diff --git a/build/Directory.d.ts b/build/Directory.d.ts
+index bac3071d4b5714325328b3eb37d3555dadf74a02..b7689650081853dd0cd8274e8b804b89782dad1b 100644
+--- a/build/Directory.d.ts
++++ b/build/Directory.d.ts
+@@ -37,6 +37,8 @@ export declare class Directory extends ExpoFileSystem.FileSystemDirectory {
+      */
+     get name(): string;
+     createFile(name: string, mimeType: string | null): File;
++    /** ClipSync: igual que createFile, pero la llamada nativa corre fuera del hilo de JS. */
++    createFileAsync(name: string, mimeType: string | null): Promise<File>;
+     createDirectory(name: string): Directory;
+     /**
+      * Watches this directory for changes to its contents or the directory itself.
+diff --git a/src/Directory.ts b/src/Directory.ts
+index 7731b8badb51d862549fb349e4beca91565d63ff..09cca9aa1b86df49ce78174538537cac75e19a86 100644
+--- a/src/Directory.ts
++++ b/src/Directory.ts
+@@ -62,6 +62,11 @@ export class Directory extends ExpoFileSystem.FileSystemDirectory {
+     return new File(super.createFile(name, mimeType).uri);
+   }
+ 
++  // ClipSync: igual que createFile, pero la llamada nativa corre fuera del hilo de JS.
++  async createFileAsync(name: string, mimeType: string | null): Promise<File> {
++    return new File((await super.createFileAsync(name, mimeType)).uri);
++  }
++
+   createDirectory(name: string): Directory {
+     return new Directory(super.createDirectory(name).uri);
+   }
