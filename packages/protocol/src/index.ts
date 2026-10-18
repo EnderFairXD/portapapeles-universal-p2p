@@ -7,4 +7,5 @@ export * from './clipSync';
 export * from './text';
 export * from './session';
 export * from './noise';
+export * from './cryptoBackend';
 export * from './pairing';

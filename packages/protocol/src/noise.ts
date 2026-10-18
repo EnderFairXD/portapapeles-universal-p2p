@@ -1,13 +1,14 @@
-// Noise_IK_25519_ChaChaPoly_SHA256 (https://noiseprotocol.org/noise.html, revisión 34) sobre @noble.
+// Noise_IK_25519_ChaChaPoly_SHA256 (https://noiseprotocol.org/noise.html, revisión 34) sobre @noble;
+// ChaChaPoly pasa por cryptoBackend (el móvil lo cambia por uno nativo con los mismos bytes).
 // El móvil es el iniciador y el PC el respondedor. Se sigue el §5 de la especificación paso a
 // paso (SymmetricState, CipherState, HandshakeState) y se valida byte a byte con los vectores
 // de test-vectors/noise-ik.json, generados con `snow` en el escritorio.
-import { chacha20poly1305 } from '@noble/ciphers/chacha.js';
 import { x25519 } from '@noble/curves/ed25519.js';
 import { hkdf } from '@noble/hashes/hkdf.js';
 import { sha256 } from '@noble/hashes/sha2.js';
 import { concatBytes, randomBytes as defaultRandomBytes, utf8ToBytes } from '@noble/hashes/utils.js';
 import { MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, NOISE_TAG_BYTES } from './constants';
+import { cryptoBackend } from './cryptoBackend';
 import { ProtocolError } from './messages';
 
 export const NOISE_PROTOCOL_NAME = 'Noise_IK_25519_ChaChaPoly_SHA256';
@@ -83,7 +84,7 @@ export class CipherState {
   encryptWithAd(ad: Uint8Array, plaintext: Uint8Array): Uint8Array {
     if (this.k === null) return plaintext;
     if (this.n >= Number.MAX_SAFE_INTEGER) throw new NoiseError('Contador de nonce agotado');
-    const out = chacha20poly1305(this.k, nonceBytes(this.n), ad).encrypt(plaintext);
+    const out = cryptoBackend().seal(this.k, nonceBytes(this.n), ad, plaintext);
     this.n++;
     return out;
   }
@@ -95,7 +96,7 @@ export class CipherState {
     if (ciphertext.length < NOISE_TAG_BYTES) throw new NoiseError('Mensaje cifrado demasiado corto');
     let out: Uint8Array;
     try {
-      out = chacha20poly1305(this.k, nonceBytes(this.n), ad).decrypt(ciphertext);
+      out = cryptoBackend().open(this.k, nonceBytes(this.n), ad, ciphertext);
     } catch {
       throw new NoiseError('El mensaje no autentica');
     }

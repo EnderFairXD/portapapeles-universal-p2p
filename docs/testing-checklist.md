@@ -76,7 +76,9 @@ como seguimiento (ChaCha20/X25519 nativos sin cambiar el protocolo) y no bloquea
 Las medidas del móvil se toman en un build de **release o preview**, no en desarrollo: Hermes en
 modo dev es mucho más lento y falsearía el resultado. El tiempo del handshake sale del registro
 `[clipsync] enlace abierto → ready: N ms` (un `console.log` de `connection.ts`, que no depende de
-`__DEV__`); se lee con `adb logcat -s ReactNativeJS` mientras se conecta el móvil.
+`__DEV__`); se lee con `adb logcat -s ReactNativeJS` mientras se conecta el móvil. La velocidad
+de cada archivo sale igual, de `[clipsync] archivo móvil→PC|PC→móvil: N MiB en T s → V MiB/s`, y
+`[clipsync] cifrado y SHA-256 nativos` confirma que se usa el módulo nativo y no @noble.
 
 | Medida | Resultado |
 |---|---|
@@ -85,10 +87,19 @@ modo dev es mucho más lento y falsearía el resultado. El tiempo del handshake 
 | Archivo de 50 MB móvil → PC (USB, build release) | 88 s ≈ **0,56 MiB/s**, hash correcto ❌ |
 | Archivo de 50 MB PC → móvil (USB, build release) | ~115 s ≈ **0,44 MiB/s**, hash correcto ❌ |
 | Archivo de 109 MB móvil → PC (WiFi a −85 dBm) | ~0,5 MiB/s; se cortó a la mitad al apagarse la pantalla |
+| Coste por trozo de 48 KiB en Hermes (release, antes) | ChaCha20 @noble ~33 ms; SHA-256 @noble ~41 ms; base64 de `react-native-tcp-socket` (Buffer en JS) ~35 ms al leer y ~9 ms al escribir; lectura/escritura de archivo y framing < 0,2 ms |
+| Coste por trozo de 48 KiB con el módulo nativo | ChaCha20 ~0,4 ms; SHA-256 ~0,1 ms; base64 ~1,6 ms al leer y ~0,8 ms al escribir; los 3 vectores de snow pasan en el móvil |
+| Archivo de 50 MB móvil → PC (USB, release, módulo nativo, 2026-10-18) | 12,1 s ≈ **4,12 MiB/s** (4,3 MB/s), hash correcto ✅ |
+| Archivo de 50 MB PC → móvil (USB, release, módulo nativo, 2026-10-18) | 12,9 s ≈ **3,87 MiB/s** (4,1 MB/s), hash correcto ✅ |
 
-La velocidad es la misma por USB que por WiFi: el límite está en el JavaScript del móvil (cifrado y
-SHA-256 de cada trozo en Hermes), no en la red. Queda como seguimiento: perfilar qué parte pesa más
-y pasarla a código nativo sin cambiar el protocolo (spec §9).
+La velocidad era la misma por USB que por WiFi: el límite estaba en el JavaScript del móvil. Medido
+trozo a trozo, en el envío se iban ~85 ms (SHA-256 + ChaCha20 + base64) y en la recepción ~109 ms
+(base64 + ChaCha20 + SHA-256), lo que da justo los 0,56 y 0,44 MiB/s de arriba. Se arregla con el
+módulo local `apps/mobile/modules/clipsync-native` (ChaCha20-Poly1305 de Conscrypt, SHA-256 y base64
+de Android) y un parche de `react-native-tcp-socket` para que las cadenas base64 no pasen por `Buffer`.
+El protocolo no cambia: `setCryptoBackend` compara el backend nativo con @noble antes de usarlo y, si no
+coincide, se sigue con @noble. Las medidas nuevas se tomaron contra el servidor `headless` del
+escritorio en build de depuración; queda repetirlas por WiFi con la app de escritorio.
 
 Hallazgos de la prueba en el móvil (2026-10-18):
 
