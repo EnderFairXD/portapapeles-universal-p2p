@@ -43,5 +43,14 @@
     "build:local": "npx expo run:android --variant release",
     "test": "vitest run -c vitest.config.ts"
   },
-  "private": true
+  "private": true,
+  "expo": {
+    "autolinking": {
+      "android": {
+        "buildFromSource": [
+          "expo-file-system"
+        ]
+      }
+    }
+  }
 }

@@ -1,0 +1,46 @@
+diff --git a/android/src/main/java/expo/modules/filesystem/FileSystemFileHandle.kt b/android/src/main/java/expo/modules/filesystem/FileSystemFileHandle.kt
+index a39dfeb96731d8c75afa084742573ae0cebb0bc7..e207996076544deaf1b3174af870339e1a9f6ece 100644
+--- a/android/src/main/java/expo/modules/filesystem/FileSystemFileHandle.kt
++++ b/android/src/main/java/expo/modules/filesystem/FileSystemFileHandle.kt
+@@ -2,6 +2,7 @@ package expo.modules.filesystem
+ 
+ import android.content.ContentResolver
+ import android.net.Uri
++import android.os.ParcelFileDescriptor
+ import expo.modules.kotlin.exception.Exceptions
+ import expo.modules.kotlin.sharedobjects.SharedRef
+ import expo.modules.kotlin.types.Enumerable
+@@ -51,7 +52,10 @@ enum class FileMode(val descriptor: String) : Enumerable {
+ 
+ class FileSystemFileHandle private constructor(
+   channel: FileChannel,
+-  private val mode: FileMode
++  private val mode: FileMode,
++  // ClipSync: se guarda el descriptor del content:// mientras el canal esté abierto; si nadie lo
++  // retiene, su finalizador lo cierra al pasar el recolector y las lecturas fallan con EBADF.
++  private val pfd: ParcelFileDescriptor? = null
+ ) : SharedRef<FileChannel>(channel), AutoCloseable {
+   companion object {
+     fun forJavaFile(file: File, mode: FileMode): FileSystemFileHandle {
+@@ -81,7 +85,7 @@ class FileSystemFileHandle private constructor(
+         else -> throw Exceptions.IllegalArgument("Unsupported file mode: '$mode'")
+       }
+ 
+-      return FileSystemFileHandle(channel, mode)
++      return FileSystemFileHandle(channel, mode, pfd)
+     }
+   }
+ 
+@@ -98,7 +102,11 @@ class FileSystemFileHandle private constructor(
+   }
+ 
+   override fun close() {
+-    fileChannel.close()
++    try {
++      fileChannel.close()
++    } finally {
++      pfd?.close()
++    }
+   }
+ 
+   fun read(length: Long): ByteArray {

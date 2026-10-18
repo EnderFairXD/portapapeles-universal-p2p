@@ -56,8 +56,8 @@ medio: primero WiFi y después USB.
 
 Se hace una sola vez, por WiFi.
 
-- [ ] emparejar con el QR (primera vez, con permiso de cámara)
-- [ ] cerrar y abrir las dos apps: reconecta sin QR
+- [x] emparejar con el QR (primera vez, con permiso de cámara) — 2026-10-18
+- [x] cerrar y abrir las dos apps: reconecta sin QR — 2026-10-18 (reinicio de la app del móvil y de la del PC)
 - [ ] QR caducado (esperar 5 min) → «QR caducado»
 - [ ] el mismo QR en un segundo móvil (si lo hay) → rechazado
 - [ ] «Olvidar» en el PC con el móvil conectado → el móvil vuelve a la bienvenida con «Este PC no
@@ -81,6 +81,23 @@ modo dev es mucho más lento y falsearía el resultado. El tiempo del handshake 
 | Medida | Resultado |
 |---|---|
 | Bench en Node (`pnpm --filter @clipsync/protocol bench`, @noble en JS puro) | ~84 handshakes/s ≈ 11,8 ms por handshake; ~69 MB/s cifrando y descifrando tramas de 48 KiB |
-| Handshake en el móvil (WiFi, build release, media de 5 conexiones, registro `adb logcat`) | pendiente |
-| Archivo de 50 MB móvil → PC (WiFi) | pendiente |
-| Archivo de 50 MB PC → móvil (WiFi) | pendiente |
+| Handshake en el móvil (build release, REDMI Note 15, 2026-10-18) | 190–640 ms (USB y WiFi) ✅ |
+| Archivo de 50 MB móvil → PC (USB, build release) | 88 s ≈ **0,56 MiB/s**, hash correcto ❌ |
+| Archivo de 50 MB PC → móvil (USB, build release) | ~115 s ≈ **0,44 MiB/s**, hash correcto ❌ |
+| Archivo de 109 MB móvil → PC (WiFi a −85 dBm) | ~0,5 MiB/s; se cortó a la mitad al apagarse la pantalla |
+
+La velocidad es la misma por USB que por WiFi: el límite está en el JavaScript del móvil (cifrado y
+SHA-256 de cada trozo en Hermes), no en la red. Queda como seguimiento: perfilar qué parte pesa más
+y pasarla a código nativo sin cambiar el protocolo (spec §9).
+
+Hallazgos de la prueba en el móvil (2026-10-18):
+
+- Corregido: `expo-file-system` 57.0.7 no retenía el `ParcelFileDescriptor` de los `content://`;
+  al pasar el recolector se cerraba y los archivos grandes fallaban a mitad («no se pudo leer el
+  archivo», `Bad file descriptor`), al enviar y al recibir. Se arregla con `patches/` y compilando
+  ese módulo desde el código (`expo.autolinking.android.buildFromSource` en `apps/mobile/package.json`).
+- Pendiente: tras cerrar un selector, `AppState.currentState` sigue en `background` unos segundos;
+  el móvil pausa y reconecta en ~200 ms sin motivo.
+- Pendiente: con la pantalla apagada a mitad de un envío por WiFi la conexión se cortó.
+- Pendiente: el QR incluye la IP de `lxcbr0` (10.0.3.1); hay que añadirla al filtro de interfaces.
+- Pendiente: un intent de compartir con una URI que `expo-share-intent` no sabe leer cierra la app.
