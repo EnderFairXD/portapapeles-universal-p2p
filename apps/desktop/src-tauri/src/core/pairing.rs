@@ -125,39 +125,74 @@ struct PairedFile {
 pub struct PairedStore {
     path: Option<PathBuf>,
     devices: Vec<PairedDevice>,
+    /// `paired.json` existe pero no se pudo leer: no se guarda nada hasta poder leerlo, para no
+    /// pisar la lista real con una vacía.
+    load_failed: bool,
 }
 
 impl PairedStore {
     /// Carga `paired.json`. Sin ruta solo vive en memoria (tests). Un archivo dañado se
-    /// aparta como `.bad` y se empieza de cero.
+    /// aparta como `.bad` y se empieza de cero; uno ilegible (permisos…) no se toca: se
+    /// recuerda el fallo (`load_failed`) y no se guarda nada hasta poder leerlo.
     pub fn load(path: Option<PathBuf>) -> Self {
-        let devices = path.as_deref().map(Self::read).unwrap_or_default();
-        Self { path, devices }
+        let (devices, load_failed) = match path.as_deref() {
+            Some(p) => Self::read(p),
+            None => (Vec::new(), false),
+        };
+        Self { path, devices, load_failed }
     }
 
-    fn read(path: &std::path::Path) -> Vec<PairedDevice> {
+    /// Lista leída y si la lectura falló sin ser «no existe».
+    fn read(path: &std::path::Path) -> (Vec<PairedDevice>, bool) {
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), false),
             Err(e) => {
                 log(&format!("no se puede leer {}: {e}", path.display()));
-                return Vec::new();
+                return (Vec::new(), true);
             }
         };
         match serde_json::from_slice::<PairedFile>(&bytes) {
-            Ok(f) if f.v == PAIRED_FILE_VERSION => f.devices,
+            Ok(f) if f.v == PAIRED_FILE_VERSION => (f.devices, false),
             _ => {
                 log(&format!("{} dañado o de otra versión", path.display()));
                 set_aside(path);
-                Vec::new()
+                (Vec::new(), false)
             }
         }
+    }
+
+    /// `true` si `paired.json` no se pudo leer y los emparejamientos nuevos no se guardan.
+    pub fn load_failed(&self) -> bool {
+        self.load_failed
+    }
+
+    /// Con `load_failed`, vuelve a intentar leer el archivo; si ya se puede, incorpora lo leído
+    /// (sin pisar lo que haya en memoria) y borra el fallo.
+    fn retry_load(&mut self) {
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let (leidos, sigue_fallando) = Self::read(&path);
+        if sigue_fallando {
+            return;
+        }
+        for d in leidos {
+            if !self.devices.iter().any(|x| x.public_key == d.public_key) {
+                self.devices.push(d);
+            }
+        }
+        self.load_failed = false;
+        log("paired.json vuelve a ser legible");
     }
 
     fn persist(&self, devices: &[PairedDevice]) -> std::io::Result<()> {
         let Some(path) = &self.path else {
             return Ok(());
         };
+        if self.load_failed {
+            return Err(std::io::Error::other("paired.json no se pudo leer: no se guarda para no pisarlo"));
+        }
         let file = PairedFile { v: PAIRED_FILE_VERSION, devices: devices.to_vec() };
         let json = serde_json::to_vec_pretty(&file).map_err(std::io::Error::other)?;
         if let Some(parent) = path.parent() {
@@ -166,8 +201,16 @@ impl PairedStore {
         write_private_atomic(path, &json)
     }
 
-    pub fn contains(&self, public_key_hex: &str) -> bool {
-        self.devices.iter().any(|d| d.public_key == public_key_hex)
+    /// Si no está y la carga había fallado, reintenta leer el archivo una vez.
+    pub fn contains(&mut self, public_key_hex: &str) -> bool {
+        if self.devices.iter().any(|d| d.public_key == public_key_hex) {
+            return true;
+        }
+        if self.load_failed {
+            self.retry_load();
+            return self.devices.iter().any(|d| d.public_key == public_key_hex);
+        }
+        false
     }
 
     /// Añade el dispositivo; con la misma clave actualiza nombre e id y conserva la fecha de
@@ -249,6 +292,32 @@ pub fn qr_svg(uri: &str) -> String {
     }
 }
 
+/// Máximo de direcciones IPv4 que lleva el QR.
+pub const MAX_QR_IPS: usize = 4;
+
+/// Prefijos (sin mayúsculas) de interfaces virtuales que no sirven para llegar al PC desde el móvil.
+const PREFIJOS_VIRTUALES: [&str; 6] = ["docker", "br-", "veth", "virbr", "vethernet", "virtualbox"];
+
+/// Descarta las direcciones de interfaces virtuales (Docker, puentes, VMs) por el prefijo de su nombre.
+pub fn filtrar_interfaces(interfaces: Vec<(String, IpAddr)>) -> Vec<IpAddr> {
+    interfaces
+        .into_iter()
+        .filter(|(nombre, _)| {
+            let nombre = nombre.to_lowercase();
+            !PREFIJOS_VIRTUALES.iter().any(|p| nombre.starts_with(p))
+        })
+        .map(|(_, ip)| ip)
+        .collect()
+}
+
+/// Direcciones del QR: sin interfaces virtuales, filtradas y ordenadas por `order_ips`, y como
+/// mucho `MAX_QR_IPS`.
+pub fn qr_ips(interfaces: Vec<(String, IpAddr)>) -> Vec<Ipv4Addr> {
+    let mut ips = order_ips(filtrar_interfaces(interfaces));
+    ips.truncate(MAX_QR_IPS);
+    ips
+}
+
 /// Solo IPv4, sin loopback ni 169.254/16 ni 0.0.0.0, sin repetidas; primero las privadas
 /// (10/8, 172.16/12, 192.168/16) y luego el resto, conservando el orden de entrada en cada grupo.
 pub fn order_ips(ips: Vec<IpAddr>) -> Vec<Ipv4Addr> {
@@ -264,10 +333,10 @@ pub fn order_ips(ips: Vec<IpAddr>) -> Vec<Ipv4Addr> {
     privadas.into_iter().chain(otras).collect()
 }
 
-/// Direcciones IPv4 de las interfaces de red del PC, ya filtradas y ordenadas.
+/// Direcciones IPv4 de las interfaces de red del PC, ya filtradas, ordenadas y limitadas.
 pub fn lan_ipv4s() -> Vec<Ipv4Addr> {
     match if_addrs::get_if_addrs() {
-        Ok(interfaces) => order_ips(interfaces.iter().map(|i| i.ip()).collect()),
+        Ok(interfaces) => qr_ips(interfaces.iter().map(|i| (i.name.clone(), i.ip())).collect()),
         Err(e) => {
             log(&format!("no se pueden listar las interfaces de red: {e}"));
             Vec::new()
@@ -397,6 +466,90 @@ mod tests {
         // y se puede seguir usando
         s.upsert(dispositivo("aa", "i", "n", 1)).unwrap();
         assert_eq!(PairedStore::load(Some(ruta)).list().len(), 1);
+    }
+
+    /// Deja `ruta` ilegible (modo 000). `false` si no sirve: se ejecuta como root.
+    #[cfg(unix)]
+    fn hacer_ilegible(ruta: &std::path::Path) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(ruta, std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::read(ruta).is_err()
+    }
+
+    #[cfg(unix)]
+    fn restaurar_permisos(ruta: &std::path::Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(ruta, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn paired_json_ilegible_no_se_pisa_y_se_recupera() {
+        let dir = tempfile::tempdir().unwrap();
+        let ruta = dir.path().join("paired.json");
+        let mut previo = PairedStore::load(Some(ruta.clone()));
+        previo.upsert(dispositivo("aa", "id-a", "Primero", 10)).unwrap();
+        let original = std::fs::read(&ruta).unwrap();
+        if !hacer_ilegible(&ruta) {
+            return; // root lee igualmente: no se puede simular
+        }
+
+        let mut s = PairedStore::load(Some(ruta.clone()));
+        assert!(s.load_failed());
+        assert!(!s.contains("aa"));
+        // mientras siga ilegible no se guarda nada ni se toca el archivo
+        assert!(s.upsert(dispositivo("bb", "id-b", "Segundo", 20)).is_err());
+        assert!(!s.contains("bb"));
+        assert!(s.load_failed());
+
+        restaurar_permisos(&ruta);
+        assert_eq!(std::fs::read(&ruta).unwrap(), original, "el archivo no debe cambiar");
+        // ya legible: contains() reintenta la lectura y recupera la lista
+        assert!(s.contains("aa"));
+        assert!(!s.load_failed());
+        s.upsert(dispositivo("bb", "id-b", "Segundo", 20)).unwrap();
+        let guardados = PairedStore::load(Some(ruta)).list();
+        assert_eq!(guardados.len(), 2);
+    }
+
+    #[test]
+    fn paired_store_sano_no_marca_fallo_de_carga() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!PairedStore::load(Some(dir.path().join("paired.json"))).load_failed());
+        assert!(!PairedStore::load(None).load_failed());
+    }
+
+    #[test]
+    fn interfaces_virtuales_se_descartan_por_prefijo_sin_mayusculas() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let entrada = vec![
+            ("wlp3s0".to_string(), ip("192.168.1.5")),
+            ("docker0".to_string(), ip("172.17.0.1")),
+            ("br-1a2b3c".to_string(), ip("172.18.0.1")),
+            ("veth12ab".to_string(), ip("10.1.1.1")),
+            ("virbr0".to_string(), ip("192.168.122.1")),
+            ("vEthernet (WSL)".to_string(), ip("172.30.0.1")),
+            ("VirtualBox Host-Only Network".to_string(), ip("192.168.56.1")),
+            ("Ethernet".to_string(), ip("10.0.0.2")),
+        ];
+        assert_eq!(filtrar_interfaces(entrada), vec![ip("192.168.1.5"), ip("10.0.0.2")]);
+    }
+
+    #[test]
+    fn qr_ips_filtra_ordena_y_limita_a_4() {
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let entrada: Vec<(String, IpAddr)> = vec![
+            ("eth0".into(), ip("8.8.8.8")),
+            ("docker0".into(), ip("172.17.0.1")),
+            ("eth1".into(), ip("192.168.1.5")),
+            ("eth2".into(), ip("10.0.0.2")),
+            ("eth3".into(), ip("10.0.1.2")),
+            ("eth4".into(), ip("10.0.2.2")),
+            ("eth5".into(), ip("10.0.3.2")),
+        ];
+        let esperado: Vec<Ipv4Addr> = ["192.168.1.5", "10.0.0.2", "10.0.1.2", "10.0.2.2"].iter().map(|s| s.parse().unwrap()).collect();
+        assert_eq!(qr_ips(entrada), esperado);
+        assert_eq!(MAX_QR_IPS, 4);
     }
 
     #[test]

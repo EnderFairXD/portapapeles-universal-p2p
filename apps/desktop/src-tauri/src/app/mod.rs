@@ -32,6 +32,13 @@ pub const NO_NETWORK_ERROR: &str = "No hay ninguna red disponible";
 pub const SERVER_PORT_ERROR: &str =
     "No se pudo abrir el puerto 52847: puede que otra copia de ClipSync esté abierta";
 
+/// Aviso fijo si `paired.json` existe pero no se pudo leer.
+pub const PAIRED_LOAD_ERROR: &str =
+    "No se pudo leer la lista de móviles emparejados; los emparejamientos nuevos no se guardarán.";
+/// Aviso fijo si la identidad del PC no se pudo guardar en disco.
+pub const IDENTITY_NOT_SAVED_ERROR: &str =
+    "No se pudo guardar la identidad del PC: los móviles tendrán que volver a emparejarse en cada arranque.";
+
 /// Transferencias terminadas sin éxito que se siguen mostrando.
 pub const MAX_FINISHED_TRANSFERS: usize = 5;
 
@@ -295,8 +302,13 @@ impl AppState {
         true
     }
 
-    pub fn set_server_error(&mut self, error: Option<String>) {
-        self.server_error = error;
+    /// Añade un aviso fijo a los que ya hay (separados por un espacio); uno repetido no se duplica.
+    pub fn add_server_error(&mut self, error: &str) {
+        self.server_error = Some(match self.server_error.take() {
+            None => error.to_string(),
+            Some(actual) if actual.contains(error) => actual,
+            Some(actual) => format!("{actual} {error}"),
+        });
     }
 
     pub fn show_clip_notice(&mut self, now_ms: u64) {
@@ -414,9 +426,10 @@ impl Ctx {
         }
     }
 
-    /// El servidor TCP no pudo arrancar: se avisa en la interfaz (el detalle va a stderr).
-    pub fn set_server_error(&self, error: &str) {
-        lock(&self.state).set_server_error(Some(error.to_string()));
+    /// Aviso fijo de arranque (puerto ocupado, lista de emparejados ilegible, identidad sin
+    /// guardar…): se muestra en la interfaz junto a los demás (el detalle va a stderr).
+    pub fn add_server_error(&self, error: &str) {
+        lock(&self.state).add_server_error(error);
         self.notify();
     }
 
@@ -921,10 +934,23 @@ mod tests {
     }
 
     #[test]
+    fn avisos_de_arranque_se_acumulan_sin_repetirse() {
+        let mut s = st();
+        s.add_server_error(PAIRED_LOAD_ERROR);
+        assert_eq!(s.snapshot(0).server_error.as_deref(), Some(PAIRED_LOAD_ERROR));
+        s.add_server_error(IDENTITY_NOT_SAVED_ERROR);
+        s.add_server_error(PAIRED_LOAD_ERROR);
+        assert_eq!(
+            s.snapshot(0).server_error,
+            Some(format!("{PAIRED_LOAD_ERROR} {IDENTITY_NOT_SAVED_ERROR}"))
+        );
+    }
+
+    #[test]
     fn error_del_servidor_se_muestra_en_el_estado() {
         let mut s = st();
         assert_eq!(s.snapshot(0).server_error, None);
-        s.set_server_error(Some(SERVER_PORT_ERROR.into()));
+        s.add_server_error(SERVER_PORT_ERROR);
         let v = serde_json::to_value(s.snapshot(0)).unwrap();
         assert_eq!(
             v["serverError"],

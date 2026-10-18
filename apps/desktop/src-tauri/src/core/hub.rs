@@ -115,7 +115,7 @@ struct State {
 }
 
 impl State {
-    fn is_paired(&self, device_key: &str) -> bool {
+    fn is_paired(&mut self, device_key: &str) -> bool {
         self.paired.contains(device_key) || self.unsaved.iter().any(|d| d.public_key == device_key)
     }
 
@@ -482,11 +482,18 @@ impl Hub {
         lock(&self.inner.state).tokens.active(now_ms())
     }
 
+    /// `true` si `paired.json` no se pudo leer: los emparejamientos nuevos no se guardan.
+    pub fn paired_load_failed(&self) -> bool {
+        lock(&self.inner.state).paired.load_failed()
+    }
+
     /// Móviles emparejados, por fecha de emparejamiento.
     pub fn paired_devices(&self) -> Vec<PairedDevice> {
         let st = lock(&self.inner.state);
         let mut v = st.paired.list();
-        v.extend(st.unsaved.iter().cloned());
+        // un pendiente de guardar que ya está en el archivo (se recuperó la lectura) no se repite
+        let en_archivo: Vec<String> = v.iter().map(|d| d.public_key.clone()).collect();
+        v.extend(st.unsaved.iter().filter(|d| !en_archivo.contains(&d.public_key)).cloned());
         v.sort_by_key(|d| d.paired_at_ms);
         v
     }

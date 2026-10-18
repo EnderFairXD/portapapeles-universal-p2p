@@ -67,7 +67,7 @@ async fn serve(hub: Hub, ctx: Arc<Ctx>) {
         }
         Err(e) => {
             log(&format!("[TCP] No se pudo escuchar en {addr}: {e}"));
-            ctx.set_server_error(app::SERVER_PORT_ERROR);
+            ctx.add_server_error(app::SERVER_PORT_ERROR);
         }
     }
 }
@@ -91,6 +91,7 @@ pub fn run() {
             let local_clip = Arc::new(Mutex::new(None::<String>));
             let local_read = local_clip.clone();
             let pc_name = pc_name();
+            let (keys, identity_saved) = identity::load_or_create_status(data_dir.as_deref());
             let (hub, events) = Hub::new(HubConfig {
                 device_id: load_device_id(data_dir.as_deref()),
                 pc_name: pc_name.clone(),
@@ -100,12 +101,18 @@ pub fn run() {
                     Ok(g) => g.clone(),
                     Err(p) => p.into_inner().clone(),
                 }),
-                keys: identity::load_or_create(data_dir.as_deref()),
+                keys,
                 paired: PairedStore::load(data_dir.as_ref().map(|d| d.join("paired.json"))),
             });
             let (clipboard, clipboard_worker) = app::clipboard::channel();
             let fp = fingerprint(&hub.public_key());
             let ctx = Arc::new(Ctx::new(hub.clone(), pc_name, local_clip, clipboard));
+            if !identity_saved {
+                ctx.add_server_error(app::IDENTITY_NOT_SAVED_ERROR);
+            }
+            if hub.paired_load_failed() {
+                ctx.add_server_error(app::PAIRED_LOAD_ERROR);
+            }
             tauri_app.manage(ctx.clone());
 
             tauri::async_runtime::spawn(ctx.clone().run_emitter(tauri_app.handle().clone()));

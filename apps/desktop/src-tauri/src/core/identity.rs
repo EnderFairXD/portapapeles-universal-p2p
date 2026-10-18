@@ -18,15 +18,21 @@ fn log(msg: &str) {
 /// efímera (solo en memoria). Si `identity.key` está dañado se aparta como `.bad` y se crea
 /// otra; si no se puede guardar, la clave sirve igualmente mientras dure el proceso.
 pub fn load_or_create(dir: Option<&Path>) -> StaticKeys {
+    load_or_create_status(dir).0
+}
+
+/// Como `load_or_create`, y además dice si la clave quedó guardada en disco (`true`). Con
+/// `false` la identidad es efímera: los móviles tendrán que emparejarse de nuevo al reiniciar.
+pub fn load_or_create_status(dir: Option<&Path>) -> (StaticKeys, bool) {
     let Some(dir) = dir else {
         static AVISO: std::sync::Once = std::sync::Once::new();
         AVISO.call_once(|| log("identidad efímera: no se guarda en disco"));
-        return StaticKeys::generate();
+        return (StaticKeys::generate(), false);
     };
     let ruta = dir.join(IDENTITY_FILE);
     match std::fs::read(&ruta) {
         Ok(bytes) => match <[u8; 32]>::try_from(bytes.as_slice()) {
-            Ok(privada) => return StaticKeys::from_private(privada),
+            Ok(privada) => return (StaticKeys::from_private(privada), true),
             Err(_) => {
                 log(&format!("{IDENTITY_FILE} dañado ({} bytes en vez de 32)", bytes.len()));
                 set_aside(&ruta);
@@ -36,15 +42,15 @@ pub fn load_or_create(dir: Option<&Path>) -> StaticKeys {
         Err(e) => {
             // Ilegible por otra causa (permisos…): no se pisa; se usa una clave efímera.
             log(&format!("no se puede leer {IDENTITY_FILE}: {e}; identidad efímera"));
-            return StaticKeys::generate();
+            return (StaticKeys::generate(), false);
         }
     }
     let keys = StaticKeys::generate();
     let guardada = std::fs::create_dir_all(dir).and_then(|()| write_private_atomic(&ruta, &keys.private));
-    if let Err(e) = guardada {
+    if let Err(e) = &guardada {
         log(&format!("no se puede guardar {IDENTITY_FILE}: {e}; identidad efímera"));
     }
-    keys
+    (keys, guardada.is_ok())
 }
 
 /// Aparta un archivo dañado como `<nombre>.bad` (sustituyendo uno anterior) y lo avisa por stderr.
@@ -137,6 +143,67 @@ mod tests {
         let a = load_or_create(None);
         let b = load_or_create(None);
         assert_ne!(a.private, b.private);
+    }
+
+    #[test]
+    fn identidad_guardada_se_marca_como_persistida() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, persistida) = load_or_create_status(Some(dir.path()));
+        assert!(persistida);
+        let (b, persistida) = load_or_create_status(Some(dir.path()));
+        assert!(persistida);
+        assert_eq!(a.private, b.private);
+    }
+
+    #[test]
+    fn identidad_sin_directorio_no_esta_persistida() {
+        assert!(!load_or_create_status(None).1);
+    }
+
+    #[test]
+    fn identidad_en_ruta_que_es_un_archivo_no_esta_persistida() {
+        let dir = tempfile::tempdir().unwrap();
+        let archivo = dir.path().join("no-es-carpeta");
+        std::fs::write(&archivo, b"x").unwrap();
+        let (_, persistida) = load_or_create_status(Some(&archivo));
+        assert!(!persistida);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identidad_en_directorio_de_solo_lectura_no_esta_persistida() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let ro = dir.path().join("ro");
+        std::fs::create_dir(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let (_, persistida) = load_or_create_status(Some(&ro));
+        let escribible = std::fs::write(ro.join("sonda"), b"x").is_ok();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if escribible {
+            return; // root escribe igualmente: no se puede simular
+        }
+        assert!(!persistida);
+        assert!(!ro.join(IDENTITY_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn identidad_ilegible_no_se_pisa_y_no_esta_persistida() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let original = load_or_create_status(Some(dir.path())).0;
+        let ruta = dir.path().join(IDENTITY_FILE);
+        std::fs::set_permissions(&ruta, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let ilegible = std::fs::read(&ruta).is_err();
+        let (otra, persistida) = load_or_create_status(Some(dir.path()));
+        std::fs::set_permissions(&ruta, std::fs::Permissions::from_mode(0o600)).unwrap();
+        if !ilegible {
+            return; // root: no se puede simular
+        }
+        assert!(!persistida);
+        assert_ne!(otra.private, original.private);
+        assert_eq!(std::fs::read(&ruta).unwrap(), original.private);
     }
 
     #[test]
