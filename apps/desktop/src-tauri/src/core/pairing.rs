@@ -296,9 +296,9 @@ pub fn qr_svg(uri: &str) -> String {
 pub const MAX_QR_IPS: usize = 4;
 
 /// Prefijos (sin mayúsculas) de interfaces virtuales que no sirven para llegar al PC desde el móvil.
-const PREFIJOS_VIRTUALES: [&str; 6] = ["docker", "br-", "veth", "virbr", "vethernet", "virtualbox"];
+const PREFIJOS_VIRTUALES: [&str; 8] = ["docker", "br-", "veth", "virbr", "lxcbr", "lxdbr", "vethernet", "virtualbox"];
 
-/// Descarta las direcciones de interfaces virtuales (Docker, puentes, VMs) por el prefijo de su nombre.
+/// Descarta las direcciones de interfaces virtuales (Docker, puentes, VMs, LXC/LXD) por el prefijo de su nombre.
 pub fn filtrar_interfaces(interfaces: Vec<(String, IpAddr)>) -> Vec<IpAddr> {
     interfaces
         .into_iter()
@@ -528,6 +528,8 @@ mod tests {
             ("br-1a2b3c".to_string(), ip("172.18.0.1")),
             ("veth12ab".to_string(), ip("10.1.1.1")),
             ("virbr0".to_string(), ip("192.168.122.1")),
+            ("lxcbr0".to_string(), ip("10.0.3.1")),
+            ("lxdbr0".to_string(), ip("10.12.34.1")),
             ("vEthernet (WSL)".to_string(), ip("172.30.0.1")),
             ("VirtualBox Host-Only Network".to_string(), ip("192.168.56.1")),
             ("Ethernet".to_string(), ip("10.0.0.2")),

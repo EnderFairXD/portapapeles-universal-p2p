@@ -5,3 +5,4 @@ allowBuilds:
   unrs-resolver: true
 patchedDependencies:
   expo-file-system@57.0.7: patches/expo-file-system@57.0.7.patch
+  expo-share-intent@8.0.1: patches/expo-share-intent@8.0.1.patch

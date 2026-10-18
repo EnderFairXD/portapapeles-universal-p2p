@@ -68,8 +68,20 @@ describe('sendFile: sin sesión o rechazado', () => {
 });
 
 describe('createPauseCheck', () => {
-  function harness(initial: { appState: string; pickerOpen: boolean }) {
-    const env = { ...initial, now: 0, timer: null as null | { at: number; fn: () => void }, paused: 0 };
+  // `appState` es lo que cree JS (AppState.currentState); `native`, lo que dice Android al
+  // preguntarle; `nativeFails`, que la consulta nativa falle.
+  function harness(initial: { appState: string; pickerOpen: boolean; native?: string }) {
+    const env = {
+      appState: initial.appState,
+      pickerOpen: initial.pickerOpen,
+      native: initial.native ?? initial.appState,
+      nativeFails: false,
+      now: 0,
+      timer: null as null | { at: number; fn: () => void },
+      queries: 0,
+      paused: 0,
+    };
+    const answers: (() => void)[] = [];
     const check = createPauseCheck({
       delayMs: 1000,
       setTimer: (fn, ms) => (env.timer = { at: env.now + ms, fn }),
@@ -77,62 +89,143 @@ describe('createPauseCheck', () => {
         if (env.timer === h) env.timer = null;
       },
       appState: () => env.appState,
+      confirmAppState: () => {
+        env.queries += 1;
+        return new Promise<string>((resolve, reject) => {
+          // la respuesta nativa llega más tarde, cuando el test la suelta con `answer()`
+          answers.push(() => (env.nativeFails ? reject(new Error('sin módulo')) : resolve(env.native)));
+        });
+      },
       pickerOpen: () => env.pickerOpen,
       pause: () => (env.paused += 1),
     });
-    const advance = (ms: number) => {
+    const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+    /** Suelta las consultas nativas pendientes y deja correr sus `then`. */
+    const answer = async () => {
+      for (const a of answers.splice(0)) a();
+      await flush();
+    };
+    const advance = async (ms: number) => {
       env.now += ms;
       if (env.timer && env.timer.at <= env.now) {
         const { fn } = env.timer;
         env.timer = null;
         fn();
       }
+      await answer();
     };
-    return { env, check, advance };
+    return { env, check, advance, answer };
   }
 
-  it('no pausa al instante: espera el margen', () => {
+  it('no pausa al instante: espera el margen', async () => {
     const h = harness({ appState: 'background', pickerOpen: false });
     h.check.schedule();
-    h.advance(999);
+    await h.advance(999);
     expect(h.env.paused).toBe(0);
-    h.advance(1);
+    await h.advance(1);
     expect(h.env.paused).toBe(1);
   });
 
-  it('no pausa si la app volvió a primer plano en ese margen', () => {
+  it('no pausa si la app volvió a primer plano en ese margen', async () => {
     const h = harness({ appState: 'background', pickerOpen: false });
     h.check.schedule();
     h.env.appState = 'active';
-    h.advance(1000);
+    await h.advance(1000);
     expect(h.env.paused).toBe(0);
   });
 
-  it('cancel() anula la comprobación pendiente', () => {
+  it('no pausa si JS aún cree que está en segundo plano pero Android ya la tiene activa', async () => {
+    // el evento 'active' sigue en cola tras una llamada síncrona larga del hilo de JS
+    const h = harness({ appState: 'background', pickerOpen: false, native: 'active' });
+    h.check.schedule();
+    await h.advance(1000);
+    expect(h.env.queries).toBe(1);
+    expect(h.env.paused).toBe(0);
+  });
+
+  it('con JS ya en primer plano ni pregunta a Android', async () => {
+    const h = harness({ appState: 'active', pickerOpen: false });
+    h.check.schedule();
+    await h.advance(1000);
+    expect(h.env.queries).toBe(0);
+    expect(h.env.paused).toBe(0);
+  });
+
+  it('cancel() durante la consulta nativa anula la pausa', async () => {
+    const h = harness({ appState: 'background', pickerOpen: false });
+    h.check.schedule();
+    h.env.now += 1000;
+    h.env.timer?.fn();
+    expect(h.env.queries).toBe(1);
+    h.check.cancel(); // llegó el evento 'active'
+    await h.answer();
+    expect(h.env.paused).toBe(0);
+  });
+
+  it('no pausa si se abrió otro selector mientras se consultaba', async () => {
+    const h = harness({ appState: 'background', pickerOpen: false });
+    h.check.schedule();
+    h.env.now += 1000;
+    h.env.timer?.fn();
+    h.env.pickerOpen = true;
+    await h.answer();
+    expect(h.env.paused).toBe(0);
+  });
+
+  it('si la consulta nativa falla, decide con lo que cree JS en ese momento', async () => {
+    const h = harness({ appState: 'background', pickerOpen: false });
+    h.env.nativeFails = true;
+    h.check.schedule();
+    await h.advance(1000);
+    expect(h.env.paused).toBe(1);
+
+    const g = harness({ appState: 'background', pickerOpen: false });
+    g.env.nativeFails = true;
+    g.check.schedule();
+    g.env.now += 1000;
+    g.env.timer?.fn();
+    g.env.appState = 'active';
+    await g.answer();
+    expect(g.env.paused).toBe(0);
+  });
+
+  it('cancel() anula la comprobación pendiente', async () => {
     const h = harness({ appState: 'background', pickerOpen: false });
     h.check.schedule();
     h.check.cancel();
     expect(h.env.timer).toBeNull();
-    h.advance(5000);
+    await h.advance(5000);
     expect(h.env.paused).toBe(0);
   });
 
-  it('no pausa si se abrió otro selector', () => {
+  it('no pausa si se abrió otro selector', async () => {
     const h = harness({ appState: 'background', pickerOpen: false });
     h.check.schedule();
     h.env.pickerOpen = true;
-    h.advance(1000);
+    await h.advance(1000);
     expect(h.env.paused).toBe(0);
   });
 
-  it('una nueva comprobación sustituye a la anterior', () => {
+  it('una nueva comprobación sustituye a la anterior', async () => {
     const h = harness({ appState: 'background', pickerOpen: false });
     h.check.schedule();
-    h.advance(600);
+    await h.advance(600);
     h.check.schedule();
-    h.advance(600);
+    await h.advance(600);
     expect(h.env.paused).toBe(0);
-    h.advance(400);
+    await h.advance(400);
+    expect(h.env.paused).toBe(1);
+  });
+
+  it('una nueva comprobación anula la consulta nativa de la anterior', async () => {
+    const h = harness({ appState: 'background', pickerOpen: false });
+    h.check.schedule();
+    h.env.now += 1000;
+    h.env.timer?.fn();
+    h.check.schedule(); // otro selector se cerró: su margen empieza de nuevo
+    await h.answer();
+    expect(h.env.paused).toBe(0);
+    await h.advance(1000);
     expect(h.env.paused).toBe(1);
   });
 });

@@ -52,7 +52,10 @@ export interface PauseCheckDeps {
   delayMs: number;
   setTimer(fn: () => void, ms: number): unknown;
   clearTimer(handle: unknown): void;
+  /** Lo que cree JS (`AppState.currentState`): llega con retraso si el hilo de JS está ocupado. */
   appState(): string;
+  /** Pregunta a Android su estado actual, que se actualiza en `onHostResume` sin esperar a JS. */
+  confirmAppState(): Promise<string>;
   pickerOpen(): boolean;
   pause(): void;
 }
@@ -61,19 +64,38 @@ export interface PauseCheckDeps {
  * Tras cerrarse un selector, Android resuelve su promesa antes de que la app vuelva a
  * 'active': comprobar al momento pararía la sesión en cada selección normal. Se espera
  * `delayMs` y solo entonces se mira si la app sigue en segundo plano.
+ *
+ * `AppState.currentState` solo cambia al procesarse el evento nativo: si una llamada síncrona
+ * larga (p. ej. crear el archivo en una carpeta SAF, 3 s en MIUI) bloquea el hilo de JS, el
+ * temporizador puede correr antes que el evento 'active' y ver aún 'background'. Por eso, antes
+ * de pausar, se confirma con la parte nativa; si esa consulta falla, decide lo que crea JS entonces.
  */
 export function createPauseCheck(deps: PauseCheckDeps): { schedule(): void; cancel(): void } {
   let handle: unknown = null;
+  // sube con cada schedule()/cancel(): una consulta nativa de una vuelta anterior ya no vale
+  let round = 0;
   const cancel = () => {
+    round += 1;
     if (handle !== null) deps.clearTimer(handle);
     handle = null;
   };
+  const stillBackground = (state: string, mine: number) =>
+    mine === round && state === 'background' && !deps.pickerOpen();
   return {
     schedule() {
       cancel();
+      const mine = round;
       handle = deps.setTimer(() => {
         handle = null;
-        if (deps.appState() === 'background' && !deps.pickerOpen()) deps.pause();
+        if (!stillBackground(deps.appState(), mine)) return;
+        deps.confirmAppState().then(
+          (state) => {
+            if (stillBackground(state, mine)) deps.pause();
+          },
+          () => {
+            if (stillBackground(deps.appState(), mine)) deps.pause();
+          },
+        );
       }, deps.delayMs);
     },
     cancel,

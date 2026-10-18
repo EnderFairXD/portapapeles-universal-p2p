@@ -96,8 +96,17 @@ Hallazgos de la prueba en el móvil (2026-10-18):
   al pasar el recolector se cerraba y los archivos grandes fallaban a mitad («no se pudo leer el
   archivo», `Bad file descriptor`), al enviar y al recibir. Se arregla con `patches/` y compilando
   ese módulo desde el código (`expo.autolinking.android.buildFromSource` en `apps/mobile/package.json`).
-- Pendiente: tras cerrar un selector, `AppState.currentState` sigue en `background` unos segundos;
-  el móvil pausa y reconecta en ~200 ms sin motivo.
+- Corregido: tras cerrar el selector de carpeta, `AppState.currentState` seguía en `background`
+  y el móvil pausaba y reconectaba ~200 ms después. Causa: `createFile` en la carpeta SAF es
+  síncrono y bloqueó el hilo de JS 3 s (`binderTransact: time=3059ms` en logcat); al soltarse, el
+  temporizador de la pausa diferida corrió antes que el evento `active` ya encolado. Ahora, antes
+  de pausar, se pregunta a Android (`getCurrentAppState`), que se actualiza en `onHostResume`.
+  Falta repetirlo en el móvil (recibir un archivo eligiendo la carpeta).
 - Pendiente: con la pantalla apagada a mitad de un envío por WiFi la conexión se cortó.
-- Pendiente: el QR incluye la IP de `lxcbr0` (10.0.3.1); hay que añadirla al filtro de interfaces.
-- Pendiente: un intent de compartir con una URI que `expo-share-intent` no sabe leer cierra la app.
+- Corregido: el QR incluía la IP de `lxcbr0` (10.0.3.1); el filtro descarta ya `lxcbr*` y `lxdbr*`.
+- Corregido: un intent de compartir con una URI cuya consulta da un cursor vacío (o nulo, o sin
+  tipo MIME) cerraba la app con `CursorIndexOutOfBoundsException` en `expo-share-intent` 8.0.1
+  (la última publicada). Se parchea en `patches/` para avisar del error («No se pudo recibir lo
+  compartido») en vez de cerrarse; las medidas de imagen/vídeo pasan a ser opcionales. Este
+  módulo no viene precompilado, así que no hace falta `buildFromSource`. Compila; falta repetir el
+  `am start … SEND` en el móvil.
