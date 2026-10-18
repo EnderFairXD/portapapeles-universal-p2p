@@ -658,6 +658,44 @@ button {
   white-space: nowrap;
 }
 
+/* Imágenes: miniatura pulsable (copia la imagen) y, si hay, «Abrir carpeta» al lado */
+.hist-item[data-kind="image"] .hist-body {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.hist-image-btn {
+  display: block;
+  padding: 3px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-alt);
+  cursor: pointer;
+  transition: border-color 0.15s;
+}
+
+.hist-image-btn:hover {
+  border-color: var(--indigo);
+}
+
+.hist-thumb {
+  display: block;
+  max-width: 160px;
+  max-height: 160px;
+  border-radius: 5px;
+  object-fit: contain;
+}
+
+.hist-thumb-placeholder {
+  display: grid;
+  width: 96px;
+  height: 64px;
+  place-items: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 .hist-empty {
   padding: 4px 2px;
   color: var(--muted);

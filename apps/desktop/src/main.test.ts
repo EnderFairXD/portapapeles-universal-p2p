@@ -117,6 +117,35 @@ describe("errores de los comandos", () => {
     expect(console.error).toHaveBeenCalled();
   });
 
+  const imageItem = { id: 9, kind: "image" as const, direction: "out" as const, text: null, fileName: null, location: null, thumbnail: "data:image/jpeg;base64,AAAA", atMs: 1 };
+
+  it("pulsar una imagen llama a copy_image con su id y avisa «Copiado»", async () => {
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_state") return state({ history: [imageItem] });
+    });
+    await start();
+    await vi.waitFor(() => expect(document.querySelector('[data-action="copy-image"]')).not.toBeNull());
+    document.querySelector<HTMLElement>('[data-action="copy-image"]')!.click();
+    await vi.waitFor(() => expect(tauri.invoke).toHaveBeenCalledWith("copy_image", { id: 9 }));
+    await vi.waitFor(() => expect(toastText()).toBe("Copiado"));
+  });
+
+  it("el error de copy_image se muestra en español y uno desconocido cae al aviso genérico", async () => {
+    let error = "No se pudo poner la imagen en el portapapeles";
+    tauri.invoke.mockImplementation(async (cmd: string) => {
+      if (cmd === "get_state") return state({ history: [imageItem] });
+      if (cmd === "copy_image") throw error;
+    });
+    await start();
+    await vi.waitFor(() => expect(document.querySelector('[data-action="copy-image"]')).not.toBeNull());
+    document.querySelector<HTMLElement>('[data-action="copy-image"]')!.click();
+    await vi.waitFor(() => expect(toastText()).toBe("No se pudo poner la imagen en el portapapeles"));
+    error = "Unknown error: image decode failed";
+    document.querySelector<HTMLElement>('[data-action="copy-image"]')!.click();
+    await vi.waitFor(() => expect(console.error).toHaveBeenCalled());
+    expect(toastText()).toBe("No se pudo poner la imagen en el portapapeles");
+  });
+
   it("los códigos conocidos siguen traduciéndose", async () => {
     tauri.invoke.mockImplementation(async (cmd: string) => {
       if (cmd === "get_state") return state({ peers: [{ sessionId: 1, deviceId: "d", deviceName: "Pixel 8", transport: "usb" }] });

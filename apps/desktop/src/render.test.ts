@@ -321,6 +321,57 @@ describe("historial", () => {
     expect(items[1]).toBe(elA);
   });
 
+  describe("imágenes", () => {
+    const JPEG = "data:image/jpeg;base64,/9j/4AAQSkZJRg==";
+    const image = (over: Partial<HistoryItem> = {}) =>
+      item({ kind: "image", text: null, fileName: "captura.png", location: "/home/javier/Imágenes/ClipSync/captura.png", thumbnail: JPEG, ...over });
+
+    it("pinta la miniatura JPEG como <img> con alt en español dentro de un botón que copia la imagen", () => {
+      render(root, state({ history: [image()] }));
+      const img = q<HTMLImageElement>(".hist-item img.hist-thumb")!;
+      expect(img.getAttribute("src")).toBe(JPEG);
+      expect(img.alt).toBe("Imagen copiada");
+      const boton = img.closest("button")!;
+      expect(boton.dataset.action).toBe("copy-image");
+      expect(boton.dataset.historyId).toBe("1");
+    });
+
+    it("una miniatura que no sea data:image/jpeg;base64, no se pinta y sale un marcador", () => {
+      const malas = [
+        "data:image/png;base64,iVBORw0KGgo=",
+        "data:image/svg+xml;base64,PHN2Zz4=",
+        "https://ejemplo.com/a.jpg",
+        "javascript:alert(1)",
+        " data:image/jpeg;base64,AAAA",
+        "DATA:image/jpeg;base64,AAAA",
+        "",
+      ];
+      malas.forEach((thumbnail, i) => {
+        render(root, state({ history: [image({ id: 50 + i, thumbnail })] }));
+        expect(q(".hist-item img"), thumbnail).toBeNull();
+        expect(q(".hist-thumb-placeholder"), thumbnail).not.toBeNull();
+        expect(q('button[data-action="copy-image"]'), thumbnail).not.toBeNull();
+      });
+    });
+
+    it("sin miniatura (null o ausente) sale el marcador y la imagen sigue siendo copiable", () => {
+      render(root, state({ history: [image({ thumbnail: null })] }));
+      expect(q(".hist-item img")).toBeNull();
+      expect(q(".hist-thumb-placeholder")!.textContent).toBe("Imagen");
+      expect(q('button[data-action="copy-image"]')).not.toBeNull();
+    });
+
+    it("una imagen recibida con carpeta ofrece «Abrir carpeta»; la enviada (location null) no", () => {
+      render(root, state({ history: [image()] }));
+      const reveal = q<HTMLButtonElement>('button[data-action="reveal"]')!;
+      expect(reveal.textContent).toBe("Abrir carpeta");
+      expect(reveal.dataset.historyId).toBe("1");
+      expect(q('button[data-action="copy"]')).toBeNull();
+      render(root, state({ history: [image({ id: 2, direction: "out", fileName: null, location: null })] }));
+      expect(qa('button[data-action="reveal"]')).toHaveLength(0);
+    });
+  });
+
   it("sin historial explica qué aparecerá", () => {
     render(root, state());
     expect(q(".hist-empty")!.hidden).toBe(false);

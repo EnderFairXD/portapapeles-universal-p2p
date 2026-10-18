@@ -37,6 +37,9 @@ const ERROR_TEXT = new Map([
   ["remote_error", "el móvil informó de un error"],
 ]);
 
+/** Única miniatura que se pinta (la genera el backend); cualquier otra cadena se descarta. */
+const THUMB_PREFIX = "data:image/jpeg;base64,";
+
 const UNITS = ["B", "KB", "MB", "GB"];
 
 /** «2,5 MB de 5,0 MB»: coma decimal, múltiplos de 1024 y la unidad del tamaño total. */
@@ -458,7 +461,27 @@ function createHistory(h: HistoryItem): Row {
   }
 
   const body = el("div", "hist-body");
-  if (h.kind === "file") {
+  if (h.kind === "image") {
+    const copy = button("", "copy-image", "hist-image-btn");
+    copy.dataset.historyId = String(h.id);
+    copy.title = "Copiar imagen al portapapeles";
+    // `src` solo por propiedad y tras comprobar el prefijo; si no, marcador neutro.
+    if (typeof h.thumbnail === "string" && h.thumbnail.startsWith(THUMB_PREFIX)) {
+      const img = el("img", "hist-thumb");
+      img.alt = "Imagen copiada";
+      img.src = h.thumbnail;
+      copy.append(img);
+    } else {
+      copy.append(el("span", "hist-thumb-placeholder", "Imagen"));
+    }
+    body.append(copy);
+    if (h.location) {
+      const reveal = button("Abrir carpeta", "reveal", "btn btn-ghost");
+      reveal.dataset.historyId = String(h.id);
+      reveal.setAttribute("aria-label", `Abrir carpeta de ${h.fileName || "la imagen"}`);
+      body.append(reveal);
+    }
+  } else if (h.kind === "file") {
     const fileName = h.fileName || "archivo";
     const name = el("span", "hist-file-name", fileName);
     name.title = fileName;

@@ -10,6 +10,7 @@ import type { UiState } from "./types";
 
 const NO_PEER_TEXT = "Conecta el móvil para enviar";
 const CLIPBOARD_TEXT = "No se pudo acceder al portapapeles";
+const IMAGE_CLIPBOARD_TEXT = "No se pudo poner la imagen en el portapapeles";
 
 /** Estado inicial: la ventana se ve completa aunque el backend aún no haya contestado. */
 const EMPTY_STATE: UiState = {
@@ -64,6 +65,7 @@ const COMMAND_ERROR = new Map([
   ["no_peer", NO_PEER_TEXT],
   ["read_error", "No se pudo leer el archivo"],
   [CLIPBOARD_TEXT, CLIPBOARD_TEXT],
+  [IMAGE_CLIPBOARD_TEXT, IMAGE_CLIPBOARD_TEXT],
   // Los de start_pairing ya vienen en español del backend.
   ["No hay ninguna red disponible", "No hay ninguna red disponible"],
   ["No se pudo generar el código QR", "No se pudo generar el código QR"],
@@ -102,6 +104,7 @@ const ACTION_FALLBACK = new Map([
   ["pick-files", "No se pudo abrir el selector de archivos"],
   ["cancel", "No se pudo cancelar"],
   ["copy", CLIPBOARD_TEXT],
+  ["copy-image", IMAGE_CLIPBOARD_TEXT],
   ["reveal", "No se pudo abrir la carpeta"],
   ["start-pairing", "No se pudo iniciar el emparejamiento"],
   ["cancel-pairing", "No se pudo cancelar el emparejamiento"],
@@ -121,6 +124,12 @@ async function onAction(action: string, el: HTMLElement): Promise<void> {
       case "copy":
         if (item?.text != null) {
           await invoke("copy_text", { text: item.text });
+          toast("Copiado");
+        }
+        break;
+      case "copy-image":
+        if (item?.kind === "image") {
+          await invoke("copy_image", { id: item.id });
           toast("Copiado");
         }
         break;
