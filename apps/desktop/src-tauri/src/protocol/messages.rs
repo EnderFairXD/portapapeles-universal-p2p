@@ -89,9 +89,18 @@ fn check_uint(v: u64, key: &str) -> Result<(), ProtocolError> {
 fn check_message(msg: &ControlMessage) -> Result<(), ProtocolError> {
     match msg {
         ControlMessage::Clip { hash, .. } => check_hash(hash, "hash"),
-        ControlMessage::FileStart { transfer_id, size, .. } => {
+        ControlMessage::FileStart { transfer_id, size, mime, purpose, .. } => {
             check_transfer_id(transfer_id)?;
-            check_uint(*size, "size")
+            check_uint(*size, "size")?;
+            match purpose.as_deref() {
+                None => Ok(()),
+                Some(PURPOSE_CLIPBOARD) if CLIP_IMAGE_MIMES.contains(&mime.as_str()) => Ok(()),
+                Some(PURPOSE_CLIPBOARD) => {
+                    fail(format!("'mime' no admitido para el portapapeles ({mime})"))
+                }
+                // más estricto que TS: en un tipo cerrado solo puede ser un error de programación
+                Some(_) => fail("'purpose' desconocido"),
+            }
         }
         ControlMessage::FileAck { transfer_id, received } => {
             check_transfer_id(transfer_id)?;
@@ -514,6 +523,48 @@ mod tests {
             .as_bytes(),
         );
         assert!(matches!(decode_one(&f), Ok(Some(Decoded::Control(ControlMessage::FileStart { .. })))));
+    }
+
+    fn file_start_con(mime: &str, purpose: Option<&str>) -> ControlMessage {
+        ControlMessage::FileStart {
+            transfer_id: TID.into(),
+            name: "a".into(),
+            size: 3,
+            mime: mime.into(),
+            purpose: purpose.map(String::from),
+        }
+    }
+
+    #[test]
+    fn codificar_rechaza_purpose_clipboard_con_mime_no_admitido() {
+        for mime in ["text/plain", "IMAGE/PNG", "image/png; charset=utf-8"] {
+            assert!(
+                matches!(encode_control(&file_start_con(mime, Some("clipboard"))), Err(ProtocolError::Invalid(_))),
+                "{mime}"
+            );
+        }
+        for mime in ["image/png", "image/jpeg", "image/webp"] {
+            assert!(encode_control(&file_start_con(mime, Some("clipboard"))).is_ok(), "{mime}");
+        }
+    }
+
+    #[test]
+    fn codificar_rechaza_un_purpose_que_no_es_clipboard() {
+        // en un tipo cerrado solo puede ser un error de programación
+        for purpose in ["otro", "Clipboard", ""] {
+            assert!(
+                matches!(encode_control(&file_start_con("image/png", Some(purpose))), Err(ProtocolError::Invalid(_))),
+                "{purpose:?}"
+            );
+        }
+        assert!(encode_control(&file_start_con("text/plain", None)).is_ok());
+    }
+
+    #[test]
+    fn purpose_con_otra_capitalizacion_se_ignora_al_decodificar() {
+        let got = decode_one(&file_start_json(r#","purpose":"Clipboard""#, "text/plain")).unwrap().unwrap();
+        let Decoded::Control(ControlMessage::FileStart { purpose, .. }) = got else { panic!() };
+        assert_eq!(purpose, None);
     }
 
     #[test]
