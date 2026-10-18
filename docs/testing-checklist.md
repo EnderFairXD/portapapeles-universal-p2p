@@ -91,6 +91,8 @@ de cada archivo sale igual, de `[clipsync] archivo móvil→PC|PC→móvil: N Mi
 | Coste por trozo de 48 KiB con el módulo nativo | ChaCha20 ~0,4 ms; SHA-256 ~0,1 ms; base64 ~1,6 ms al leer y ~0,8 ms al escribir; los 3 vectores de snow pasan en el móvil |
 | Archivo de 50 MB móvil → PC (USB, release, módulo nativo, 2026-10-18) | 12,1 s ≈ **4,12 MiB/s** (4,3 MB/s), hash correcto ✅ |
 | Archivo de 50 MB PC → móvil (USB, release, módulo nativo, 2026-10-18) | 12,9 s ≈ **3,87 MiB/s** (4,1 MB/s), hash correcto ✅ |
+| Archivo de 50 MB móvil → PC (WiFi a −86 dBm, release, módulo nativo, 2026-10-18) | 27,5 s ≈ **1,82 MiB/s** (1,9 MB/s), hash correcto; justo por debajo del criterio, con una WiFi muy floja |
+| Archivo de 50 MB PC → móvil (WiFi a −86 dBm, release, módulo nativo, 2026-10-18) | 12,4 s ≈ **4,04 MiB/s** (4,2 MB/s), hash correcto; el nombre repetido se guarda como «… (1).bin» ✅ |
 
 La velocidad era la misma por USB que por WiFi: el límite estaba en el JavaScript del móvil. Medido
 trozo a trozo, en el envío se iban ~85 ms (SHA-256 + ChaCha20 + base64) y en la recepción ~109 ms
