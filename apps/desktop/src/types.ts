@@ -15,13 +15,15 @@ export interface Peer {
 
 export interface HistoryItem {
   id: number;
-  kind: "text" | "file";
+  kind: "text" | "file" | "image";
   direction: HistoryDirection;
   text?: string | null;
   /** Nombre tal cual lo mandó el móvil: solo para mostrar. */
   fileName?: string | null;
   /** Ruta real: archivo guardado (in) o de origen (out). */
   location?: string | null;
+  /** Miniatura de una imagen: solo se pinta si es `data:image/jpeg;base64,…`; puede ser `null`. */
+  thumbnail?: string | null;
   atMs: number;
 }
 
