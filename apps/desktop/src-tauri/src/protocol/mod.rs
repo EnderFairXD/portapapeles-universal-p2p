@@ -30,6 +30,13 @@ pub const FILE_ACK_EVERY_BYTES: u64 = 1_048_576;
 pub const FILE_WINDOW_BYTES: u64 = 2_097_152;
 /// Máximo de texto de portapapeles, en bytes UTF-8 (1 MiB).
 pub const MAX_CLIP_BYTES: usize = 1_048_576;
+/// Máximo de una imagen para el portapapeles (20 MiB).
+#[allow(dead_code)] // lo usarán el Hub y la sesión al enviar y recibir imágenes
+pub const MAX_CLIP_IMAGE_BYTES: u64 = 20_971_520;
+/// Tipos MIME admitidos para una imagen de portapapeles (comparación exacta).
+pub const CLIP_IMAGE_MIMES: [&str; 3] = ["image/png", "image/jpeg", "image/webp"];
+/// Valor de `purpose` en `file_start` para una imagen que va al portapapeles.
+pub const PURPOSE_CLIPBOARD: &str = "clipboard";
 /// Máximo de un mensaje de control reensamblado (2 MiB).
 pub const MAX_CONTROL_BYTES: usize = 2_097_152;
 

@@ -5,6 +5,7 @@
 mod clip_sync;
 mod files;
 mod hub;
+mod image_sync;
 mod session;
 
 pub mod identity;

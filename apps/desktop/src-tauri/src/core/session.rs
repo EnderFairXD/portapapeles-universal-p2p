@@ -724,6 +724,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             name: t.f.name.clone(),
             size: t.f.size,
             mime: t.f.mime.clone(),
+            purpose: None,
         };
         self.out = Some(t);
         // file_start sale antes del aviso 'active'
