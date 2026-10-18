@@ -435,7 +435,8 @@ export class ConnectionManager {
         if (gen !== this.generation) return;
         wasReady = true;
         readyAt = Date.now();
-        if (__DEV__) console.log(`[clipsync] enlace abierto → ready: ${readyAt - openedAt} ms`);
+        // sin __DEV__: la medida de la fase 2 se toma en un build de release (`adb logcat`)
+        console.log(`[clipsync] enlace abierto → ready: ${readyAt - openedAt} ms`);
         this.ready = true;
         this.handshakeFailures = 0;
         if (addr) this.rememberPc(addr);

@@ -73,9 +73,14 @@ Se hace una sola vez, por WiFi.
 Criterio: **handshake ≤ 1 s y ≥ 2 MB/s en los dos sentidos** (spec §9). Si no se cumple, se apunta
 como seguimiento (ChaCha20/X25519 nativos sin cambiar el protocolo) y no bloquea la fase.
 
+Las medidas del móvil se toman en un build de **release o preview**, no en desarrollo: Hermes en
+modo dev es mucho más lento y falsearía el resultado. El tiempo del handshake sale del registro
+`[clipsync] enlace abierto → ready: N ms` (un `console.log` de `connection.ts`, que no depende de
+`__DEV__`); se lee con `adb logcat -s ReactNativeJS` mientras se conecta el móvil.
+
 | Medida | Resultado |
 |---|---|
 | Bench en Node (`pnpm --filter @clipsync/protocol bench`, @noble en JS puro) | ~84 handshakes/s ≈ 11,8 ms por handshake; ~69 MB/s cifrando y descifrando tramas de 48 KiB |
-| Handshake en el móvil (WiFi, media de 5 conexiones, registro `__DEV__`) | pendiente |
+| Handshake en el móvil (WiFi, build release, media de 5 conexiones, registro `adb logcat`) | pendiente |
 | Archivo de 50 MB móvil → PC (WiFi) | pendiente |
 | Archivo de 50 MB PC → móvil (WiFi) | pendiente |

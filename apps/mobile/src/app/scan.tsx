@@ -40,7 +40,9 @@ export default function Scan() {
   const leave = useCallback(() => {
     if (left.current) return;
     left.current = true;
-    router.back();
+    // sin pantalla detrás (el escáner es la primera) «Volver» lleva a la principal
+    if (router.canGoBack()) router.back();
+    else router.replace('/');
   }, [router]);
 
   const finish = useCallback(
