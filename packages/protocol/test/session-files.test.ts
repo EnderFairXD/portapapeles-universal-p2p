@@ -4,6 +4,7 @@ import {
   FILE_ACK_EVERY_BYTES,
   FILE_CHUNK_BYTES,
   FILE_WINDOW_BYTES,
+  MAX_CLIP_IMAGE_BYTES,
   FrameDecoder,
   MessageDecoder,
   NoiseIK,
@@ -684,5 +685,174 @@ describe('cierre y convivencia', () => {
     await flush();
     expect(last(s)).toMatchObject({ state: 'done', bytes: data.length });
     s.session.close();
+  });
+});
+
+describe('imágenes para el portapapeles (purpose)', () => {
+  const imagen = (data: Uint8Array) =>
+    Object.assign(memorySource(data, 'captura.png', 'image/png'), { purpose: 'clipboard' as const });
+
+  test('purpose llega al openSink y a los TransferUpdate de los dos lados', async () => {
+    const metas: FileMeta[] = [];
+    const { c, s } = await connect({
+      serverSink: async (meta) => {
+        metas.push(meta);
+        return memorySink(meta.name);
+      },
+    });
+    const data = pattern(100000);
+    const id = c.session.sendFile(imagen(data));
+    await flush();
+
+    expect(metas).toEqual([{ name: 'captura.png', size: 100000, mime: 'image/png', purpose: 'clipboard' }]);
+    expect(c.ev.transfers.map((u) => u.state)).toEqual(['queued', 'active', 'done']);
+    expect(c.ev.transfers.every((u) => u.purpose === 'clipboard')).toBe(true);
+    expect(s.ev.transfers.length).toBeGreaterThan(0);
+    expect(s.ev.transfers.every((u) => u.purpose === 'clipboard')).toBe(true);
+    expect(last(s)).toMatchObject({ transferId: id, direction: 'in', state: 'done', purpose: 'clipboard' });
+  });
+
+  test('purpose también viaja del servidor al cliente', async () => {
+    const { c, s } = await connect();
+    s.session.sendFile(imagen(pattern(10)));
+    await flush();
+    expect(last(c)).toMatchObject({ direction: 'in', state: 'done', purpose: 'clipboard' });
+    expect(last(s)).toMatchObject({ direction: 'out', state: 'done', purpose: 'clipboard' });
+  });
+
+  test('un archivo sin purpose no lo lleva, ni en meta ni en los avisos', async () => {
+    const metas: FileMeta[] = [];
+    const { c, s } = await connect({
+      serverSink: async (meta) => {
+        metas.push(meta);
+        return memorySink(meta.name);
+      },
+    });
+    c.session.sendFile(memorySource(pattern(10), 'f.bin'));
+    await flush();
+    expect('purpose' in metas[0]).toBe(false);
+    for (const u of [...c.ev.transfers, ...s.ev.transfers]) expect('purpose' in u).toBe(false);
+  });
+
+  test('file_start crudo con purpose sale tal cual por el cable', async () => {
+    const { c, raw } = await clientAgainstRaw();
+    c.session.sendFile(imagen(pattern(10)));
+    await flush();
+    expect(raw.controls().find((m) => m.kind === 'file_start')).toMatchObject({ purpose: 'clipboard', mime: 'image/png' });
+  });
+
+  test('imagen de 20 MiB + 1 recibida → file_cancel too_large, sin openSink y sin cerrar la sesión', async () => {
+    const opened: FileMeta[] = [];
+    const [a, b] = linkPair();
+    const s = makeSession(b, 'server', async (meta) => {
+      opened.push(meta);
+      return memorySink(meta.name);
+    });
+    await s.session.start();
+    const raw = await rawClient(a);
+    await flush();
+    const id = newId();
+    raw.send({
+      kind: 'file_start',
+      transferId: id,
+      name: 'enorme.png',
+      size: MAX_CLIP_IMAGE_BYTES + 1,
+      mime: 'image/png',
+      purpose: 'clipboard',
+    });
+    await flush();
+    expect(opened).toEqual([]);
+    expect(raw.controls().filter((m) => m.kind.startsWith('file_'))).toEqual([
+      { kind: 'file_cancel', transferId: id, reason: 'too_large' },
+    ]);
+    expect(s.ev.transfers).toEqual([
+      {
+        transferId: id,
+        direction: 'in',
+        name: 'enorme.png',
+        size: MAX_CLIP_IMAGE_BYTES + 1,
+        bytes: 0,
+        state: 'failed',
+        error: 'too_large',
+        purpose: 'clipboard',
+      },
+    ]);
+    expect(s.ev.closed).toEqual([]);
+    // los datos que ya iban en vuelo se descartan sin cerrar la sesión
+    raw.sendRaw(encodeFileData(id, pattern(10)));
+    await flush();
+    expect(s.ev.closed).toEqual([]);
+  });
+
+  test('imagen de exactamente 20 MiB se acepta (se abre el sink)', async () => {
+    const opened: FileMeta[] = [];
+    const [a, b] = linkPair();
+    const s = makeSession(b, 'server', async (meta) => {
+      opened.push(meta);
+      return memorySink(meta.name);
+    });
+    await s.session.start();
+    const raw = await rawClient(a);
+    await flush();
+    raw.send({
+      kind: 'file_start',
+      transferId: newId(),
+      name: 'ok.png',
+      size: MAX_CLIP_IMAGE_BYTES,
+      mime: 'image/png',
+      purpose: 'clipboard',
+    });
+    await flush();
+    expect(opened).toHaveLength(1);
+    expect(last(s)).toMatchObject({ state: 'active', purpose: 'clipboard' });
+  });
+
+  test('un archivo normal de más de 20 MiB no se limita', async () => {
+    const opened: FileMeta[] = [];
+    const [a, b] = linkPair();
+    const s = makeSession(b, 'server', async (meta) => {
+      opened.push(meta);
+      return memorySink(meta.name);
+    });
+    await s.session.start();
+    const raw = await rawClient(a);
+    await flush();
+    raw.send({ kind: 'file_start', transferId: newId(), name: 'big.bin', size: MAX_CLIP_IMAGE_BYTES + 1, mime: 'x' });
+    await flush();
+    expect(opened).toHaveLength(1);
+  });
+
+  test('sendFile de 20 MiB + 1 con purpose lanza RangeError y no deja nada en cola', async () => {
+    const { c } = await connect();
+    const src = {
+      name: 'enorme.png',
+      size: MAX_CLIP_IMAGE_BYTES + 1,
+      mime: 'image/png',
+      purpose: 'clipboard' as const,
+      read: async () => new Uint8Array(0),
+      close: async () => {},
+    };
+    expect(() => c.session.sendFile(src)).toThrow(RangeError);
+    expect(c.ev.transfers).toEqual([]);
+  });
+
+  test('sendFile de exactamente 20 MiB con purpose se acepta', async () => {
+    const { c } = await connect();
+    const src = {
+      name: 'justa.png',
+      size: MAX_CLIP_IMAGE_BYTES,
+      mime: 'image/png',
+      purpose: 'clipboard' as const,
+      read: async () => new Uint8Array(0),
+      close: async () => {},
+    };
+    expect(() => c.session.sendFile(src)).not.toThrow();
+    expect(c.ev.transfers[0]).toMatchObject({ state: 'queued', purpose: 'clipboard' });
+  });
+
+  test('sendFile de más de 20 MiB sin purpose se acepta', async () => {
+    const { c } = await connect();
+    const src = { name: 'big.bin', size: MAX_CLIP_IMAGE_BYTES + 1, mime: 'x', read: async () => new Uint8Array(0), close: async () => {} };
+    expect(() => c.session.sendFile(src)).not.toThrow();
   });
 });
