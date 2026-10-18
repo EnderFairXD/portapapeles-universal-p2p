@@ -3,7 +3,7 @@
 //! identifica por su clave pública en hex (`device_key`, D4).
 //! No depende de Tauri: la app se suscribe al canal de `HubEvent`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -15,14 +15,14 @@ use serde::Serialize;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc;
 
-use super::clip_sync::ClipboardSync;
 use super::pairing::{PairedDevice, PairedStore, PairingOffer, PairingTokens, TokenCheck};
 use super::session::{
-    self, lock, new_id, Command, Direction, OutFile, OutMeta, SessionConfig, SessionEvent,
-    SessionHost, TransferState, TransferUpdate, Transport,
+    self, lock, new_id, Command, DeviceSyncs, Direction, OutFile, OutMeta, SessionConfig,
+    SessionEvent, SessionHost, TransferState, TransferUpdate, Transport,
 };
 use crate::protocol::hello::{ClientHello, RejectReason};
 use crate::protocol::secure::StaticKeys;
+use crate::protocol::MAX_CLIP_IMAGE_BYTES;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(
@@ -55,13 +55,31 @@ pub enum HubEvent {
         device_key: String,
         device_name: String,
     },
+    /// Imagen para el portapapeles guardada en `image_dir` (`location`); la app la pone en el
+    /// portapapeles y llama a `mark_image_synced`.
+    ClipImageReceived {
+        session_id: u64,
+        location: String,
+    },
+}
+
+/// Imagen actual del portapapeles del PC, ya codificada en PNG.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LocalImage {
+    /// hash de lo que devuelve el portapapeles (no de los bytes del PNG)
+    pub hash: String,
+    pub png_path: PathBuf,
 }
 
 pub struct HubConfig {
     pub device_id: String,
     pub pc_name: String,
     pub download_dir: PathBuf,
+    /// destino de las imágenes con `purpose:"clipboard"` (se crea si falta)
+    pub image_dir: PathBuf,
     pub local_clip: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    /// la imagen que se ofrece al conectar un móvil
+    pub local_image: Arc<dyn Fn() -> Option<LocalImage> + Send + Sync>,
     /// identidad del PC: respondedor del handshake Noise IK
     pub keys: StaticKeys,
     pub paired: PairedStore,
@@ -73,6 +91,8 @@ const FILE_MIME: &str = "application/octet-stream";
 /// Conexiones a la vez que aún no han completado el handshake (pares desconocidos de la LAN).
 const MAX_PRE_HANDSHAKE_SESSIONS: usize = 8;
 const FORGOTTEN: &str = "forgotten";
+/// Sesiones cerradas cuyo dispositivo se recuerda para un `mark_image_synced` tardío.
+const MAX_ENDED_SESSIONS: usize = 32;
 
 fn log(msg: &str) {
     // stderr: stdout puede llevar eventos en JSON (ejemplo headless); writeln no hace panic
@@ -96,7 +116,9 @@ struct Inner {
     device_id: String,
     pc_name: String,
     download_dir: PathBuf,
+    image_dir: PathBuf,
     local_clip: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+    local_image: Arc<dyn Fn() -> Option<LocalImage> + Send + Sync>,
     keys: StaticKeys,
     events: mpsc::UnboundedSender<HubEvent>,
     next_id: AtomicU64,
@@ -105,8 +127,10 @@ struct Inner {
 
 struct State {
     sessions: BTreeMap<u64, Entry>,
-    /// anti-rebote por dispositivo, en memoria durante esta fase
-    syncs: HashMap<String, Arc<Mutex<ClipboardSync>>>,
+    /// anti-rebote (texto e imagen) por dispositivo, en memoria
+    syncs: HashMap<String, DeviceSyncs>,
+    /// (sesión, dispositivo) de las últimas sesiones cerradas
+    ended: VecDeque<(u64, String)>,
     ready_count: u64,
     paired: PairedStore,
     /// emparejados con el token cuyo `paired.json` no se pudo guardar: valen hasta cerrar la app
@@ -160,6 +184,10 @@ impl SessionHost for Inner {
         (self.local_clip)()
     }
 
+    fn local_image(&self) -> Option<LocalImage> {
+        (self.local_image)()
+    }
+
     /// Spec §3.2: entra un móvil emparejado o el que trae el token vigente del QR. Con el token
     /// vigente se consume, se guarda (o actualiza) el emparejamiento y se emite `DevicePaired`.
     fn authorize(
@@ -201,21 +229,22 @@ impl SessionHost for Inner {
 
     /// Se llama tras aceptar el handshake, antes de la regla de inicio. Si el dispositivo ya tenía
     /// sesión (p. ej. TCP medio abierto), lo último "enviado" por ella puede no haber llegado: se
-    /// olvida la sincronía para que la regla reenvíe el texto actual (un duplicado es inofensivo).
-    fn clip_sync_for(&self, _session_id: u64, device_id: &str) -> Arc<Mutex<ClipboardSync>> {
+    /// olvida la sincronía (texto e imagen) para que la regla reenvíe lo actual (un duplicado es
+    /// inofensivo).
+    fn syncs_for(&self, _session_id: u64, device_id: &str) -> DeviceSyncs {
         let mut st = lock(&self.state);
         let reconnect = st
             .sessions
             .values()
             .any(|e| e.peer.as_ref().is_some_and(|(d, _)| d == device_id));
-        let sync = st
+        let syncs = st
             .syncs
             .entry(device_id.to_string())
-            .or_insert_with(|| Arc::new(Mutex::new(ClipboardSync::new(None))));
+            .or_insert_with(DeviceSyncs::new);
         if reconnect {
-            *lock(sync) = ClipboardSync::new(None);
+            syncs.reset();
         }
-        sync.clone()
+        syncs.clone()
     }
 
     // Se emite con el estado bloqueado para que el orden del canal sea el de los cambios.
@@ -262,11 +291,19 @@ impl SessionHost for Inner {
                 self.emit(HubEvent::LocalClipSuperseded { text })
             }
             SessionEvent::Transfer(u) => self.emit(HubEvent::Transfer(u)),
+            SessionEvent::ClipImage(location) => self.emit(HubEvent::ClipImageReceived {
+                session_id,
+                location,
+            }),
             SessionEvent::Closed(reason) => {
                 let Some((device_id, _)) = st.sessions.remove(&session_id).and_then(|e| e.peer)
                 else {
                     return; // solo se avisa de la desconexión de quien llegó a conectarse
                 };
+                if st.ended.len() >= MAX_ENDED_SESSIONS {
+                    st.ended.pop_front();
+                }
+                st.ended.push_back((session_id, device_id.clone()));
                 // el enlace cayó: lo último escrito puede no haber llegado al móvil. Si ya hay otra
                 // sesión del dispositivo (aunque esté saludando), su saludo ya lo restableció y lo
                 // que haya marcado desde entonces es válido: no se toca.
@@ -275,8 +312,8 @@ impl SessionHost for Inner {
                     .values()
                     .any(|e| e.device_id.as_deref() == Some(device_id.as_str()));
                 if (reason == "link_closed" || reason == "heartbeat_timeout") && !otra {
-                    if let Some(sync) = st.syncs.get(&device_id) {
-                        *lock(sync) = ClipboardSync::new(None);
+                    if let Some(syncs) = st.syncs.get(&device_id) {
+                        syncs.reset();
                     }
                 }
                 self.emit(HubEvent::PeerDisconnected { session_id, reason });
@@ -300,7 +337,9 @@ impl Hub {
             device_id,
             pc_name,
             download_dir,
+            image_dir,
             local_clip,
+            local_image,
             keys,
             paired,
         } = config;
@@ -308,13 +347,16 @@ impl Hub {
             device_id,
             pc_name,
             download_dir,
+            image_dir,
             local_clip,
+            local_image,
             keys,
             events,
             next_id: AtomicU64::new(1),
             state: Mutex::new(State {
                 sessions: BTreeMap::new(),
                 syncs: HashMap::new(),
+                ended: VecDeque::new(),
                 ready_count: 0,
                 paired,
                 unsaved: Vec::new(),
@@ -384,6 +426,7 @@ impl Hub {
             device_id: inner.device_id.clone(),
             device_name: inner.pc_name.clone(),
             download_dir: inner.download_dir.clone(),
+            image_dir: inner.image_dir.clone(),
             keys: inner.keys.clone(),
         };
         let host: Arc<dyn SessionHost> = self.inner.clone();
@@ -396,6 +439,42 @@ impl Hub {
     pub fn broadcast_clip(&self, text: &str) {
         for e in lock(&self.inner.state).sessions.values() {
             let _ = e.commands.send(Command::SendClip(text.to_string()));
+        }
+    }
+
+    /// A cada sesión lista cuya `ImageSync` no la tenga; marca tentativo por dispositivo.
+    /// `Err("too_large")` si pasa de 20 MiB; `Err("read_error")` si no se puede leer.
+    /// Cada sesión decide con su `ImageSync` (las que aún saludan lo ignoran: su envío de inicio
+    /// lee `local_image`). Hay que actualizar `local_image` antes de llamar.
+    pub fn broadcast_clip_image(&self, image: &LocalImage) -> Result<(), String> {
+        let meta = std::fs::metadata(&image.png_path).map_err(|_| "read_error")?;
+        if !meta.is_file() {
+            return Err("read_error".into());
+        }
+        if meta.len() > MAX_CLIP_IMAGE_BYTES {
+            return Err("too_large".into());
+        }
+        for e in lock(&self.inner.state).sessions.values() {
+            let _ = e.commands.send(Command::SendImage(image.clone()));
+        }
+        Ok(())
+    }
+
+    /// La capa app escribió la imagen recibida por esa sesión y leyó `hash` de vuelta: ese
+    /// dispositivo ya la tiene. Vale también si la sesión ya se cerró.
+    pub fn mark_image_synced(&self, session_id: u64, hash: &str) {
+        let st = lock(&self.inner.state);
+        let device = match st.sessions.get(&session_id) {
+            Some(e) => e.device_id.clone(),
+            None => st
+                .ended
+                .iter()
+                .find(|(id, _)| *id == session_id)
+                .map(|(_, d)| d.clone()),
+        };
+        if let Some(syncs) = device.and_then(|d| st.syncs.get(&d)) {
+            // el PC no guarda el confirmado entre arranques
+            let _ = lock(&syncs.image).mark_synced(hash);
         }
     }
 
@@ -421,6 +500,7 @@ impl Hub {
             state: TransferState::Queued,
             error: None,
             location: None,
+            purpose: None,
         };
         let mut out = OutFile {
             meta: OutMeta {
@@ -493,7 +573,12 @@ impl Hub {
         let mut v = st.paired.list();
         // un pendiente de guardar que ya está en el archivo (se recuperó la lectura) no se repite
         let en_archivo: Vec<String> = v.iter().map(|d| d.public_key.clone()).collect();
-        v.extend(st.unsaved.iter().filter(|d| !en_archivo.contains(&d.public_key)).cloned());
+        v.extend(
+            st.unsaved
+                .iter()
+                .filter(|d| !en_archivo.contains(&d.public_key))
+                .cloned(),
+        );
         v.sort_by_key(|d| d.paired_at_ms);
         v
     }

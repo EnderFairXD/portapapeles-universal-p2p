@@ -208,6 +208,8 @@ impl AppState {
                     now_ms.saturating_add(PAIR_NOTICE_MS),
                 ));
             }
+            // la pone en el portapapeles la Tarea 6
+            HubEvent::ClipImageReceived { .. } => {}
         }
     }
 
@@ -651,6 +653,7 @@ mod tests {
             state,
             error: None,
             location: None,
+            purpose: None,
         }
     }
 

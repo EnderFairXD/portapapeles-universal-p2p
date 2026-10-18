@@ -6,6 +6,7 @@
 //! siguiente.
 
 use std::collections::{HashSet, VecDeque};
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
@@ -20,6 +21,8 @@ use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 use super::clip_sync::{sha256_hex, ClipDecision, ClipboardSync};
 use super::files::FileReceiver;
+use super::hub::LocalImage;
+use super::image_sync::ImageSync;
 use crate::protocol::hello::{
     decode_client_hello, encode_server_hello, ClientHello, RejectReason, ServerHello,
 };
@@ -27,7 +30,7 @@ use crate::protocol::secure::{self, SecureChannel, StaticKeys};
 use crate::protocol::{
     encode_control, encode_file_data, frame_codec, ControlMessage, Decoded, MessageDecoder,
     FILE_ACK_EVERY_BYTES, FILE_CHUNK_BYTES, FILE_WINDOW_BYTES, HEARTBEAT_INTERVAL_MS,
-    HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES, MAX_FRAME_BYTES,
+    HEARTBEAT_TIMEOUT_MS, MAX_CLIP_BYTES, MAX_CLIP_IMAGE_BYTES, MAX_FRAME_BYTES, PURPOSE_CLIPBOARD,
 };
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]
@@ -65,6 +68,8 @@ pub struct TransferUpdate {
     pub state: TransferState,
     pub error: Option<String>,
     pub location: Option<String>,
+    /// `Some("clipboard")` en las imágenes del portapapeles; `null` en JSON si falta (R21)
+    pub purpose: Option<String>,
 }
 
 /// Órdenes del Hub a una sesión.
@@ -72,6 +77,8 @@ pub(super) enum Command {
     /// Se envía solo si la sesión está lista y su ClipboardSync dice `Send`.
     SendClip(String),
     SendFile(OutFile),
+    /// Imagen del portapapeles: se envía solo si la sesión está lista y su ImageSync no la tiene.
+    SendImage(LocalImage),
     Cancel(String),
     Close(String),
 }
@@ -100,12 +107,37 @@ pub(super) enum SessionEvent {
     Clip(String),
     LocalClipSuperseded(String),
     Transfer(TransferUpdate),
+    /// imagen para el portapapeles ya guardada (ruta)
+    ClipImage(String),
     Closed(String),
+}
+
+/// Anti-rebote de un dispositivo (texto e imagen), compartido entre sus sesiones.
+#[derive(Clone)]
+pub(super) struct DeviceSyncs {
+    pub clip: Arc<Mutex<ClipboardSync>>,
+    pub image: Arc<Mutex<ImageSync>>,
+}
+
+impl DeviceSyncs {
+    pub fn new() -> Self {
+        Self {
+            clip: Arc::new(Mutex::new(ClipboardSync::new(None))),
+            image: Arc::new(Mutex::new(ImageSync::new(None))),
+        }
+    }
+
+    /// Olvida lo enviado (R17/R20): lo último puede no haber llegado al móvil.
+    pub fn reset(&self) {
+        *lock(&self.clip) = ClipboardSync::new(None);
+        *lock(&self.image) = ImageSync::new(None);
+    }
 }
 
 /// Lo que la sesión necesita del Hub. `on_event` se llama de forma síncrona y en orden.
 pub(super) trait SessionHost: Send + Sync + 'static {
     fn local_clip(&self) -> Option<String>;
+    fn local_image(&self) -> Option<LocalImage>;
     /// Tras leer el mensaje 1: decide si el móvil con esa clave pública puede entrar. Con
     /// `Err`, el PC responde con el rechazo y cierra con ese motivo.
     fn authorize(
@@ -114,8 +146,8 @@ pub(super) trait SessionHost: Send + Sync + 'static {
         public_key: &[u8; 32],
         hello: &ClientHello,
     ) -> Result<(), RejectReason>;
-    /// Tras aceptar: devuelve la ClipboardSync del dispositivo (`device_key` = clave en hex).
-    fn clip_sync_for(&self, session_id: u64, device_key: &str) -> Arc<Mutex<ClipboardSync>>;
+    /// Tras aceptar: devuelve el anti-rebote del dispositivo (`device_key` = clave en hex).
+    fn syncs_for(&self, session_id: u64, device_key: &str) -> DeviceSyncs;
     fn on_event(&self, session_id: u64, event: SessionEvent);
 }
 
@@ -124,6 +156,8 @@ pub(super) struct SessionConfig {
     pub device_id: String,
     pub device_name: String,
     pub download_dir: PathBuf,
+    /// destino de las imágenes con `purpose:"clipboard"`
+    pub image_dir: PathBuf,
     /// claves estáticas del PC (respondedor del handshake)
     pub keys: StaticKeys,
 }
@@ -156,6 +190,14 @@ const WRITE_ERROR: &str = "write_error";
 const READ_ERROR: &str = "read_error";
 const SIZE_MISMATCH: &str = "size_mismatch";
 const CHECKSUM_MISMATCH: &str = "checksum_mismatch";
+/// file_cancel de una imagen para el portapapeles de más de 20 MiB
+const TOO_LARGE: &str = "too_large";
+/// el PC siempre envía sus imágenes en PNG
+const IMAGE_MIME: &str = "image/png";
+
+fn log(msg: &str) {
+    let _ = writeln!(std::io::stderr(), "[Sesión] {msg}");
+}
 
 /// Error que cierra la sesión con ese motivo.
 type Res = Result<(), &'static str>;
@@ -170,9 +212,30 @@ struct OutTransfer {
     hasher: sha2::Sha256,
     /// trozo leído que espera hueco en la ventana (como mucho uno)
     pending: Option<Vec<u8>>,
+    /// hash de la imagen del portapapeles; `None` en un archivo normal
+    image_hash: Option<String>,
 }
 
 impl OutTransfer {
+    fn new(f: OutMeta, file: tokio::fs::File, image_hash: Option<String>) -> Self {
+        OutTransfer {
+            f,
+            file,
+            sent: 0,
+            acked: 0,
+            end_sent: false,
+            hasher: sha2::Digest::new(),
+            pending: None,
+            image_hash,
+        }
+    }
+
+    fn purpose(&self) -> Option<String> {
+        self.image_hash
+            .as_ref()
+            .map(|_| PURPOSE_CLIPBOARD.to_string())
+    }
+
     fn update(&self, state: TransferState, error: Option<&str>) -> TransferUpdate {
         TransferUpdate {
             transfer_id: self.f.id.clone(),
@@ -187,6 +250,7 @@ impl OutTransfer {
             state,
             error: error.map(String::from),
             location: None,
+            purpose: self.purpose(),
         }
     }
 
@@ -228,6 +292,7 @@ struct InTransfer {
     size: u64,
     received: u64,
     sink: Sink,
+    purpose: Option<String>,
 }
 
 impl InTransfer {
@@ -246,6 +311,7 @@ impl InTransfer {
             state,
             error: error.map(String::from),
             location,
+            purpose: self.purpose.clone(),
         }
     }
 }
@@ -373,6 +439,7 @@ pub(super) async fn run<S>(
         closed: false,
         ready: false,
         sync: Arc::new(Mutex::new(ClipboardSync::new(None))),
+        image_sync: Arc::new(Mutex::new(ImageSync::new(None))),
         last_rx: Instant::now(),
         out_queue: VecDeque::new(),
         out: None,
@@ -422,6 +489,8 @@ struct Session<W> {
     ready: bool,
     /// ClipboardSync del dispositivo (compartido entre sus sesiones); provisional hasta el saludo
     sync: Arc<Mutex<ClipboardSync>>,
+    /// ImageSync del dispositivo, igual que `sync`
+    image_sync: Arc<Mutex<ImageSync>>,
     last_rx: Instant,
     out_queue: VecDeque<OutTransfer>,
     out: Option<OutTransfer>,
@@ -484,9 +553,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         self.closed = true;
         if let Some(t) = self.out.take() {
+            self.settle_image(&t, false);
             self.emit_transfer(t.update(TransferState::Failed, Some(reason)));
         }
         for t in std::mem::take(&mut self.out_queue) {
+            self.settle_image(&t, false);
             self.emit_transfer(t.update(TransferState::Failed, Some(reason)));
         }
         if let Some(t) = self.inc.take() {
@@ -507,6 +578,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     state: TransferState::Failed,
                     error: Some(reason.to_string()),
                     location: None,
+                    purpose: None,
                 });
             }
         }
@@ -532,18 +604,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 }
             }
             Command::SendFile(OutFile { meta, file }) => {
-                let t = OutTransfer {
-                    f: meta,
-                    file: tokio::fs::File::from_std(file),
-                    sent: 0,
-                    acked: 0,
-                    end_sent: false,
-                    hasher: sha2::Digest::new(),
-                    pending: None,
-                };
+                let t = OutTransfer::new(meta, tokio::fs::File::from_std(file), None);
                 // 'queued' ya lo emitió el Hub al aceptar el archivo
                 self.out_queue.push_back(t);
             }
+            Command::SendImage(img) => self.offer_image(img).await,
             Command::Cancel(id) => self.cancel_transfer(&id).await,
             Command::Close(reason) => self.close(&reason),
         }
@@ -554,6 +619,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if let Some(i) = self.out_queue.iter().position(|t| t.f.id == id) {
             // aún no empezó: el otro lado no sabe nada de él
             if let Some(t) = self.out_queue.remove(i) {
+                self.settle_image(&t, false);
                 self.emit_transfer(t.update(TransferState::Cancelled, None));
             }
             return;
@@ -607,8 +673,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 transfer_id,
                 name,
                 size,
+                purpose,
                 ..
-            } => self.on_file_start(transfer_id, name, size).await,
+            } => self.on_file_start(transfer_id, name, size, purpose).await,
             ControlMessage::FileEnd {
                 transfer_id,
                 sha256,
@@ -636,7 +703,9 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     /// Tras aceptar el handshake (el mensaje 2 ya salió): regla de inicio y `Ready`.
     async fn on_client_hello(&mut self, device_key: String, hello: ClientHello) {
-        self.sync = self.host.clip_sync_for(self.cfg.id, &device_key);
+        let syncs = self.host.syncs_for(self.cfg.id, &device_key);
+        self.sync = syncs.clip;
+        self.image_sync = syncs.image;
         // Órdenes que llegaron durante el handshake: como la sesión no está lista, los clips se
         // ignoran (la regla de inicio lee ahora el portapapeles local) y un Close la cierra.
         while let Ok(c) = self.commands.try_recv() {
@@ -667,6 +736,10 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         });
         if let Some(text) = superseded {
             self.emit(SessionEvent::LocalClipSuperseded(text));
+        }
+        // envío de inicio de la imagen: no entra en «gana el móvil»
+        if let Some(img) = self.host.local_image() {
+            self.offer_image(img).await;
         }
     }
 
@@ -709,6 +782,67 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         Ok(())
     }
 
+    // --- imágenes del portapapeles: emisor ---
+
+    /// R7: por sesión, como mucho una imagen del portapapeles en cola o en curso. La que espera
+    /// en cola se sustituye por la nueva; la que está en vuelo termina y la nueva va detrás.
+    /// `mark_sent` siempre lleva el hash de la que de verdad está en cola o en curso.
+    async fn offer_image(&mut self, img: LocalImage) {
+        if !self.ready {
+            return; // su regla de inicio ya leerá `local_image`
+        }
+        let queued = self.out_queue.iter().find_map(|t| t.image_hash.as_deref());
+        if queued == Some(img.hash.as_str()) {
+            return; // ya está en cola
+        }
+        let dup = lock(&self.image_sync).is_duplicate(&img.hash);
+        let in_flight =
+            self.out.as_ref().and_then(|t| t.image_hash.as_deref()) == Some(img.hash.as_str());
+        if dup || in_flight {
+            // el otro lado ya la tiene o la está recibiendo: lo que espera en cola sobra
+            self.drop_queued_image();
+            if !dup {
+                lock(&self.image_sync).mark_sent(&img.hash);
+            }
+            return;
+        }
+        let Some(t) = open_image(&img).await else {
+            return;
+        };
+        self.drop_queued_image();
+        lock(&self.image_sync).mark_sent(&img.hash);
+        self.emit_transfer(t.update(TransferState::Queued, None));
+        self.out_queue.push_back(t);
+    }
+
+    /// Quita de la cola la imagen que aún no empezó (el otro lado no sabe nada de ella).
+    fn drop_queued_image(&mut self) {
+        let Some(i) = self.out_queue.iter().position(|t| t.image_hash.is_some()) else {
+            return;
+        };
+        if let Some(t) = self.out_queue.remove(i) {
+            self.emit_transfer(t.update(TransferState::Cancelled, None));
+        }
+    }
+
+    /// Fin de una imagen saliente: confirma o revierte, solo si sigue siendo la última marcada
+    /// (si no, la sustituyó otra o llegó una del móvil). Va antes del aviso al Hub.
+    fn settle_image(&self, t: &OutTransfer, ok: bool) {
+        let Some(h) = t.image_hash.as_deref() else {
+            return;
+        };
+        let mut sync = lock(&self.image_sync);
+        if sync.last_synced_hash() != Some(h) {
+            return;
+        }
+        if ok {
+            // el PC no guarda el confirmado entre arranques
+            let _ = sync.confirm_sent();
+        } else {
+            sync.revert_sent();
+        }
+    }
+
     // --- archivos: emisor ---
 
     /// Arranca el siguiente de la cola si no hay otro en curso.
@@ -724,7 +858,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             name: t.f.name.clone(),
             size: t.f.size,
             mime: t.f.mime.clone(),
-            purpose: None,
+            purpose: t.purpose(),
         };
         self.out = Some(t);
         // file_start sale antes del aviso 'active'
@@ -792,6 +926,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     /// Termina el saliente activo; con `cancel`, avisa al otro lado con ese motivo.
     async fn end_out(&mut self, state: TransferState, error: Option<&str>, cancel: Option<&str>) {
         let Some(t) = self.out.take() else { return };
+        self.settle_image(&t, state == TransferState::Done);
         // se emite antes de escribir: si la escritura falla, 'closed' llega después
         self.emit_transfer(t.update(state, error));
         if let Some(reason) = cancel {
@@ -856,10 +991,18 @@ impl<W: AsyncWrite + Unpin> Session<W> {
 
     // --- archivos: receptor ---
 
-    async fn on_file_start(&mut self, id: String, name: String, size: u64) -> Res {
+    async fn on_file_start(
+        &mut self,
+        id: String,
+        name: String,
+        size: u64,
+        purpose: Option<String>,
+    ) -> Res {
         if self.inc.is_some() || self.ended_in.contains(&id) {
             return Err(PROTOCOL_ERROR);
         }
+        // el decodificador solo deja pasar "clipboard"
+        let image = purpose.as_deref() == Some(PURPOSE_CLIPBOARD);
         // recortado para mostrarlo; el archivo se guarda con el nombre saneado de siempre
         let shown = truncate_chars(name.clone(), MAX_FILE_NAME_CHARS);
         self.inc = Some(InTransfer {
@@ -868,8 +1011,24 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             size,
             received: 0,
             sink: Sink::Pending,
+            purpose,
         });
-        let dir = self.cfg.download_dir.clone();
+        if image && size > MAX_CLIP_IMAGE_BYTES {
+            // demasiado grande para el portapapeles: se rechaza sin abrir el destino ni cerrar
+            self.end_in(
+                TransferState::Failed,
+                Some(TOO_LARGE),
+                None,
+                Some(TOO_LARGE),
+            )
+            .await;
+            return Ok(());
+        }
+        let dir = if image {
+            self.cfg.image_dir.clone()
+        } else {
+            self.cfg.download_dir.clone()
+        };
         match tokio::task::spawn_blocking(move || FileReceiver::create(&dir, &name)).await {
             Ok(Ok(rx)) => {
                 if let Some(t) = self.inc.as_mut() {
@@ -885,7 +1044,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     None,
                     Some(WRITE_ERROR),
                 )
-                .await
+                .await;
             }
         }
         Ok(())
@@ -968,6 +1127,7 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         if t.received != t.size {
             return Err(PROTOCOL_ERROR);
         }
+        let image = t.purpose.is_some();
         let received = t.received;
         let Sink::Open(rx) = std::mem::replace(&mut t.sink, Sink::Pending) else {
             return Err(INTERNAL_ERROR);
@@ -996,8 +1156,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                 .await;
                 // si la sesión cayó aquí, close() ya borró el archivo y emitió failed
                 let location = path.to_string_lossy().into_owned();
-                self.end_in(TransferState::Done, None, Some(location), None)
+                let done = self
+                    .end_in(TransferState::Done, None, Some(location.clone()), None)
                     .await;
+                if done && image {
+                    self.emit(SessionEvent::ClipImage(location));
+                }
                 return Ok(());
             }
             Ok(Err(e)) if e == CHECKSUM_MISMATCH => CHECKSUM_MISMATCH,
@@ -1016,14 +1180,17 @@ impl<W: AsyncWrite + Unpin> Session<W> {
     }
 
     /// Termina el entrante activo; salvo `done`, descarta lo recibido o guardado.
+    /// `false` si ya no había ninguno (p. ej. la sesión se cerró antes).
     async fn end_in(
         &mut self,
         state: TransferState,
         error: Option<&str>,
         location: Option<String>,
         cancel: Option<&str>,
-    ) {
-        let Some(t) = self.inc.take() else { return };
+    ) -> bool {
+        let Some(t) = self.inc.take() else {
+            return false;
+        };
         self.ended_in.insert(t.id.clone());
         let u = t.update(state, error, location);
         if state != TransferState::Done {
@@ -1038,5 +1205,29 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             })
             .await;
         }
+        true
     }
+}
+
+/// Abre la imagen para enviarla; `None` (registrado) si no se puede o pasa de 20 MiB.
+async fn open_image(img: &LocalImage) -> Option<OutTransfer> {
+    let opened = async {
+        let file = tokio::fs::File::open(&img.png_path).await.ok()?;
+        let meta = file.metadata().await.ok()?;
+        let name = img.png_path.file_name()?.to_string_lossy().into_owned();
+        (meta.is_file() && meta.len() <= MAX_CLIP_IMAGE_BYTES).then_some((file, meta.len(), name))
+    };
+    let Some((file, size, name)) = opened.await else {
+        log("no se pudo abrir la imagen del portapapeles o pasa de 20 MiB");
+        return None;
+    };
+    let (id, id_bytes) = new_id();
+    let meta = OutMeta {
+        id,
+        id_bytes,
+        name,
+        size,
+        mime: IMAGE_MIME.into(),
+    };
+    Some(OutTransfer::new(meta, file, Some(img.hash.clone())))
 }
