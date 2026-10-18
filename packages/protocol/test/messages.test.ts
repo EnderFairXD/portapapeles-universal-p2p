@@ -60,6 +60,7 @@ describe('vectores compartidos', () => {
     for (const k of ['clip', 'file_start', 'file_ack', 'file_end', 'file_result', 'file_cancel', 'ping', 'pong']) {
       expect(kinds.has(k)).toBe(true);
     }
+    expect(vectors.some((v) => 'kind' in v.expect && v.expect.kind === 'file_start' && v.expect.purpose === 'clipboard')).toBe(true);
     expect(vectors.some((v) => 'data' in v.expect)).toBe(true);
     expect(vectors.filter((v) => 'error' in v.expect && !('kind' in v.expect)).length).toBeGreaterThanOrEqual(5);
   });
@@ -77,6 +78,7 @@ describe('encodeControl / MessageDecoder', () => {
   const messages: ControlMessage[] = [
     { kind: 'clip', id: 'a', text: 'hola 😀', hash: HASH },
     { kind: 'file_start', transferId: TID, name: 'a.txt', size: 0, mime: 'text/plain' },
+    { kind: 'file_start', transferId: TID, name: 'c.png', size: 10, mime: 'image/png', purpose: 'clipboard' },
     { kind: 'file_ack', transferId: TID, received: 1048576 },
     { kind: 'file_end', transferId: TID, sha256: HASH },
     { kind: 'file_result', transferId: TID, ok: true },
@@ -92,6 +94,28 @@ describe('encodeControl / MessageDecoder', () => {
     expect(frames[0][0]).toBe(0x01);
     expect(decodeAll(frames)).toEqual([{ type: 'control', msg }]);
   });
+
+  test('file_start sin purpose no lo emite en el JSON; con purpose desconocido lo descarta', () => {
+    const plain = encodeControl({ kind: 'file_start', transferId: TID, name: 'a.txt', size: 0, mime: 'text/plain' });
+    expect(new TextDecoder().decode(plain[0].subarray(1))).not.toContain('purpose');
+    const odd = { kind: 'file_start', transferId: TID, name: 'a.txt', size: 0, mime: 'text/plain', purpose: 'otro' };
+    const out = decodeAll([Uint8Array.of(0x01, ...new TextEncoder().encode(JSON.stringify(odd)))]);
+    expect(out).toEqual([{ type: 'control', msg: { kind: 'file_start', transferId: TID, name: 'a.txt', size: 0, mime: 'text/plain' } }]);
+  });
+
+  test.each(['image/png', 'image/jpeg', 'image/webp'])('purpose clipboard admite %s', (mime) => {
+    const msg: ControlMessage = { kind: 'file_start', transferId: TID, name: 'x', size: 1, mime, purpose: 'clipboard' };
+    expect(decodeAll(encodeControl(msg))).toEqual([{ type: 'control', msg }]);
+  });
+
+  test.each(['text/plain', 'image/gif', 'IMAGE/PNG', 'image/png; charset=x', ''])(
+    'purpose clipboard con mime %j → ProtocolError',
+    (mime) => {
+      expect(() =>
+        encodeControl({ kind: 'file_start', transferId: TID, name: 'x', size: 1, mime, purpose: 'clipboard' }),
+      ).toThrow(ProtocolError);
+    },
+  );
 
   test('un clip de 1 MiB de emojis se fragmenta en tramas ≤ 65535 y se reensambla igual', () => {
     const text = '😀'.repeat(262144); // 1 MiB en UTF-8

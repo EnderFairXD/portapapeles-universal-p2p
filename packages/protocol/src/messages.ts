@@ -1,8 +1,17 @@
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
-import { FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES } from './constants';
+import { CLIP_IMAGE_MIMES, FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES, PURPOSE_CLIPBOARD } from './constants';
 
 export type ClipMsg = { kind: 'clip'; id: string; text: string; hash: string };
-export type FileStartMsg = { kind: 'file_start'; transferId: string; name: string; size: number; mime: string };
+/** Destino de un archivo: ausente = archivo normal; 'clipboard' = imagen para el portapapeles. */
+export type FilePurpose = typeof PURPOSE_CLIPBOARD;
+export type FileStartMsg = {
+  kind: 'file_start';
+  transferId: string;
+  name: string;
+  size: number;
+  mime: string;
+  purpose?: FilePurpose;
+};
 export type FileAckMsg = { kind: 'file_ack'; transferId: string; received: number };
 export type FileEndMsg = { kind: 'file_end'; transferId: string; sha256: string };
 export type FileResultMsg = { kind: 'file_result'; transferId: string; ok: boolean; error?: string };
@@ -74,14 +83,23 @@ function validateControl(value: unknown): ControlMessage {
   switch (o.kind) {
     case 'clip':
       return { kind: 'clip', id: str(o, 'id'), text: str(o, 'text'), hash: hash(o, 'hash') };
-    case 'file_start':
-      return {
+    case 'file_start': {
+      const msg: FileStartMsg = {
         kind: 'file_start',
         transferId: transferId(o),
         name: str(o, 'name'),
         size: uint(o, 'size'),
         mime: str(o, 'mime'),
       };
+      // un purpose desconocido (o que no es texto) se ignora: es un archivo normal
+      if (o.purpose === PURPOSE_CLIPBOARD) {
+        if (!(CLIP_IMAGE_MIMES as readonly string[]).includes(msg.mime)) {
+          fail(`'mime' no admitido para el portapapeles (${msg.mime})`);
+        }
+        msg.purpose = PURPOSE_CLIPBOARD;
+      }
+      return msg;
+    }
     case 'file_ack':
       return { kind: 'file_ack', transferId: transferId(o), received: uint(o, 'received') };
     case 'file_end':

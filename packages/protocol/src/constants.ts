@@ -20,6 +20,12 @@ export const FILE_ACK_EVERY_BYTES = 1048576;
 export const FILE_WINDOW_BYTES = 2097152;
 /** Máximo de texto de portapapeles, en bytes UTF-8 (1 MiB). */
 export const MAX_CLIP_BYTES = 1048576;
+/** Máximo de una imagen para el portapapeles (20 MiB). */
+export const MAX_CLIP_IMAGE_BYTES = 20971520;
+/** Tipos MIME admitidos para una imagen de portapapeles. */
+export const CLIP_IMAGE_MIMES = ['image/png', 'image/jpeg', 'image/webp'] as const;
+/** Valor de `purpose` en `file_start` para una imagen que va al portapapeles. */
+export const PURPOSE_CLIPBOARD = 'clipboard';
 /** Máximo de un mensaje de control reensamblado (2 MiB). */
 export const MAX_CONTROL_BYTES = 2097152;
 
