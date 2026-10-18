@@ -14,6 +14,7 @@ import {
   Session,
   generateKeyPair,
   sha256Hex,
+  type FileMeta,
   type KeyPair,
   type PeerInfo,
   type TransferUpdate,
@@ -97,8 +98,9 @@ async function freshDataDir(): Promise<string> {
 
 async function startHeadless(opts: { localClip?: string; dataDir?: string } = {}) {
   const downloadDir = await freshDir();
+  const imageDir = join(dirname(downloadDir), 'imagenes');
   const dataDir = opts.dataDir ?? (await freshDataDir());
-  const args = ['--download-dir', downloadDir, '--data-dir', dataDir];
+  const args = ['--download-dir', downloadDir, '--image-dir', imageDir, '--data-dir', dataDir];
   if (opts.localClip !== undefined) args.push('--local-clip', opts.localClip);
   const child: ChildProcess = spawn(binary, args, { stdio: ['pipe', 'pipe', 'pipe'] });
   const exited = new Promise<void>((r) => child.once('exit', () => r()));
@@ -138,6 +140,7 @@ async function startHeadless(opts: { localClip?: string; dataDir?: string } = {}
   return {
     port,
     downloadDir,
+    imageDir,
     dataDir,
     /** Clave pública del PC en hex minúscula y en bytes (lo que el móvil lee del QR). */
     publicKeyHex,
@@ -181,6 +184,7 @@ async function connectClient(port: number, opts: ClientOptions) {
   const link = await connectNode(port);
   const sync = new ClipboardSync();
   const sinks: MemorySink[] = [];
+  const metas: FileMeta[] = [];
   const clips: string[] = [];
   const transfers: TransferUpdate[] = [];
   const identity = opts.identity ?? generateKeyPair();
@@ -195,6 +199,7 @@ async function connectClient(port: number, opts: ClientOptions) {
     clipSyncFor: () => sync,
     getLocalClip: async () => opts.localClip ?? null,
     openSink: async (meta) => {
+      metas.push(meta);
       const s = memorySink(meta.name);
       sinks.push(s);
       return s;
@@ -213,6 +218,7 @@ async function connectClient(port: number, opts: ClientOptions) {
     identityHex: bytesToHex(identity.publicKey),
     sync,
     sinks,
+    metas,
     clips,
     transfers,
     get ready() {
@@ -558,4 +564,86 @@ test('reiniciar headless con el mismo --data-dir conserva publicKey y emparejado
   const conn = await second.waitEvent((e) => e.type === 'peerConnected', 'peerConnected tras reiniciar');
   expect(conn.deviceId).toBe(client.identityHex);
   expect(second.events.some((e) => e.type === 'devicePaired')).toBe(false);
+});
+
+// --- imágenes del portapapeles (fase 2b) ---
+
+/** PNG de prueba: cabecera real y relleno aleatorio (el protocolo no valida el contenido). */
+function fakePng(n: number): Uint8Array {
+  const png = new Uint8Array(randomBytes(n));
+  png.set([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+  return png;
+}
+
+test('imagen de 3 MiB cliente → PC con purpose clipboard: clipImageReceived y archivo idéntico en image-dir', async () => {
+  const pc = await startHeadless();
+  const client = await pairedSession(pc);
+  const png = fakePng(3 * MiB);
+
+  const id = client.session.sendFile({ ...memorySource(png, 'captura.png', 'image/png'), purpose: 'clipboard' });
+  const mine = await client.waitTransfer(id, 'done');
+  expect(mine.purpose).toBe('clipboard');
+  const ev = await pc.waitEvent((e) => e.type === 'clipImageReceived', 'clipImageReceived');
+  const conn = await pc.waitEvent((e) => e.type === 'peerConnected', 'peerConnected');
+  expect(ev.sessionId).toBe(conn.sessionId);
+  expect(ev.location).toBe(join(pc.imageDir, 'captura.png'));
+  const saved = new Uint8Array(await readFile(ev.location as string));
+  expect(saved.length).toBe(png.length);
+  expect(sha256Hex(saved)).toBe(sha256Hex(png));
+  // el progreso del PC también lleva el purpose, y la imagen no cae en Descargas
+  const done = await pc.waitEvent((e) => e.type === 'transfer' && e.transferId === id && e.state === 'done', 'done en el PC');
+  expect(done).toMatchObject({ direction: 'in', purpose: 'clipboard' });
+  expect(await listDir(pc.downloadDir)).toEqual([]);
+  expect(pc.bad).toEqual([]);
+});
+
+test('imagen del PC (cmd image) → el memorySink del cliente la recibe con purpose clipboard', async () => {
+  const pc = await startHeadless();
+  const client = await pairedSession(pc);
+  const png = fakePng(3 * MiB + 5);
+  const src = join(dirname(pc.downloadDir), 'copia.png');
+  await writeFile(src, png);
+
+  pc.command({ cmd: 'image', path: src, hash: sha256Hex(png) });
+  const queued = await pc.waitEvent((e) => e.type === 'transfer' && e.state === 'queued', 'queued en el PC');
+  expect(queued).toMatchObject({ direction: 'out', name: 'copia.png', size: png.length, purpose: 'clipboard' });
+  const id = queued.transferId as string;
+
+  const done = await client.waitTransfer(id, 'done');
+  expect(done).toMatchObject({ direction: 'in', name: 'copia.png', size: png.length, purpose: 'clipboard' });
+  expect(client.metas).toHaveLength(1);
+  expect(client.metas[0]).toMatchObject({ name: 'copia.png', mime: 'image/png', purpose: 'clipboard' });
+  expect(sha256Hex(client.sinks[0].bytes())).toBe(sha256Hex(png));
+  await pc.waitEvent((e) => e.type === 'transfer' && e.transferId === id && e.state === 'done', 'done en el PC');
+});
+
+test('imagen local del PC antes de conectar: se envía al iniciar la sesión', async () => {
+  const pc = await startHeadless();
+  const png = fakePng(200_000);
+  const src = join(dirname(pc.downloadDir), 'inicial.png');
+  await writeFile(src, png);
+  pc.command({ cmd: 'image', path: src, hash: sha256Hex(png) });
+
+  const client = await pairedSession(pc);
+  await waitUntil(() => client.transfers.find((u) => u.state === 'done'), 'imagen de inicio en el cliente');
+  expect(client.metas[0]).toMatchObject({ name: 'inicial.png', mime: 'image/png', purpose: 'clipboard' });
+  expect(sha256Hex(client.sinks[0].bytes())).toBe(sha256Hex(png));
+});
+
+test('20 MiB + 1 con purpose clipboard: RangeError en el cliente y no sale nada', async () => {
+  const pc = await startHeadless();
+  const client = await pairedSession(pc);
+  const big = new Uint8Array(20 * MiB + 1);
+
+  expect(() =>
+    client.session.sendFile({ ...memorySource(big, 'enorme.png', 'image/png'), purpose: 'clipboard' }),
+  ).toThrow(RangeError);
+  expect(client.transfers).toEqual([]);
+
+  // el ping/pong del clip hace de barrera: si algo hubiera salido, ya habría llegado
+  expect(client.session.sendClip('barrera')).toBe('send');
+  await pc.waitEvent((e) => e.type === 'clipReceived' && e.text === 'barrera', 'clipReceived');
+  expect(pc.events.some((e) => e.type === 'transfer' || e.type === 'clipImageReceived')).toBe(false);
+  expect(existsSync(pc.imageDir) ? await listDir(pc.imageDir) : []).toEqual([]);
+  expect(client.closed).toBeNull();
 });

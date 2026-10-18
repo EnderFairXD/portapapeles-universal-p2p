@@ -1,6 +1,10 @@
 //! Servidor sin interfaz para el e2e: el Hub en 127.0.0.1:0, sus eventos como JSON por stdout
 //! y órdenes JSON por stdin. Uso:
-//! `headless --download-dir <dir> --data-dir <dir> [--local-clip <texto>]`.
+//! `headless --download-dir <dir> --image-dir <dir> --data-dir <dir> [--local-clip <texto>]`.
+//!
+//! `--image-dir` es el destino de las imágenes con `purpose:"clipboard"`. La orden
+//! `{"cmd":"image","path":…,"hash":…}` difunde un PNG como imagen del portapapeles y lo guarda
+//! como imagen local (la que se envía al iniciar una sesión). No toca el portapapeles real.
 //!
 //! `--data-dir` guarda la identidad (`identity.key`) y los emparejados (`paired.json`): al
 //! relanzar con la misma carpeta se conservan.
@@ -13,7 +17,7 @@ use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 
 use clipsync_lib::core::pairing::PairedStore;
-use clipsync_lib::core::{identity, Hub, HubConfig};
+use clipsync_lib::core::{identity, Hub, HubConfig, LocalImage};
 use serde::Deserialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::net::TcpListener;
@@ -27,6 +31,11 @@ enum Cmd {
     File {
         path: PathBuf,
     },
+    /// Imagen del portapapeles: `hash` es el que el PC daría a esa imagen (aquí, cualquier texto).
+    Image {
+        path: PathBuf,
+        hash: String,
+    },
     /// Abre una ventana de emparejamiento; responde con la línea `pairing`.
     Pair,
     /// Olvida un móvil emparejado; sus efectos llegan como eventos.
@@ -38,12 +47,14 @@ enum Cmd {
 
 struct Args {
     download_dir: PathBuf,
+    image_dir: PathBuf,
     data_dir: PathBuf,
     local_clip: Option<String>,
 }
 
 fn parse_args() -> Result<Args, String> {
     let mut download_dir = None;
+    let mut image_dir = None;
     let mut data_dir = None;
     let mut local_clip = None;
     let mut it = std::env::args_os().skip(1);
@@ -51,6 +62,7 @@ fn parse_args() -> Result<Args, String> {
         let value = it.next();
         match (arg.to_str(), value) {
             (Some("--download-dir"), Some(v)) => download_dir = Some(PathBuf::from(v)),
+            (Some("--image-dir"), Some(v)) => image_dir = Some(PathBuf::from(v)),
             (Some("--data-dir"), Some(v)) => data_dir = Some(PathBuf::from(v)),
             (Some("--local-clip"), Some(v)) => {
                 local_clip = Some(v.into_string().map_err(|_| "--local-clip no es UTF-8")?)
@@ -59,9 +71,11 @@ fn parse_args() -> Result<Args, String> {
         }
     }
     let download_dir = download_dir.ok_or("falta --download-dir")?;
+    let image_dir = image_dir.ok_or("falta --image-dir")?;
     let data_dir = data_dir.ok_or("falta --data-dir")?;
     Ok(Args {
         download_dir,
+        image_dir,
         data_dir,
         local_clip,
     })
@@ -85,7 +99,7 @@ async fn main() -> ExitCode {
         Ok(a) => a,
         Err(e) => {
             err(&format!(
-                "{e}\nUso: headless --download-dir <dir> --data-dir <dir> [--local-clip <texto>]"
+                "{e}\nUso: headless --download-dir <dir> --image-dir <dir> --data-dir <dir> [--local-clip <texto>]"
             ));
             return ExitCode::from(2);
         }
@@ -94,13 +108,18 @@ async fn main() -> ExitCode {
     // como la app: el último texto local (el inicial, o el último pedido por stdin)
     let local = Arc::new(Mutex::new(args.local_clip));
     let local_read = local.clone();
+    // como el texto: la última imagen local (la de la orden `image`)
+    let local_img = Arc::new(Mutex::new(None::<LocalImage>));
+    let local_img_read = local_img.clone();
     let (hub, mut events) = Hub::new(HubConfig {
         device_id: "headless-pc".into(),
         pc_name: "PC headless".into(),
-        // provisional: la Tarea 5 añade --image-dir
-        image_dir: args.download_dir.join("ClipSync"),
+        image_dir: args.image_dir,
         download_dir: args.download_dir,
-        local_image: Arc::new(|| None),
+        local_image: Arc::new(move || match local_img_read.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }),
         local_clip: Arc::new(move || match local_read.lock() {
             Ok(g) => g.clone(),
             Err(p) => p.into_inner().clone(),
@@ -155,7 +174,7 @@ async fn main() -> ExitCode {
         match stdin.read_until(b'\n', &mut buf).await {
             Ok(0) => break, // stdin cerrado: el proceso padre se fue
             Ok(_) => match std::str::from_utf8(&buf) {
-                Ok(line) => handle(&hub, &local, line),
+                Ok(line) => handle(&hub, &local, &local_img, line),
                 Err(_) => err("línea de stdin que no es UTF-8: se ignora"),
             },
             Err(e) => {
@@ -168,7 +187,12 @@ async fn main() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn handle(hub: &Hub, local: &Mutex<Option<String>>, line: &str) {
+fn handle(
+    hub: &Hub,
+    local: &Mutex<Option<String>>,
+    local_img: &Mutex<Option<LocalImage>>,
+    line: &str,
+) {
     let line = line.trim_end_matches(['\n', '\r']);
     if line.trim().is_empty() {
         return;
@@ -183,6 +207,23 @@ fn handle(hub: &Hub, local: &Mutex<Option<String>>, line: &str) {
             hub.broadcast_clip(&text);
         }
         Ok(Cmd::File { path }) => send_file(hub, &path),
+        Ok(Cmd::Image { path, hash }) => {
+            let img = LocalImage {
+                hash,
+                png_path: path,
+            };
+            // antes del broadcast: el envío de inicio de sesiones nuevas lee la imagen local
+            match local_img.lock() {
+                Ok(mut g) => *g = Some(img.clone()),
+                Err(p) => *p.into_inner() = Some(img.clone()),
+            }
+            if let Err(e) = hub.broadcast_clip_image(&img) {
+                err(&format!(
+                    "no se pudo difundir {}: {e}",
+                    img.png_path.display()
+                ));
+            }
+        }
         Ok(Cmd::Pair) => {
             let offer = hub.start_pairing();
             // a mano, por el orden de las claves; el token es base64url, pero se escapa igualmente
