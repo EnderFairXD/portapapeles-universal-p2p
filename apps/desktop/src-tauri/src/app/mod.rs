@@ -90,7 +90,7 @@ pub struct HistoryItem {
     pub text: Option<String>,
     pub file_name: Option<String>,
     pub location: Option<String>,
-    /// miniatura PNG en data URL; solo en `kind: "image"`
+    /// miniatura JPEG en data URL (`data:image/jpeg;base64,…`); solo en `kind: "image"`
     pub thumbnail: Option<String>,
     pub at_ms: u64,
 }
@@ -1405,25 +1405,25 @@ mod tests {
     fn imagen_enviada_va_al_historial_con_miniatura() {
         let mut s = st();
         s.apply(connected(1, "movil"), 1);
-        s.add_sent_image(png(1), Some("data:image/png;base64,AAAA".into()), 9);
+        s.add_sent_image(png(1), Some("data:image/jpeg;base64,AAAA".into()), 9);
         let ui = s.snapshot(0);
         let h = &ui.history[0];
         assert_eq!(h.kind, "image");
         assert_eq!(h.direction, "out");
-        assert_eq!(h.thumbnail.as_deref(), Some("data:image/png;base64,AAAA"));
+        assert_eq!(h.thumbnail.as_deref(), Some("data:image/jpeg;base64,AAAA"));
         assert_eq!(h.text, None);
         assert_eq!(h.location, None);
         assert_eq!(h.at_ms, 9);
         assert_eq!(s.image_path(h.id), Some(png(1)));
         let v = serde_json::to_value(&ui).unwrap();
         assert_eq!(v["history"][0]["kind"], "image");
-        assert_eq!(v["history"][0]["thumbnail"], "data:image/png;base64,AAAA");
+        assert_eq!(v["history"][0]["thumbnail"], "data:image/jpeg;base64,AAAA");
     }
 
     #[test]
     fn imagen_copiada_sin_movil_no_se_anota() {
         let mut s = st();
-        s.add_sent_image(png(1), Some("data:image/png;base64,AAAA".into()), 1);
+        s.add_sent_image(png(1), Some("data:image/jpeg;base64,AAAA".into()), 1);
         assert!(s.snapshot(0).history.is_empty());
         // su PNG no queda referenciado por el historial
         assert!(!s.image_in_use(&png(1)));
@@ -1434,7 +1434,7 @@ mod tests {
         let mut s = st();
         s.add_received_image(
             png(2),
-            Some("data:image/png;base64,BBBB".into()),
+            Some("data:image/jpeg;base64,BBBB".into()),
             "/home/u/Imágenes/ClipSync/foto.jpg".into(),
             4,
         );
@@ -1497,11 +1497,11 @@ mod tests {
         let mut s = st();
         s.apply(connected(1, "movil"), 1);
         for i in 1..=51 {
-            s.add_sent_image(png(i), Some(format!("data:image/png;base64,{i}")), i as u64);
+            s.add_sent_image(png(i), Some(format!("data:image/jpeg;base64,{i}")), i as u64);
         }
         let h = s.snapshot(0).history;
         assert_eq!(h.len(), 50);
-        assert_eq!(h[49].thumbnail.as_deref(), Some("data:image/png;base64,2"));
+        assert_eq!(h[49].thumbnail.as_deref(), Some("data:image/jpeg;base64,2"));
         assert_eq!(s.take_trash(), vec![png(1)]);
         assert!(s.take_trash().is_empty());
         assert!(!s.image_in_use(&png(1)));
@@ -1515,12 +1515,12 @@ mod tests {
     fn un_png_compartido_sigue_en_uso_aunque_se_pode_un_item() {
         let mut s = st();
         s.apply(connected(1, "movil"), 1);
-        s.add_sent_image(png(1), Some("data:image/png;base64,A".into()), 1);
+        s.add_sent_image(png(1), Some("data:image/jpeg;base64,A".into()), 1);
         for i in 0..49 {
             s.add_text(DIR_OUT, i.to_string(), 2);
         }
         // la misma imagen copiada otra vez
-        s.add_sent_image(png(1), Some("data:image/png;base64,A".into()), 3);
+        s.add_sent_image(png(1), Some("data:image/jpeg;base64,A".into()), 3);
         assert_eq!(s.take_trash(), vec![png(1)]);
         // quien borra comprueba antes si sigue en uso
         assert!(s.image_in_use(&png(1)));
@@ -1531,13 +1531,13 @@ mod tests {
         let mut s = st();
         s.apply(connected(1, "movil"), 1);
         for i in 1..=51 {
-            s.add_sent_image(png(i), Some("data:image/png;base64,A".into()), 1);
+            s.add_sent_image(png(i), Some("data:image/jpeg;base64,A".into()), 1);
         }
         let fallidos = s.take_trash();
         s.retry_later(fallidos);
         // no se reintenta en cada sondeo, solo al podar de nuevo
         assert!(s.take_trash().is_empty());
-        s.add_sent_image(png(52), Some("data:image/png;base64,A".into()), 2);
+        s.add_sent_image(png(52), Some("data:image/jpeg;base64,A".into()), 2);
         assert_eq!(s.take_trash(), vec![png(2), png(1)]);
     }
 

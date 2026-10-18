@@ -198,6 +198,7 @@ pub struct Watcher<B, H> {
     /// último detalle de lectura registrado, para no repetirlo en cada sondeo
     last_read_error: Option<String>,
     last_image_error: Option<String>,
+    last_store_error: Option<String>,
 }
 
 impl<B: Backend, H: Host> Watcher<B, H> {
@@ -212,6 +213,7 @@ impl<B: Backend, H: Host> Watcher<B, H> {
             last_hash: None,
             last_read_error: None,
             last_image_error: None,
+            last_store_error: None,
         }
     }
 
@@ -360,7 +362,13 @@ impl<B: Backend, H: Host> Watcher<B, H> {
                 None
             }
             Err(e) => {
-                log(&e);
+                if self.last_store_error.as_deref() != Some(e.as_str()) {
+                    log(&e);
+                    self.last_store_error = Some(e);
+                }
+                // sin PNG no se ofrece; se olvida para reintentarlo en el siguiente sondeo
+                self.last_fp = None;
+                self.last_hash = None;
                 self.host.set_local_image(None);
                 None
             }
@@ -408,8 +416,9 @@ impl<B: Backend, H: Host> Watcher<B, H> {
     }
 
     /// Pone la imagen y la lee de vuelta: lo leído es lo que se anota y se reenvía, por si el
-    /// portapapeles la recodifica.
-    fn put_image(&mut self, path: &Path) -> Result<(Pixels, String), String> {
+    /// portapapeles la recodifica. `Ok(None)` si se puso pero no se pudo leer de vuelta (tras
+    /// un reintento): entonces no se anota nada y el siguiente sondeo la trata como una copia.
+    fn put_image(&mut self, path: &Path) -> Result<Option<(Pixels, String)>, String> {
         let (w, h, rgba) = decode_limited(path)?;
         self.cb
             .set_image(ImageData {
@@ -418,20 +427,30 @@ impl<B: Backend, H: Host> Watcher<B, H> {
                 bytes: rgba.as_slice().into(),
             })
             .map_err(|e| format!("no se pudo poner la imagen: {e}"))?;
-        let px = match self.cb.get_image() {
+        drop(rgba);
+        let px = match self.cb.get_image().or_else(|_| self.cb.get_image()) {
             Ok(img) => Pixels::from(img),
             Err(e) => {
                 log(&format!("no se pudo leer de vuelta la imagen: {e}"));
-                Pixels { w, h, rgba }
+                // el hash de lo decodificado no vale: el portapapeles puede haberla recodificado
+                self.last_fp = None;
+                self.last_hash = None;
+                self.last_text = None;
+                return Ok(None);
             }
         };
         let hash = self.remember(&px);
-        Ok((px, hash))
+        Ok(Some((px, hash)))
     }
 
     pub fn write_received_image(&mut self, session_id: u64, location: String) {
         let (px, hash) = match self.put_image(Path::new(&location)) {
-            Ok(r) => r,
+            Ok(Some(r)) => r,
+            // está en el portapapeles, pero sin hash leído no se marca: queda como archivo
+            Ok(None) => {
+                self.host.on_image_receive_failed(location);
+                return;
+            }
             Err(e) => {
                 log(&e);
                 self.host.show_notice(IMAGE_WRITE_ERROR);
@@ -447,10 +466,14 @@ impl<B: Backend, H: Host> Watcher<B, H> {
 
     /// Imagen del historial: se pone sin difundirla, como `copy_text`.
     pub fn copy_image(&mut self, png: &Path) -> Result<(), String> {
-        let (px, hash) = self.put_image(png).map_err(|e| {
+        let Some((px, hash)) = self.put_image(png).map_err(|e| {
             log(&e);
             IMAGE_WRITE_ERROR.to_string()
-        })?;
+        })?
+        else {
+            self.host.set_local_image(None);
+            return Ok(());
+        };
         let local = match self.store_png(&px, &hash) {
             Ok((path, size)) if size <= self.max_image_bytes => Some(LocalImage {
                 hash,
