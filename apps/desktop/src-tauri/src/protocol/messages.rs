@@ -4,13 +4,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES};
+use super::{CLIP_IMAGE_MIMES, FILE_CHUNK_BYTES, MAX_CONTROL_BYTES, MAX_PAYLOAD_BYTES, PURPOSE_CLIPBOARD};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum ControlMessage {
     Clip { id: String, text: String, hash: String },
-    FileStart { transfer_id: String, name: String, size: u64, mime: String },
+    FileStart {
+        transfer_id: String,
+        name: String,
+        size: u64,
+        mime: String,
+        /// Solo `Some("clipboard")`; cualquier otro valor del cable se descarta al decodificar.
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        purpose: Option<String>,
+    },
     FileAck { transfer_id: String, received: u64 },
     FileEnd { transfer_id: String, sha256: String },
     FileResult {
@@ -151,12 +159,23 @@ fn validate_control(value: &Value) -> Result<ControlMessage, ProtocolError> {
             text: str_field(o, "text")?,
             hash: hash_field(o, "hash")?,
         }),
-        "file_start" => Ok(ControlMessage::FileStart {
-            transfer_id: transfer_id_field(o)?,
-            name: str_field(o, "name")?,
-            size: uint_field(o, "size")?,
-            mime: str_field(o, "mime")?,
-        }),
+        "file_start" => {
+            let transfer_id = transfer_id_field(o)?;
+            let name = str_field(o, "name")?;
+            let size = uint_field(o, "size")?;
+            let mime = str_field(o, "mime")?;
+            // un purpose desconocido (o que no es texto) se ignora: es un archivo normal
+            let purpose = match o.get("purpose") {
+                Some(Value::String(p)) if p == PURPOSE_CLIPBOARD => {
+                    if !CLIP_IMAGE_MIMES.contains(&mime.as_str()) {
+                        return fail(format!("'mime' no admitido para el portapapeles ({mime})"));
+                    }
+                    Some(PURPOSE_CLIPBOARD.to_owned())
+                }
+                _ => None,
+            };
+            Ok(ControlMessage::FileStart { transfer_id, name, size, mime, purpose })
+        }
         "file_ack" => Ok(ControlMessage::FileAck {
             transfer_id: transfer_id_field(o)?,
             received: uint_field(o, "received")?,
@@ -313,7 +332,9 @@ fn parse_control(json: &[u8]) -> Result<ControlMessage, ProtocolError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{MAX_CLIP_BYTES, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION};
+    use crate::protocol::{
+        MAX_CLIP_BYTES, MAX_CLIP_IMAGE_BYTES, MAX_FRAME_BYTES, MAX_PAYLOAD_BYTES, PROTOCOL_VERSION,
+    };
     use sha2::{Digest, Sha256};
     const TID: &str = "00112233445566778899aabbccddeeff";
     const HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
@@ -386,7 +407,14 @@ mod tests {
     fn ida_y_vuelta_de_cada_variante() {
         let messages = vec![
             clip("hola 😀"),
-            ControlMessage::FileStart { transfer_id: TID.into(), name: "a.txt".into(), size: 0, mime: "text/plain".into() },
+            ControlMessage::FileStart { transfer_id: TID.into(), name: "a.txt".into(), size: 0, mime: "text/plain".into(), purpose: None },
+            ControlMessage::FileStart {
+                transfer_id: TID.into(),
+                name: "captura.png".into(),
+                size: 1234,
+                mime: "image/png".into(),
+                purpose: Some(PURPOSE_CLIPBOARD.into()),
+            },
             ControlMessage::FileAck { transfer_id: TID.into(), received: 1_048_576 },
             ControlMessage::FileEnd { transfer_id: TID.into(), sha256: HASH.into() },
             ControlMessage::FileResult { transfer_id: TID.into(), ok: true, error: None },
@@ -401,6 +429,98 @@ mod tests {
             assert_eq!(frames[0][0], 0x01);
             assert_eq!(decode_all(&frames).unwrap(), vec![Decoded::Control(msg)]);
         }
+    }
+
+    fn file_start_json(extra: &str, mime: &str) -> Vec<u8> {
+        let mut f = vec![0x01];
+        f.extend_from_slice(
+            format!(r#"{{"kind":"file_start","transferId":"{TID}","name":"a","size":3,"mime":"{mime}"{extra}}}"#)
+                .as_bytes(),
+        );
+        f
+    }
+
+    fn decode_one(frame: &[u8]) -> Result<Option<Decoded>, ProtocolError> {
+        MessageDecoder::default().push(frame)
+    }
+
+    #[test]
+    fn file_start_sin_purpose_no_lleva_la_clave_y_con_purpose_va_al_final() {
+        let sin = ControlMessage::FileStart {
+            transfer_id: TID.into(),
+            name: "a".into(),
+            size: 3,
+            mime: "text/plain".into(),
+            purpose: None,
+        };
+        let json = String::from_utf8(encode_control(&sin).unwrap()[0][1..].to_vec()).unwrap();
+        assert_eq!(
+            json,
+            format!(r#"{{"kind":"file_start","transferId":"{TID}","name":"a","size":3,"mime":"text/plain"}}"#)
+        );
+        let con = ControlMessage::FileStart {
+            transfer_id: TID.into(),
+            name: "a".into(),
+            size: 3,
+            mime: "image/png".into(),
+            purpose: Some(PURPOSE_CLIPBOARD.into()),
+        };
+        let json = String::from_utf8(encode_control(&con).unwrap()[0][1..].to_vec()).unwrap();
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"kind":"file_start","transferId":"{TID}","name":"a","size":3,"mime":"image/png","purpose":"clipboard"}}"#
+            )
+        );
+    }
+
+    #[test]
+    fn purpose_desconocido_nulo_o_numerico_se_ignora_sin_error() {
+        for extra in [r#","purpose":"otro""#, r#","purpose":null"#, r#","purpose":7"#, r#","purpose":["clipboard"]"#] {
+            // incluso con un mime que no sería de imagen
+            let got = decode_one(&file_start_json(extra, "text/plain")).unwrap().unwrap();
+            let Decoded::Control(ControlMessage::FileStart { purpose, mime, .. }) = got else {
+                panic!("{extra}: no es file_start")
+            };
+            assert_eq!((purpose, mime.as_str()), (None, "text/plain"), "{extra}");
+        }
+    }
+
+    #[test]
+    fn purpose_clipboard_admite_solo_los_tres_mimes_exactos() {
+        for mime in ["image/png", "image/jpeg", "image/webp"] {
+            let got = decode_one(&file_start_json(r#","purpose":"clipboard""#, mime)).unwrap().unwrap();
+            let Decoded::Control(ControlMessage::FileStart { purpose, .. }) = got else { panic!() };
+            assert_eq!(purpose.as_deref(), Some("clipboard"), "{mime}");
+        }
+        for mime in ["text/plain", "IMAGE/PNG", "image/png; charset=utf-8", "image/gif", "image/png ", ""] {
+            assert!(
+                matches!(
+                    decode_one(&file_start_json(r#","purpose":"clipboard""#, mime)),
+                    Err(ProtocolError::Invalid(_))
+                ),
+                "{mime:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn la_regla_del_mime_no_mira_el_tamano() {
+        let mut f = vec![0x01];
+        f.extend_from_slice(
+            format!(
+                r#"{{"kind":"file_start","transferId":"{TID}","name":"a","size":99999999999,"mime":"image/png","purpose":"clipboard"}}"#
+            )
+            .as_bytes(),
+        );
+        assert!(matches!(decode_one(&f), Ok(Some(Decoded::Control(ControlMessage::FileStart { .. })))));
+    }
+
+    #[test]
+    fn constantes_de_imagen_coinciden_con_ts() {
+        assert_eq!(MAX_CLIP_IMAGE_BYTES, 20 * 1024 * 1024);
+        assert_eq!(CLIP_IMAGE_MIMES, ["image/png", "image/jpeg", "image/webp"]);
+        assert_eq!(PURPOSE_CLIPBOARD, "clipboard");
     }
 
     #[test]

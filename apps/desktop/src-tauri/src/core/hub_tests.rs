@@ -755,6 +755,7 @@ async fn enviar_archivo<W: AsyncWrite + Unpin>(
         name: name.into(),
         size: data.len() as u64,
         mime: "application/octet-stream".into(),
+        purpose: None,
     })
     .await;
     for chunk in data.chunks(FILE_CHUNK_BYTES) {
@@ -834,6 +835,7 @@ async fn archivo_entrante_vacio_y_multiplo_exacto_de_48k() {
             name: format!("f{i}.bin"),
             size: n as u64,
             mime: "x/y".into(),
+            purpose: None,
         })
         .await;
         for chunk in data.chunks(FILE_CHUNK_BYTES) {
@@ -924,6 +926,7 @@ async fn corte_a_mitad_borra_part_y_emite_failed() {
         name: "x.bin".into(),
         size: n,
         mime: "x/y".into(),
+        purpose: None,
     })
     .await;
     let data = datos(22 * FILE_CHUNK_BYTES);
@@ -1077,6 +1080,7 @@ async fn si_cae_antes_de_file_result_se_borra_el_archivo_guardado() {
         name: "a.txt".into(),
         size: 1000,
         mime: "x/y".into(),
+        purpose: None,
     })
     .await;
     c.send_data(TID, &data).await;
@@ -1117,6 +1121,7 @@ async fn datos_rezagados_tras_cancelar_se_descartan() {
         name: "a.txt".into(),
         size: 10,
         mime: "x/y".into(),
+        purpose: None,
     })
     .await;
     assert_eq!(
@@ -1228,7 +1233,8 @@ async fn archivo_saliente_respeta_ventana_de_2_mib() {
             transfer_id: id.clone(),
             name: "grande.bin".into(),
             size: n,
-            mime: "application/octet-stream".into()
+            mime: "application/octet-stream".into(),
+            purpose: None,
         }
     );
 
@@ -2027,6 +2033,7 @@ async fn trama_alterada_a_mitad_de_archivo_cierra_y_borra_el_parcial() {
         name: "x.bin".into(),
         size: n,
         mime: "x/y".into(),
+        purpose: None,
     })
     .await;
     let data = datos(22 * FILE_CHUNK_BYTES);
