@@ -5,8 +5,12 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use base64::Engine;
+use image::codecs::jpeg::JpegEncoder;
 use image::codecs::png::{CompressionType, FilterType, PngEncoder};
-use image::{ExtendedColorType, ImageBuffer, ImageEncoder, ImageError, ImageReader, Limits, Rgba};
+use image::{
+    DynamicImage, ExtendedColorType, ImageBuffer, ImageDecoder, ImageEncoder, ImageError,
+    ImageReader, Limits, Rgb, RgbImage, Rgba,
+};
 use sha2::{Digest, Sha256};
 
 /// Límites de decodificación (bomba de descompresión).
@@ -14,6 +18,8 @@ pub const MAX_DECODE_SIDE: u32 = 16_384;
 pub const MAX_DECODE_ALLOC: u64 = 512 * 1024 * 1024;
 /// Lado máximo de las miniaturas del historial.
 pub const THUMBNAIL_SIDE: u32 = 160;
+/// Calidad JPEG de las miniaturas (~10 KB cada una).
+const THUMBNAIL_QUALITY: u8 = 75;
 /// Para la huella se muestrea una fila de cada tantas.
 const FINGERPRINT_ROW_STEP: usize = 64;
 
@@ -70,8 +76,16 @@ pub fn encode_png(w: usize, h: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Decodifica PNG, JPEG o WebP a RGBA con los límites de lado y memoria; la cabecera se
-/// comprueba antes de reservar el búfer.
+fn limit_error(e: ImageError) -> String {
+    match e {
+        ImageError::Limits(e) => format!("imagen fuera de los límites: {e}"),
+        e => format!("no se pudo decodificar la imagen: {e}"),
+    }
+}
+
+/// Decodifica PNG, JPEG o WebP a RGBA con los límites de lado y memoria. La cabecera se
+/// comprueba antes de reservar nada, y la memoria se cuenta en RGBA (lo que se devuelve), no en
+/// el formato original: un gris de 16384² ocupa 256 MiB, pero 1 GiB al pasarlo a RGBA.
 pub fn decode_limited(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
     let mut reader = ImageReader::open(path)
         .and_then(|r| r.with_guessed_format())
@@ -81,10 +95,15 @@ pub fn decode_limited(path: &Path) -> Result<(usize, usize, Vec<u8>), String> {
     limits.max_image_height = Some(MAX_DECODE_SIDE);
     limits.max_alloc = Some(MAX_DECODE_ALLOC);
     reader.limits(limits);
-    let img = reader.decode().map_err(|e| match e {
-        ImageError::Limits(e) => format!("imagen fuera de los límites: {e}"),
-        e => format!("no se pudo decodificar la imagen: {e}"),
-    })?;
+    let decoder = reader.into_decoder().map_err(limit_error)?;
+    let (w, h) = decoder.dimensions();
+    let rgba_bytes = u64::from(w) * u64::from(h) * 4;
+    if rgba_bytes > MAX_DECODE_ALLOC || decoder.total_bytes() > MAX_DECODE_ALLOC {
+        return Err(format!(
+            "imagen fuera de los límites: {w} × {h} necesita {rgba_bytes} bytes en RGBA"
+        ));
+    }
+    let img = DynamicImage::from_decoder(decoder).map_err(limit_error)?;
     let rgba = img.into_rgba8();
     let (w, h) = (rgba.width() as usize, rgba.height() as usize);
     Ok((w, h, rgba.into_raw()))
@@ -103,7 +122,8 @@ fn thumbnail_size(w: u32, h: u32) -> (u32, u32) {
     (scale(w), scale(h))
 }
 
-/// Miniatura PNG en data URL (`data:image/png;base64,…`).
+/// Miniatura JPEG en data URL (`data:image/jpeg;base64,…`); la transparencia se compone
+/// sobre blanco.
 pub fn thumbnail_data_url(w: usize, h: usize, rgba: &[u8]) -> Result<String, String> {
     check_len(w, h, rgba)?;
     let (w, h) = (dim(w), dim(h));
@@ -111,10 +131,19 @@ pub fn thumbnail_data_url(w: usize, h: usize, rgba: &[u8]) -> Result<String, Str
         .ok_or_else(|| "búfer de la miniatura no válido".to_string())?;
     let (tw, th) = thumbnail_size(w, h);
     let thumb = image::imageops::thumbnail(&src, tw, th);
-    let png = encode_png(tw as usize, th as usize, thumb.as_raw())?;
+    let rgb = RgbImage::from_fn(tw, th, |x, y| {
+        let Rgba([r, g, b, a]) = *thumb.get_pixel(x, y);
+        let over_white =
+            |c: u8| ((u32::from(c) * u32::from(a) + 255 * (255 - u32::from(a))) / 255) as u8;
+        Rgb([over_white(r), over_white(g), over_white(b)])
+    });
+    let mut jpg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpg, THUMBNAIL_QUALITY)
+        .write_image(rgb.as_raw(), tw, th, ExtendedColorType::Rgb8)
+        .map_err(|e| format!("no se pudo codificar la miniatura: {e}"))?;
     Ok(format!(
-        "data:image/png;base64,{}",
-        base64::engine::general_purpose::STANDARD.encode(png)
+        "data:image/jpeg;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(jpg)
     ))
 }
 
@@ -263,11 +292,16 @@ mod tests {
 
     /// PNG válido de cabecera que declara `w × h` RGBA con un IDAT minúsculo.
     fn png_que_declara(w: u32, h: u32) -> Vec<u8> {
+        png_que_declara_con(w, h, 6)
+    }
+
+    /// Ídem con otro tipo de color (0 = gris de 8 bits, 6 = RGBA).
+    fn png_que_declara_con(w: u32, h: u32, color: u8) -> Vec<u8> {
         let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
         let mut ihdr = Vec::new();
         ihdr.extend_from_slice(&w.to_be_bytes());
         ihdr.extend_from_slice(&h.to_be_bytes());
-        ihdr.extend_from_slice(&[8, 6, 0, 0, 0]);
+        ihdr.extend_from_slice(&[8, color, 0, 0, 0]);
         chunk(&mut out, b"IHDR", &ihdr);
         // zlib vacío
         chunk(
@@ -313,13 +347,68 @@ mod tests {
         assert!(err.contains("límite"), "{err}");
     }
 
+    #[test]
+    fn decode_limited_cuenta_la_memoria_en_rgba_y_no_en_el_formato_original() {
+        // gris de 8 bits: 256 MiB en su formato (pasa `max_alloc`), pero 1 GiB en RGBA
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gris.png");
+        std::fs::write(&path, png_que_declara_con(16_384, 16_384, 0)).unwrap();
+        let t = std::time::Instant::now();
+        let err = decode_limited(&path).unwrap_err();
+        assert!(err.contains("límite"), "{err}");
+        // se rechaza por la cabecera, sin reservar los 256 MiB del gris
+        assert!(t.elapsed() < std::time::Duration::from_millis(200));
+    }
+
+    #[test]
+    fn decode_limited_admite_justo_512_mib_en_rgba() {
+        // 16384 × 8192 × 4 = 512 MiB: en el límite, no fuera (falla después, por el IDAT vacío)
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("justo.png");
+        std::fs::write(&path, png_que_declara_con(16_384, 8_192, 0)).unwrap();
+        let err = decode_limited(&path).unwrap_err();
+        assert!(!err.contains("límite"), "{err}");
+    }
+
     fn decodifica_data_url(url: &str) -> (u32, u32) {
-        let b64 = url.strip_prefix("data:image/png;base64,").unwrap();
-        let png = base64::engine::general_purpose::STANDARD
+        let b64 = url.strip_prefix("data:image/jpeg;base64,").unwrap();
+        let jpg = base64::engine::general_purpose::STANDARD
             .decode(b64)
             .unwrap();
-        let img = image::load_from_memory_with_format(&png, image::ImageFormat::Png).unwrap();
+        let img = image::load_from_memory_with_format(&jpg, image::ImageFormat::Jpeg).unwrap();
         (img.width(), img.height())
+    }
+
+    #[test]
+    fn miniatura_jpeg_de_unos_10_kb() {
+        // patrón con detalle: el peor caso razonable para una miniatura de 160 px
+        let (w, h) = (1600, 900);
+        let mut rgba = imagen(w, h);
+        let mut seed = 0x1234_5678u32;
+        for b in rgba.iter_mut() {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            *b ^= (seed >> 28) as u8;
+        }
+        let url = thumbnail_data_url(w, h, &rgba).unwrap();
+        assert!(url.starts_with("data:image/jpeg;base64,"));
+        assert!(url.len() < 16 * 1024, "{} bytes", url.len());
+    }
+
+    #[test]
+    fn miniatura_de_una_imagen_transparente() {
+        // JPEG no tiene alfa: se compone sobre blanco
+        let rgba = vec![0u8; 10 * 10 * 4];
+        let url = thumbnail_data_url(10, 10, &rgba).unwrap();
+        let b64 = url.strip_prefix("data:image/jpeg;base64,").unwrap();
+        let jpg = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let img = image::load_from_memory_with_format(&jpg, image::ImageFormat::Jpeg)
+            .unwrap()
+            .to_rgb8();
+        assert!(img.pixels().all(|p| p.0.iter().all(|&c| c > 240)));
     }
 
     #[test]

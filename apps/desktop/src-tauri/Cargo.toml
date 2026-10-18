@@ -51,6 +51,23 @@ opt-level = 3
 panic = "abort"
 strip = true
 
+# `tauri dev`: el sondeo decodifica el PNG de la imagen del portapapeles cada segundo; sin
+# optimizar estas dependencias costaría mucha CPU en debug
+[profile.dev.package.image]
+opt-level = 3
+[profile.dev.package.png]
+opt-level = 3
+[profile.dev.package.fdeflate]
+opt-level = 3
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+[profile.dev.package.crc32fast]
+opt-level = 3
+[profile.dev.package.zune-jpeg]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["full", "test-util"] }
 bytes = "1.12.1"

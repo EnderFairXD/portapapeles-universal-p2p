@@ -14,6 +14,9 @@ struct FakeClipboard {
     /// el portapapeles altera un píxel al guardar (como si recodificara)
     recode: bool,
     fail_set_image: bool,
+    /// lecturas de imagen que fallan justo después de escribir una
+    fail_readbacks: u32,
+    fail_readbacks_after_set: u32,
     get_image_calls: usize,
 }
 
@@ -28,6 +31,12 @@ impl Backend for FakeClipboard {
     }
     fn get_image(&mut self) -> Result<ImageData<'static>, arboard::Error> {
         self.get_image_calls += 1;
+        if self.fail_readbacks > 0 {
+            self.fail_readbacks -= 1;
+            return Err(arboard::Error::Unknown {
+                description: "lectura fallida".into(),
+            });
+        }
         match &self.image {
             Some((w, h, rgba)) => Ok(ImageData {
                 width: *w,
@@ -41,6 +50,7 @@ impl Backend for FakeClipboard {
         if self.fail_set_image {
             return Err(arboard::Error::ConversionFailure);
         }
+        self.fail_readbacks = self.fail_readbacks_after_set;
         let mut bytes = img.bytes.into_owned();
         if self.recode {
             bytes[0] ^= 1;
@@ -511,4 +521,63 @@ fn la_poda_borra_los_png_sin_uso_y_conserva_los_que_siguen_en_uso() {
     // sin nada en la papelera no hace nada
     b.w.prune();
     assert!(b.host.calls().is_empty());
+}
+
+#[test]
+fn si_falla_la_lectura_de_vuelta_se_reintenta_una_vez() {
+    let mut b = banco(FakeClipboard {
+        recode: true,
+        fail_readbacks_after_set: 1,
+        ..Default::default()
+    });
+    b.w.start();
+    let location = guarda_recibida(&b, "a.png", &imagen(6, 6, 13));
+    b.w.write_received_image(2, location);
+    let (w, h, puesta) = b.w.cb.image.clone().unwrap();
+    let leido = pixel_hash(w, h, &puesta);
+    let calls = b.host.calls();
+    assert!(
+        matches!(&calls[..], [Call::Received { hash, .. }] if *hash == leido),
+        "{calls:?}"
+    );
+    b.w.tick(true, true);
+    assert!(b.host.calls().is_empty());
+}
+
+#[test]
+fn si_la_lectura_de_vuelta_falla_dos_veces_no_se_marca_con_el_hash_decodificado() {
+    let mut b = banco(FakeClipboard {
+        recode: true,
+        fail_readbacks_after_set: 2,
+        ..Default::default()
+    });
+    b.w.start();
+    let location = guarda_recibida(&b, "a.png", &imagen(6, 6, 14));
+    b.w.write_received_image(2, location.clone());
+    // sin `on_image_received` (no hay `mark_image_synced`); el archivo queda en el historial
+    assert_eq!(b.host.calls(), vec![Call::ReceiveFailed(location)]);
+    // el siguiente sondeo la trata como lo que hay en el portapapeles
+    b.w.tick(false, true);
+    let (w, h, puesta) = b.w.cb.image.clone().unwrap();
+    let calls = b.host.calls();
+    assert!(
+        matches!(&calls[..], [Call::Sent(img, true)] if img.hash == pixel_hash(w, h, &puesta)),
+        "{calls:?}"
+    );
+}
+
+#[test]
+fn si_no_se_puede_guardar_el_png_se_reintenta_en_el_siguiente_sondeo() {
+    let mut b = banco(FakeClipboard::default());
+    b.w.start();
+    // la caché deja de ser escribible: en su sitio hay un archivo
+    std::fs::remove_dir_all(&b.images).unwrap();
+    std::fs::write(&b.images, b"no soy una carpeta").unwrap();
+    b.w.cb.image = Some(imagen(5, 5, 15));
+    b.w.tick(false, true);
+    assert_eq!(b.host.calls(), vec![Call::LocalImage(None)]);
+    std::fs::remove_file(&b.images).unwrap();
+    std::fs::create_dir(&b.images).unwrap();
+    b.w.tick(false, true);
+    assert!(matches!(b.host.calls()[..], [Call::Sent(_, true)]));
 }
