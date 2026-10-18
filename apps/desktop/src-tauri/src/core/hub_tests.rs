@@ -2807,3 +2807,242 @@ async fn una_imagen_ya_sincronizada_descarta_la_que_esperaba_en_cola() {
     assert!(c.sync().await.is_empty(), "ni C ni Y");
     s.no_events();
 }
+
+// --- ronda de correcciones 1 (fase 2b): imágenes en cola ya superadas ---
+
+#[tokio::test]
+async fn imagen_entrante_descarta_la_imagen_en_cola_hacia_ese_movil() {
+    // X en vuelo, Y en cola, y el móvil manda Z: Y nunca sale y la sincronía queda en Z
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let x = imagen(src.path(), "x.png", &datos(3000));
+    let y = imagen(src.path(), "y.png", &datos(4000));
+    s.copy_image(&x).unwrap();
+    let (idx, _, _) = recibir_imagen(&mut c).await;
+    s.copy_image(&y).unwrap();
+    let mut ev = Vec::new();
+    for _ in 0..3 {
+        ev.push(s.event().await);
+    }
+    let idy = ev[2]["transferId"].as_str().unwrap().to_string();
+    assert_eq!(ev[2], img_transfer(&idy, "out", "y.png", 4000, 0, "queued"));
+
+    let z = datos(5000);
+    let msgs = enviar_con(
+        &mut c,
+        file_start(TID, "z.png", 5000, Some("clipboard")),
+        &z,
+        &sha(&z),
+    )
+    .await;
+    assert!(matches!(
+        msgs.last(),
+        Some(ControlMessage::FileResult { ok: true, .. })
+    ));
+    let loc = json!(s.image_dir().join("z.png").to_string_lossy());
+    assert_eq!(
+        s.event().await,
+        img_transfer(TID, "in", "z.png", 5000, 0, "active")
+    );
+    assert_eq!(
+        s.event().await,
+        with(
+            img_transfer(TID, "in", "z.png", 5000, 5000, "done"),
+            "location",
+            loc.clone()
+        )
+    );
+    assert_eq!(
+        s.event().await,
+        img_transfer(&idy, "out", "y.png", 4000, 0, "cancelled")
+    );
+    assert_eq!(
+        s.event().await,
+        json!({"type": "clipImageReceived", "sessionId": 1, "location": loc})
+    );
+    // la app escribe Z y lee de vuelta su hash del lado del PC
+    let hz = "hash-de-z-en-el-pc";
+    s.hub.mark_image_synced(1, hz);
+    // X termina; después no sale nada (ni Y)
+    resultado(&mut c, &idx, true).await;
+    assert_eq!(
+        s.event().await,
+        img_transfer(&idx, "out", "x.png", 3000, 3000, "done")
+    );
+    assert!(c.sync().await.is_empty(), "Y no debe salir");
+    // la sincronía quedó en Z: no se reenvía
+    let zimg = LocalImage {
+        hash: hz.into(),
+        png_path: archivo_local(src.path(), "z-pc.png", &z),
+    };
+    s.copy_image(&zimg).unwrap();
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
+    // y Y no quedó marcada como enviada: si se vuelve a copiar, sale
+    s.copy_image(&y).unwrap();
+    imagen_completa(&mut s, &mut c, true).await;
+    s.no_events();
+}
+
+#[tokio::test]
+async fn reofrecer_una_imagen_en_cola_tras_moverse_el_hash_la_vuelve_a_marcar() {
+    let mut s = setup(None);
+    let mut c = conectado(&mut s, "m1").await;
+    let src = tempfile::tempdir().unwrap();
+    let x = imagen(src.path(), "x.png", &datos(3000));
+    let y = imagen(src.path(), "y.png", &datos(4000));
+    s.copy_image(&x).unwrap();
+    let (idx, _, _) = recibir_imagen(&mut c).await;
+    s.copy_image(&y).unwrap();
+    for _ in 0..3 {
+        s.event().await;
+    }
+    // la sincronía se mueve a otra imagen mientras Y espera, y luego se vuelve a copiar Y
+    s.hub.mark_image_synced(1, "otra");
+    s.copy_image(&y).unwrap();
+    resultado(&mut c, &idx, true).await;
+    assert_eq!(s.event().await["state"], "done");
+    // Y sale una vez y queda confirmada: no se repite
+    imagen_completa(&mut s, &mut c, true).await;
+    s.copy_image(&y).unwrap();
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut c]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
+    s.no_events();
+}
+
+/// Enlace cuya escritura se puede retener y soltar desde el test; avisa cuando queda retenida.
+struct Retenible {
+    inner: DuplexStream,
+    estado: Arc<Mutex<(bool, Option<std::task::Waker>)>>,
+    retenida: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Clone)]
+struct Freno {
+    estado: Arc<Mutex<(bool, Option<std::task::Waker>)>>,
+    retenida: Arc<tokio::sync::Notify>,
+}
+
+impl Freno {
+    fn retener(&self) {
+        self.estado.lock().unwrap().0 = true;
+    }
+
+    fn soltar(&self) {
+        let mut e = self.estado.lock().unwrap();
+        e.0 = false;
+        if let Some(w) = e.1.take() {
+            w.wake();
+        }
+    }
+}
+
+fn retenible(inner: DuplexStream) -> (Retenible, Freno) {
+    let f = Freno {
+        estado: Arc::new(Mutex::new((false, None))),
+        retenida: Arc::new(tokio::sync::Notify::new()),
+    };
+    let r = Retenible {
+        inner,
+        estado: f.estado.clone(),
+        retenida: f.retenida.clone(),
+    };
+    (r, f)
+}
+
+impl AsyncRead for Retenible {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for Retenible {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        {
+            let mut e = self.estado.lock().unwrap();
+            if e.0 {
+                e.1 = Some(cx.waker().clone());
+                self.retenida.notify_one();
+                return Poll::Pending;
+            }
+        }
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+#[tokio::test]
+async fn sesion_reemplazada_no_deshace_la_marca_de_imagen_de_la_nueva() {
+    let mut s = setup(None);
+    let src = tempfile::tempdir().unwrap();
+    let x = imagen(src.path(), "x.png", &datos(3000));
+    *s.local_img.lock().unwrap() = Some(x.clone());
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    let (b, freno) = retenible(b);
+    s.hub.accept_stream(b, Transport::Wifi);
+    let mut viejo = over(a);
+    viejo.hello("m1", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(1, "m1", "wifi"));
+    // X queda en vuelo en la vieja (sin file_result)
+    let (idv, _, _) = recibir_imagen(&mut viejo).await;
+    // la vieja se queda escribiendo el pong: no verá su Close hasta soltarla
+    freno.retener();
+    viejo.send(ControlMessage::Ping).await;
+    freno.retenida.notified().await;
+
+    // la nueva restablece la sincronía y marca X en su envío de inicio
+    let mut nuevo = connect(&s.hub);
+    nuevo.hello("m1", Some(false)).await;
+    let (idn, _, _) = recibir_imagen(&mut nuevo).await;
+    // ahora la vieja ve el Close("replaced") con X en vuelo
+    freno.soltar();
+    let mut ev = Vec::new();
+    loop {
+        let e = s.event().await;
+        let fin = e["type"] == "peerDisconnected";
+        ev.push(e);
+        if fin {
+            break;
+        }
+    }
+    assert_eq!(
+        ev.last().unwrap(),
+        &json!({"type": "peerDisconnected", "sessionId": 1, "reason": "replaced"})
+    );
+    assert!(
+        ev.contains(&with(
+            img_transfer(&idv, "out", "x.png", 3000, 0, "failed"),
+            "error",
+            json!("replaced")
+        )),
+        "{ev:?}"
+    );
+    resultado(&mut nuevo, &idn, true).await;
+    let fin = s.transfers_until_end(&[&idn]).await;
+    assert_eq!(fin[&idn].last().unwrap()["state"], "done");
+    // X quedó confirmada en la nueva: no se repite
+    s.copy_image(&x).unwrap();
+    assert_eq!(
+        clips_antes_de_fin(&s.hub, &mut [&mut nuevo]).await,
+        Vec::<Vec<String>>::from([vec![]])
+    );
+    s.no_events();
+}

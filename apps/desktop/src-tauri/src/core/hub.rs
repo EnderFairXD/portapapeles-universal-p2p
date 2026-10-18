@@ -271,7 +271,7 @@ impl SessionHost for Inner {
                 // un móvil con la misma clave que ya tenía sesión: la vieja se cierra
                 for (id, e) in &st.sessions {
                     if *id != session_id && e.peer.as_ref().is_some_and(|(d, _)| *d == device_id) {
-                        let _ = e.commands.send(Command::Close("replaced".into()));
+                        let _ = e.commands.send(Command::Close(session::REPLACED.into()));
                     }
                 }
             }
