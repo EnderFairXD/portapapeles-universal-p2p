@@ -224,6 +224,33 @@ describe("transferencias", () => {
   });
 });
 
+describe("transferencias de imágenes del portapapeles", () => {
+  it("una imagen sustituida (clipboard + cancelled) no sale, y la sección se oculta si era la única", () => {
+    render(root, state({ transfers: [transfer({ purpose: "clipboard", state: "cancelled" })] }));
+    expect(qa(".transfer")).toHaveLength(0);
+    expect(q(".transfers")!.hidden).toBe(true);
+  });
+
+  it("si la fila ya estaba pintada y pasa a cancelled se retira", () => {
+    render(root, state({ transfers: [transfer({ purpose: "clipboard", state: "active" })] }));
+    expect(qa(".transfer")).toHaveLength(1);
+    render(root, state({ transfers: [transfer({ purpose: "clipboard", state: "cancelled" })] }));
+    expect(qa(".transfer")).toHaveLength(0);
+  });
+
+  it("las clipboard fallidas, en curso o en cola siguen visibles", () => {
+    const t = (n: string, st: Transfer["state"]) => transfer({ transferId: n.repeat(32), purpose: "clipboard", state: st });
+    render(root, state({ transfers: [t("1", "failed"), t("2", "active"), t("3", "queued")] }));
+    expect(qa(".transfer")).toHaveLength(3);
+    expect(q(".transfers")!.hidden).toBe(false);
+  });
+
+  it("un archivo normal cancelado sigue saliendo como «Cancelado»", () => {
+    render(root, state({ transfers: [transfer({ purpose: null, state: "cancelled" }), transfer({ transferId: "b".repeat(32), state: "cancelled" })] }));
+    expect(qa(".transfer")).toHaveLength(2);
+  });
+});
+
 describe("formatProgress", () => {
   it("usa coma decimal y múltiplos de 1024", () => {
     expect(formatProgress(2_621_440, 5_242_880)).toBe("2,5 MB de 5,0 MB");
@@ -330,8 +357,9 @@ describe("historial", () => {
       render(root, state({ history: [image()] }));
       const img = q<HTMLImageElement>(".hist-item img.hist-thumb")!;
       expect(img.getAttribute("src")).toBe(JPEG);
-      expect(img.alt).toBe("Imagen copiada");
+      expect(img.alt).toBe("Miniatura de la imagen");
       const boton = img.closest("button")!;
+      expect(boton.getAttribute("aria-label")).toBe("Copiar imagen al portapapeles");
       expect(boton.dataset.action).toBe("copy-image");
       expect(boton.dataset.historyId).toBe("1");
     });
@@ -351,6 +379,7 @@ describe("historial", () => {
         expect(q(".hist-item img"), thumbnail).toBeNull();
         expect(q(".hist-thumb-placeholder"), thumbnail).not.toBeNull();
         expect(q('button[data-action="copy-image"]'), thumbnail).not.toBeNull();
+        expect(q('button[data-action="copy-image"]')!.getAttribute("aria-label"), thumbnail).toBe("Copiar imagen al portapapeles");
       });
     });
 
@@ -359,6 +388,15 @@ describe("historial", () => {
       expect(q(".hist-item img")).toBeNull();
       expect(q(".hist-thumb-placeholder")!.textContent).toBe("Imagen");
       expect(q('button[data-action="copy-image"]')).not.toBeNull();
+    });
+
+    it("una miniatura con el prefijo correcto pero datos rotos pasa al marcador al fallar la carga", () => {
+      render(root, state({ history: [image()] }));
+      const img = q<HTMLImageElement>(".hist-item img.hist-thumb")!;
+      img.dispatchEvent(new Event("error"));
+      expect(q(".hist-item img")).toBeNull();
+      expect(q(".hist-thumb-placeholder")!.textContent).toBe("Imagen");
+      expect(q('button[data-action="copy-image"]')!.getAttribute("aria-label")).toBe("Copiar imagen al portapapeles");
     });
 
     it("una imagen recibida con carpeta ofrece «Abrir carpeta»; la enviada (location null) no", () => {

@@ -659,14 +659,24 @@ button {
 }
 
 /* Imágenes: miniatura pulsable (copia la imagen) y, si hay, «Abrir carpeta» al lado */
+.hist-item[data-kind="image"] {
+  align-items: center;
+}
+
 .hist-item[data-kind="image"] .hist-body {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
+  gap: 8px 10px;
+}
+
+.hist-item[data-kind="image"] .hist-body .btn {
+  flex-shrink: 0;
 }
 
 .hist-image-btn {
   display: block;
+  min-width: 0;
   padding: 3px;
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -681,7 +691,7 @@ button {
 
 .hist-thumb {
   display: block;
-  max-width: 160px;
+  max-width: min(160px, 100%);
   max-height: 160px;
   border-radius: 5px;
   object-fit: contain;

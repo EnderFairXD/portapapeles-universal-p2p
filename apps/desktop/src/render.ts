@@ -430,8 +430,10 @@ function updateTransfer(row: TransferRow, t: Transfer): void {
 }
 
 function renderTransfers(view: View, state: UiState): void {
-  syncList(view.transferList, view.transferRows, state.transfers, (t) => t.transferId, createTransfer, updateTransfer);
-  view.transfers.hidden = state.transfers.length === 0;
+  // Una imagen del portapapeles sustituida por otra más reciente sale como cancelada: no es un fallo ni interesa al usuario.
+  const visible = state.transfers.filter((t) => !(t.purpose === "clipboard" && t.state === "cancelled"));
+  syncList(view.transferList, view.transferRows, visible, (t) => t.transferId, createTransfer, updateTransfer);
+  view.transfers.hidden = visible.length === 0;
 }
 
 function formatTime(atMs: number): { label: string; iso: string } | null {
@@ -465,14 +467,17 @@ function createHistory(h: HistoryItem): Row {
     const copy = button("", "copy-image", "hist-image-btn");
     copy.dataset.historyId = String(h.id);
     copy.title = "Copiar imagen al portapapeles";
-    // `src` solo por propiedad y tras comprobar el prefijo; si no, marcador neutro.
+    copy.setAttribute("aria-label", "Copiar imagen al portapapeles");
+    const placeholder = () => el("span", "hist-thumb-placeholder", "Imagen");
+    // `src` solo por propiedad y tras comprobar el prefijo; si no, o si los datos están rotos, marcador neutro.
     if (typeof h.thumbnail === "string" && h.thumbnail.startsWith(THUMB_PREFIX)) {
       const img = el("img", "hist-thumb");
-      img.alt = "Imagen copiada";
+      img.alt = "Miniatura de la imagen";
+      img.onerror = () => img.replaceWith(placeholder());
       img.src = h.thumbnail;
       copy.append(img);
     } else {
-      copy.append(el("span", "hist-thumb-placeholder", "Imagen"));
+      copy.append(placeholder());
     }
     body.append(copy);
     if (h.location) {
