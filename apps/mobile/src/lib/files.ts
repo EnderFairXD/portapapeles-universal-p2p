@@ -162,9 +162,12 @@ function deleteQuietly(file: File): void {
   }
 }
 
-/** SAF añade «(1)» si el nombre existe; octet-stream evita que añada otra extensión. */
-function createIn(dirUri: string, name: string): File {
-  return new Directory(dirUri).createFile(name, 'application/octet-stream');
+/**
+ * SAF añade «(1)» si el nombre existe; octet-stream evita que añada otra extensión.
+ * Asíncrono: createDocument puede tardar segundos (3 s en MIUI) y congelaría el hilo de JS.
+ */
+function createIn(dirUri: string, name: string): Promise<File> {
+  return new Directory(dirUri).createFileAsync(name, 'application/octet-stream');
 }
 
 /**
@@ -177,7 +180,7 @@ export async function openSink(meta: FileMeta): Promise<FileSink> {
   const saved = loadSettings().receiveDirUri;
   if (saved) {
     try {
-      file = createIn(saved, name);
+      file = await createIn(saved, name);
     } catch {
       file = null; // permiso revocado o carpeta borrada: se vuelve a pedir
     }
@@ -185,7 +188,7 @@ export async function openSink(meta: FileMeta): Promise<FileSink> {
   if (!file) {
     const picked = await chooseReceiveDir();
     if (!picked) throw new NoReceiveDirError();
-    file = createIn(picked, name);
+    file = await createIn(picked, name);
   }
 
   const target = file;

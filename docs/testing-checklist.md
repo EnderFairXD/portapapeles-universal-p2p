@@ -113,6 +113,13 @@ Hallazgos de la prueba en el móvil (2026-10-18):
   temporizador de la pausa diferida corrió antes que el evento `active` ya encolado. Ahora, antes
   de pausar, se pregunta a Android (`getCurrentAppState`), que se actualiza en `onHostResume`.
   Falta repetirlo en el móvil (recibir un archivo eligiendo la carpeta).
+- Corregido: la creación del archivo ya no bloquea el hilo de JS. El parche de `expo-file-system`
+  añade `Directory.createFileAsync`, que hace el `createDocument` de SAF en `Dispatchers.IO`, y
+  `openSink` lo espera. Medido en el REDMI contra el `headless` por USB: la primera creación de
+  cada proceso tardó 360 y 174 ms, la primera justo tras elegir carpeta 70 ms y las demás 53–112 ms,
+  siempre en un hilo `DefaultDispatcher-worker`; durante la espera el hilo de JS no se paró más de
+  25–130 ms seguidos (lo mide un `setInterval` de 20 ms). Los
+  3 s no se repitieron: no pasa en cada creación, fue un caso puntual y lento del proveedor.
 - Pendiente: con la pantalla apagada a mitad de un envío por WiFi la conexión se cortó.
 - Corregido: el QR incluía la IP de `lxcbr0` (10.0.3.1); el filtro descarta ya `lxcbr*` y `lxdbr*`.
 - Corregido: un intent de compartir con una URI cuya consulta da un cursor vacío (o nulo, o sin
