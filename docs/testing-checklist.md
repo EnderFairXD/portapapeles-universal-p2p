@@ -112,7 +112,8 @@ Hallazgos de la prueba en el móvil (2026-10-18):
   síncrono y bloqueó el hilo de JS 3 s (`binderTransact: time=3059ms` en logcat); al soltarse, el
   temporizador de la pausa diferida corrió antes que el evento `active` ya encolado. Ahora, antes
   de pausar, se pregunta a Android (`getCurrentAppState`), que se actualiza en `onHostResume`.
-  Falta repetirlo en el móvil (recibir un archivo eligiendo la carpeta).
+  Con la creación ya asíncrona (punto siguiente) no se puede reproducir; la consulta a Android
+  queda como defensa ante cualquier otra llamada síncrona larga.
 - Corregido: la creación del archivo ya no bloquea el hilo de JS. El parche de `expo-file-system`
   añade `Directory.createFileAsync`, que hace el `createDocument` de SAF en `Dispatchers.IO`, y
   `openSink` lo espera. Medido en el REDMI contra el `headless` por USB: la primera creación de
@@ -126,5 +127,5 @@ Hallazgos de la prueba en el móvil (2026-10-18):
   tipo MIME) cerraba la app con `CursorIndexOutOfBoundsException` en `expo-share-intent` 8.0.1
   (la última publicada). Se parchea en `patches/` para avisar del error («No se pudo recibir lo
   compartido») en vez de cerrarse; las medidas de imagen/vídeo pasan a ser opcionales. Este
-  módulo no viene precompilado, así que no hace falta `buildFromSource`. Compila; falta repetir el
-  `am start … SEND` en el móvil.
+  módulo no viene precompilado, así que no hace falta `buildFromSource`. Probado en el REDMI con
+  `am start … SEND` y `content://media/external/file/45223`: sale el aviso y la app sigue abierta.
