@@ -192,6 +192,8 @@ const SIZE_MISMATCH: &str = "size_mismatch";
 const CHECKSUM_MISMATCH: &str = "checksum_mismatch";
 /// file_cancel de una imagen para el portapapeles de más de 20 MiB
 const TOO_LARGE: &str = "too_large";
+/// cierre de una sesión porque el mismo móvil abrió otra (lo envía el Hub)
+pub(super) const REPLACED: &str = "replaced";
 /// el PC siempre envía sus imágenes en PNG
 const IMAGE_MIME: &str = "image/png";
 
@@ -552,12 +554,18 @@ impl<W: AsyncWrite + Unpin> Session<W> {
             return;
         }
         self.closed = true;
+        // reemplazada: la ImageSync del dispositivo ya es de la sesión nueva, no se toca
+        let settle = reason != REPLACED;
         if let Some(t) = self.out.take() {
-            self.settle_image(&t, false);
+            if settle {
+                self.settle_image(&t, false);
+            }
             self.emit_transfer(t.update(TransferState::Failed, Some(reason)));
         }
         for t in std::mem::take(&mut self.out_queue) {
-            self.settle_image(&t, false);
+            if settle {
+                self.settle_image(&t, false);
+            }
             self.emit_transfer(t.update(TransferState::Failed, Some(reason)));
         }
         if let Some(t) = self.inc.take() {
@@ -793,7 +801,12 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         }
         let queued = self.out_queue.iter().find_map(|t| t.image_hash.as_deref());
         if queued == Some(img.hash.as_str()) {
-            return; // ya está en cola
+            // ya está en cola; si después se marcó otra (p. ej. una del móvil), vuelve a ser la última
+            let mut sync = lock(&self.image_sync);
+            if !sync.is_duplicate(&img.hash) {
+                sync.mark_sent(&img.hash);
+            }
+            return;
         }
         let dup = lock(&self.image_sync).is_duplicate(&img.hash);
         let in_flight =
@@ -815,14 +828,13 @@ impl<W: AsyncWrite + Unpin> Session<W> {
         self.out_queue.push_back(t);
     }
 
-    /// Quita de la cola la imagen que aún no empezó (el otro lado no sabe nada de ella).
-    fn drop_queued_image(&mut self) {
-        let Some(i) = self.out_queue.iter().position(|t| t.image_hash.is_some()) else {
-            return;
-        };
-        if let Some(t) = self.out_queue.remove(i) {
-            self.emit_transfer(t.update(TransferState::Cancelled, None));
-        }
+    /// Quita de la cola la imagen que aún no empezó (el otro lado no sabe nada de ella); al
+    /// soltarla se cierra su archivo. Sin revertir: la llama quien marca otra justo después.
+    fn drop_queued_image(&mut self) -> Option<OutTransfer> {
+        let i = self.out_queue.iter().position(|t| t.image_hash.is_some())?;
+        let t = self.out_queue.remove(i)?;
+        self.emit_transfer(t.update(TransferState::Cancelled, None));
+        Some(t)
     }
 
     /// Fin de una imagen saliente: confirma o revierte, solo si sigue siendo la última marcada
@@ -1160,6 +1172,11 @@ impl<W: AsyncWrite + Unpin> Session<W> {
                     .end_in(TransferState::Done, None, Some(location.clone()), None)
                     .await;
                 if done && image {
+                    // el móvil tiene ahora una imagen más nueva: la que esperaba en cola ya no
+                    // sirve (la que está en vuelo termina y settle_image la ignora)
+                    if let Some(t) = self.drop_queued_image() {
+                        self.settle_image(&t, false);
+                    }
                     self.emit(SessionEvent::ClipImage(location));
                 }
                 return Ok(());
