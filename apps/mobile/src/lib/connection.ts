@@ -47,7 +47,7 @@ import {
   reconnectDelayMs,
   type SendFileResult,
 } from './connectionPolicy';
-import { deleteQuietly, isPickerOpen, onPickerSettled, openSink, resetPickers } from './files';
+import { deleteQuietly, fileSourceFromUri, FileTooLargeError, isPickerOpen, onPickerSettled, openSink, resetPickers, UnknownFileSizeError } from './files';
 import {
   canWriteClipboard,
   ImageKeeper,
@@ -60,6 +60,8 @@ import {
 import { cachedImageSource, discardTemp, keepForHistory, readClipboardImage, saveReceivedImage, setClipboardImage } from './images';
 import { bytesToHex, hexToBytes, pairedPcFromInfo, type PairedPc } from './pairing';
 import { connectCandidates, type PcAddress } from './pcAddress';
+import { pickScreenshots, screenshotMime, type ShotAsset } from './screenshotPolicy';
+import { ensurePhotoAccess, startScreenshotWatcher } from './screenshots';
 import { getDeviceId, loadSettings, updateSettings } from './settings';
 import { SyncKeeper } from './syncKeeper';
 import { connectTcp } from './tcpLink';
@@ -96,6 +98,8 @@ export interface ConnState {
   lastError: string | null;
   /** El PC emparejado; `pairing` mientras falta completar el emparejamiento con el token del QR. */
   pc: { name: string; pairing: boolean } | null;
+  /** Enviar capturas está activado pero falta el permiso de fotos (denegado o solo algunas fotos). */
+  photoAccessMissing: boolean;
 }
 
 /** Resultado de `sendClipboardImageFile`: además, `duplicate` si el PC ya la tiene o ya va de camino. */
@@ -114,6 +118,10 @@ export const IMAGE_WRITE_FAILED = 'No se pudo poner la imagen en el portapapeles
 export const GALLERY_FAILED = 'No se pudo guardar en la galería';
 /** Margen tras cerrarse un selector antes de pausar si la app sigue en segundo plano. */
 const PICKER_SETTLE_MS = 1000;
+/** Reintentos de una captura que no se pudo abrir antes de darla por perdida. */
+const SHOT_MAX_ATTEMPTS = 3;
+/** Ids de capturas recordados para no repetirlas (se recorta al pasar de aquí). */
+const SHOT_IDS_KEPT = 200;
 
 /** El módulo nativo que alimenta AppState (spec NativeAppState de React Native). */
 interface NativeAppStateModule extends TurboModule {
@@ -162,6 +170,7 @@ export class ConnectionManager {
     history: [],
     lastError: null,
     pc: pcView(this.pc),
+    photoAccessMissing: false,
   };
   private readonly listeners = new Set<() => void>();
 
@@ -187,6 +196,12 @@ export class ConnectionManager {
   private generation = 0;
   private wake: (() => void) | null = null;
   private stopWatcher: (() => void) | null = null;
+  /** Vigilante de capturas nuevas (solo con «Enviar capturas» activado y permiso de fotos). */
+  private stopShots: (() => void) | null = null;
+  private shotsStarting = false;
+  /** Capturas ya encoladas (o descartadas): no se repiten aunque sigan en la ventana de 15 min. */
+  private readonly sentShotIds = new Set<string>();
+  private readonly shotAttempts = new Map<string, number>();
 
   private session: Session | null = null;
   private ready = false;
@@ -373,6 +388,7 @@ export class ConnectionManager {
     }
     if (this.running) {
       // seguía conectado en segundo plano: solo vuelve el vigilante, y lo copiado mientras tanto
+      void this.startScreenshots();
       if (!this.stopWatcher) {
         this.startClipboardWatcher();
         const watching = () => this.stopWatcher !== null;
@@ -391,6 +407,7 @@ export class ConnectionManager {
     this.running = true;
     const gen = ++this.generation;
     this.startClipboardWatcher();
+    void this.startScreenshots();
     startDiscovery();
     void this.loop(gen);
   }
@@ -417,6 +434,7 @@ export class ConnectionManager {
     this.running = false;
     this.pauseCheck.cancel();
     this.stopClipboardWatcher();
+    this.stopScreenshots();
     stopDiscovery();
     // antes de cambiar de generación para que lleguen los 'failed' de las transferencias en
     // curso; el anti-rebote vuelve al último hash confirmado al cerrarse (R29)
@@ -616,6 +634,88 @@ export class ConnectionManager {
       this.addHistory({ kind: 'text', direction: 'out', text });
       this.setError(null);
     } else if (outcome === 'too_large') this.setError(CLIP_TOO_LARGE);
+  }
+
+  // --- capturas ---
+
+  /** Ajustes: se activó o desactivó «Enviar capturas»; arranca o para el vigilante al momento. */
+  refreshScreenshots(): void {
+    this.stopScreenshots();
+    if (this.running) void this.startScreenshots();
+    else this.update({ photoAccessMissing: false });
+  }
+
+  private stopScreenshots(): void {
+    this.stopShots?.();
+    this.stopShots = null;
+  }
+
+  /** Arranca el vigilante si está activado y hay permiso completo; si no, avisa de que falta. */
+  private async startScreenshots(): Promise<void> {
+    if (this.stopShots || this.shotsStarting) return;
+    if (!loadSettings().sendScreenshots) {
+      this.update({ photoAccessMissing: false });
+      return;
+    }
+    this.shotsStarting = true;
+    const gen = this.generation;
+    let access: Awaited<ReturnType<typeof ensurePhotoAccess>>;
+    try {
+      access = await ensurePhotoAccess();
+    } finally {
+      this.shotsStarting = false;
+    }
+    // si mientras tanto se pausó o se desactivó, no arranca
+    if (gen !== this.generation || !this.running || this.stopShots || !loadSettings().sendScreenshots) return;
+    this.update({ photoAccessMissing: access !== 'full' });
+    if (access !== 'full') return;
+    // la primera vez se parte de ahora: lo anterior no se envía
+    if (loadSettings().lastScreenshotCheck === null) updateSettings({ lastScreenshotCheck: Date.now() });
+    this.stopShots = startScreenshotWatcher((shots) => this.onScreenshots(shots));
+  }
+
+  /**
+   * Candidatas del vigilante: se envían las nuevas, de la más antigua a la más reciente, y
+   * `lastScreenshotCheck` avanza hasta la última tratada. Sin sesión lista no se toca nada:
+   * se reintenta en el siguiente turno.
+   */
+  private onScreenshots(candidates: ShotAsset[]): void {
+    if (!this.readySession()) return;
+    const since = loadSettings().lastScreenshotCheck;
+    const picked = pickScreenshots(candidates, since, Date.now(), this.sentShotIds).reverse();
+    let handled = since;
+    for (const shot of picked) {
+      if (!this.sendScreenshot(shot)) break;
+      handled = Math.max(handled ?? 0, shot.creationTime);
+    }
+    if (handled !== since) updateSettings({ lastScreenshotCheck: handled });
+  }
+
+  /** true si la captura quedó tratada (encolada o descartada); false si hay que reintentar. */
+  private sendScreenshot(shot: ShotAsset): boolean {
+    const done = () => {
+      this.sentShotIds.add(shot.id);
+      this.shotAttempts.delete(shot.id);
+      if (this.sentShotIds.size > SHOT_IDS_KEPT) {
+        const oldest = this.sentShotIds.values().next().value;
+        if (oldest !== undefined) this.sentShotIds.delete(oldest);
+      }
+      return true;
+    };
+    const mime = screenshotMime(shot.filename);
+    if (!mime) return done(); // formato que el PC no admite (p. ej. HEIC)
+    let src: FileSource;
+    try {
+      src = fileSourceFromUri(shot.uri, shot.filename ?? 'captura', mime, -1);
+    } catch (e) {
+      if (e instanceof FileTooLargeError || e instanceof UnknownFileSizeError) return done();
+      const attempts = (this.shotAttempts.get(shot.id) ?? 0) + 1;
+      this.shotAttempts.set(shot.id, attempts);
+      return attempts >= SHOT_MAX_ATTEMPTS ? done() : false;
+    }
+    const result = this.sendClipboardImageFile(src, undefined, shot.uri);
+    if (result.ok || result.reason === 'rejected') return done();
+    return false; // sin sesión: ya se reintentará
   }
 
   // --- archivos ---
