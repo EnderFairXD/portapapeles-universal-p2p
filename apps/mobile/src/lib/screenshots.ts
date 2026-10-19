@@ -39,6 +39,8 @@ async function listRecentScreenshots(titles: Map<string, string>): Promise<ShotA
     const metas = await new Query()
       .album(album)
       .orderBy({ key: AssetField.CREATION_TIME, ascending: false })
+      // MIUI puede dejar DATE_TAKEN en 0: con la fecha de modificación como segunda clave siguen saliendo las nuevas
+      .orderBy({ key: AssetField.MODIFICATION_TIME, ascending: false })
       .limit(PER_ALBUM)
       .exeForMetadata();
     for (const m of metas) {

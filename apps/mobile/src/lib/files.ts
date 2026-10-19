@@ -157,8 +157,10 @@ export async function chooseReceiveDir(): Promise<string | null> {
   return dir.uri;
 }
 
-export function deleteQuietly(file: File): void {
+/** Acepta la ruta/URI: el `File` se crea dentro del try, así que nunca lanza. */
+export function deleteQuietly(target: File | string): void {
   try {
+    const file = typeof target === 'string' ? new File(target) : target;
     if (file.exists) file.delete();
   } catch {
     // ya no está
