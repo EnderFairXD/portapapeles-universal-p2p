@@ -131,3 +131,28 @@ Hallazgos de la prueba en el móvil (2026-10-18):
   compartido») en vez de cerrarse; las medidas de imagen/vídeo pasan a ser opcionales. Este
   módulo no viene precompilado, así que no hace falta `buildFromSource`. Probado en el REDMI con
   `am start … SEND` y `content://media/external/file/45223`: sale el aviso y la app sigue abierta.
+
+## Imágenes y capturas (fase 2b)
+
+Se prueba por WiFi y otra vez por USB, con el móvil emparejado. Android 10 o anterior y Android 14
+(permiso parcial) se prueban en la medida en que haya móvil.
+
+- [ ] captura en el PC → portapapeles y Galería → ClipSync del móvil
+- [ ] lo mismo con el móvil desconectado → llega al abrir ClipSync
+- [ ] captura en el móvil → PC al volver a ClipSync (portapapeles y `~/Imágenes/ClipSync`)
+- [ ] captura con ClipSync abierto → se envía sola y una sola vez
+- [ ] «Copiar imagen» en el navegador del móvil → PC, sin la URL
+- [ ] imagen de 20 MB y una de 21 MB (aviso «Imagen demasiado grande para sincronizar (máx. 20 MB)»)
+- [ ] permiso de fotos denegado y parcial: sale «Permite el acceso a las fotos para enviar tus
+  capturas» con «Abrir ajustes» y el resto de ClipSync (texto, archivos) sigue funcionando
+- [ ] la imagen recibida no rebota
+- [ ] imagen recibida con la app en segundo plano: no rebota al volver a primer plano (se escribe
+  en el portapapeles al abrir ClipSync, una sola vez)
+- [ ] texto copiado mientras se guarda una imagen en la galería: llega al PC (el guard del
+  portapapeles solo cubre la escritura de la imagen)
+- [ ] guardar en la galería en Android 10: sale el diálogo de permiso de fotos y, si se acepta, la
+  imagen queda en el álbum «ClipSync»; si se rechaza, «No se pudo guardar en la galería» y la imagen
+  llega igualmente al portapapeles
+- [ ] ajustes del móvil: «Enviar capturas automáticamente» y «Guardar imágenes recibidas en la
+  galería» (se conservan al cerrar la app y se aplican sin reiniciar)
+- [ ] CPU del PC con una captura 4K en el portapapeles (< 5 % de un núcleo)

@@ -1,6 +1,6 @@
 # Portapapeles Universal P2P (ClipSync)
 
-Sincronización del portapapeles (texto, tokens y archivos) entre móvil y escritorio **sin nube**:
+Sincronización del portapapeles (texto, tokens, archivos, imágenes y capturas de pantalla) entre móvil y escritorio **sin nube**:
 los dispositivos hablan directamente por LAN, USB o Bluetooth. De momento solo para **Android**.
 
 ## Estructura del monorepo
