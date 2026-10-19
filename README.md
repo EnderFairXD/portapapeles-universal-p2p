@@ -3,6 +3,19 @@
 Sincronización del portapapeles (texto, tokens, archivos, imágenes y capturas de pantalla) entre móvil y escritorio **sin nube**:
 los dispositivos hablan directamente por LAN, USB o Bluetooth. De momento solo para **Android**.
 
+## Qué hace
+
+- **Texto**: lo que copias en un dispositivo se puede pegar en el otro, en los dos sentidos.
+- **Archivos**: del PC al móvil y del móvil al PC, con «Compartir → ClipSync» desde la Galería.
+  Probado con 50 MB por USB, con comprobación de integridad (SHA-256).
+- **Imágenes**: una imagen copiada en el PC llega al portapapeles del móvil y a su galería (álbum
+  «ClipSync»); una copiada en el móvil llega al portapapeles del PC. Máximo 20 MB por imagen.
+- **Capturas de pantalla**: las capturas nuevas del móvil se envían solas al PC al abrir o volver a
+  ClipSync (Android no permite vigilarlas en segundo plano sin un servicio permanente). Las del PC
+  viajan al móvil con ClipSync abierto.
+- **Historial** en las dos apps, con miniatura de las imágenes: tocar una la vuelve a poner en el
+  portapapeles de ese dispositivo.
+
 ## Estructura del monorepo
 
 | Carpeta | Contenido |
@@ -18,8 +31,8 @@ El móvil prueba los medios por orden de preferencia y cae al siguiente si el an
 
 | Medio | Estado |
 |---|---|
-| WiFi / LAN (mDNS + TCP) | ✅ Bidireccional (texto y archivos) |
-| Cable USB (túnel ADB) | ✅ Con el `adb` del sistema |
+| WiFi / LAN (mDNS + TCP) | ✅ Bidireccional (texto, archivos, imágenes y capturas) |
+| Cable USB (túnel ADB) | ✅ Con el `adb` del sistema. 50 MB a unos 4 MiB/s en los dos sentidos (móvil de pruebas, cifrado nativo de Android) |
 | Bluetooth (BLE / Classic) | Pendiente |
 
 No hay Modo Invitado: ClipSync necesita estar instalado en los dos dispositivos.
@@ -45,6 +58,12 @@ el PC que escaneó, y el PC solo acepta móviles emparejados.
 Para quitar un móvil, usa «Olvidar» en el PC o en el móvil. Si escaneas el QR del mismo PC otra
 vez, se vuelve a emparejar sin preguntar; si es el de otro PC, la app pregunta antes de sustituir
 el actual.
+
+## Estado
+
+Fases 1 y 2 (sesión por WiFi/USB, emparejamiento y cifrado) y fase 2b (imágenes y capturas)
+implementadas. Las pruebas manuales de imágenes y capturas están en curso; la lista está en
+[`docs/testing-checklist.md`](docs/testing-checklist.md). Pendiente: Bluetooth.
 
 ## Comprobación manual
 
