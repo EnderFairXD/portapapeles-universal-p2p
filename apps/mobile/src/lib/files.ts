@@ -53,7 +53,8 @@ export function onPickerSettled(cb: () => void): () => void {
   };
 }
 
-async function withPicker<T>(fn: () => Promise<T>): Promise<T> {
+/** Envuelve un diálogo del sistema (selector, permisos): la app no se pausa mientras está abierto. */
+export async function withPicker<T>(fn: () => Promise<T>): Promise<T> {
   const token = pickers.enter();
   try {
     return await fn();
