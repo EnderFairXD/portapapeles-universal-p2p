@@ -2,7 +2,7 @@ import { useShareIntentContext } from 'expo-share-intent';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
+import { Linking, Pressable, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { HistoryList } from '@/components/HistoryList';
@@ -11,7 +11,7 @@ import { StatusCard } from '@/components/StatusCard';
 import { Toast } from '@/components/Toast';
 import { TransferList } from '@/components/TransferList';
 import { Welcome } from '@/components/Welcome';
-import { connection } from '@/lib/connection';
+import { connection, type HistoryEntry } from '@/lib/connection';
 import { filesLabel } from '@/lib/format';
 import { pickAndSend } from '@/lib/sendFlow';
 import { useConnection } from '@/lib/useConnection';
@@ -43,9 +43,9 @@ export default function Home() {
     }
   }, []);
 
-  const onCopy = useCallback(async (text: string) => {
+  const onCopy = useCallback(async (entry: HistoryEntry) => {
     try {
-      await connection.copyFromHistory(text);
+      await connection.copyFromHistory(entry);
       setToast({ text: 'Copiado', visible: true });
     } catch {
       setToast({ text: 'No se pudo copiar', visible: true });
@@ -57,6 +57,9 @@ export default function Home() {
   // son métodos de la clase: hay que llamarlos con `connection.`
   const onDismissError = useCallback(() => connection.clearError(), []);
   const onCancel = useCallback((id: string) => connection.cancelTransfer(id), []);
+  const onOpenPhotoSettings = useCallback(() => {
+    Linking.openSettings().catch(() => {});
+  }, []);
 
   const disabled = !connected || picking;
 
@@ -85,6 +88,7 @@ export default function Home() {
             notice={waiting > 0 ? `Esperando conexión para enviar ${filesLabel(waiting)}` : null}
             onCancelNotice={waiting > 0 ? () => resetShareIntent() : undefined}
             onDismissError={onDismissError}
+            onOpenPhotoSettings={onOpenPhotoSettings}
           />
         </View>
       </LinearGradient>

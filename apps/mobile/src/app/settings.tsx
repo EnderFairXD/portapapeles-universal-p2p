@@ -2,22 +2,63 @@ import Constants from 'expo-constants';
 import { LinearGradient } from 'expo-linear-gradient';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
-import { Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import { Alert, Linking, Pressable, StyleSheet, Switch, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { PHOTO_ACCESS_NOTICE } from '@/components/StatusCard';
 import { connection } from '@/lib/connection';
 import { chooseReceiveDir } from '@/lib/files';
 import { readableDir } from '@/lib/format';
-import { loadSettings } from '@/lib/settings';
+import { loadSettings, updateSettings } from '@/lib/settings';
 import { useConnection } from '@/lib/useConnection';
 import { colors, radius, TOUCH, type } from '@/theme';
+
+/** Una fila con interruptor; toda la fila se puede tocar. */
+function ToggleRow({ title, hint, value, onChange }: { title: string; hint: string; value: boolean; onChange: (v: boolean) => void }) {
+  return (
+    <Pressable
+      style={styles.toggle}
+      onPress={() => onChange(!value)}
+      accessibilityRole="switch"
+      accessibilityLabel={title}
+      accessibilityHint={hint}
+      accessibilityState={{ checked: value }}
+    >
+      <View style={styles.toggleText}>
+        <Text style={styles.value}>{title}</Text>
+        <Text style={styles.hint}>{hint}</Text>
+      </View>
+      <Switch
+        value={value}
+        onValueChange={onChange}
+        trackColor={{ false: colors.linkOff, true: colors.indigoDeep }}
+        thumbColor={value ? colors.outFg : colors.headerMuted}
+        accessible={false}
+        importantForAccessibility="no"
+      />
+    </Pressable>
+  );
+}
 
 export default function Settings() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
   const [dirUri, setDirUri] = useState<string | null>(() => loadSettings().receiveDirUri);
   const [busy, setBusy] = useState(false);
-  const pcName = useConnection().pc?.name ?? null;
+  const conn = useConnection();
+  const pcName = conn.pc?.name ?? null;
+  const [sendShots, setSendShots] = useState(() => loadSettings().sendScreenshots);
+  const [saveGallery, setSaveGallery] = useState(() => loadSettings().saveToGallery);
+
+  const toggleShots = (value: boolean) => {
+    setSendShots(value);
+    updateSettings({ sendScreenshots: value });
+    connection.refreshScreenshots(); // arranca o para el vigilante al momento
+  };
+  const toggleGallery = (value: boolean) => {
+    setSaveGallery(value);
+    updateSettings({ saveToGallery: value }); // se lee en cada imagen recibida
+  };
 
   const forget = () => {
     if (!pcName) return;
@@ -103,6 +144,37 @@ export default function Settings() {
           </Pressable>
         </View>
 
+        <View style={[styles.card, styles.cardTop]}>
+          <Text style={styles.label}>Imágenes y capturas</Text>
+          <ToggleRow
+            title="Enviar capturas automáticamente"
+            hint="Las capturas de pantalla nuevas se envían al PC al volver a ClipSync."
+            value={sendShots}
+            onChange={toggleShots}
+          />
+          {sendShots && conn.photoAccessMissing && (
+            <View style={styles.permission}>
+              <Text style={styles.hint}>{PHOTO_ACCESS_NOTICE}</Text>
+              <Pressable
+                style={({ pressed }) => [styles.change, styles.changeTop, pressed && styles.changePressed]}
+                onPress={() => {
+                  Linking.openSettings().catch(() => {});
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Abrir ajustes de Android para permitir el acceso a las fotos"
+              >
+                <Text style={styles.changeText}>Abrir ajustes</Text>
+              </Pressable>
+            </View>
+          )}
+          <ToggleRow
+            title="Guardar imágenes recibidas en la galería"
+            hint="Se guardan en el álbum «ClipSync»."
+            value={saveGallery}
+            onChange={toggleGallery}
+          />
+        </View>
+
         <View style={styles.version}>
           <Text style={styles.hint}>Versión</Text>
           <Text style={styles.hint}>{Constants.expoConfig?.version ?? '—'}</Text>
@@ -127,6 +199,10 @@ const styles = StyleSheet.create({
     borderColor: colors.border,
   },
   cardGap: { marginBottom: 12 },
+  cardTop: { marginTop: 12 },
+  toggle: { flexDirection: 'row', alignItems: 'center', gap: 12, minHeight: TOUCH, marginTop: 10 },
+  toggleText: { flex: 1 },
+  permission: { marginTop: 4 },
   actions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, marginTop: 14 },
   forgetText: { color: colors.danger },
   label: { ...type.section, color: colors.textMuted },
