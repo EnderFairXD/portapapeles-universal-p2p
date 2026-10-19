@@ -1,6 +1,18 @@
 import { describe, expect, it } from 'vitest';
 
-import { clipboardKind, imageExtension, ImageKeeper, ImageOutbox, isOwnWrite, outgoingImageName, pruneImageNames, type HashStore } from '../src/lib/imagePolicy';
+import {
+  canWriteClipboard,
+  clipboardKind,
+  imageExtension,
+  ImageKeeper,
+  ImageOutbox,
+  isOwnWrite,
+  outgoingImageName,
+  PendingImageWrite,
+  pruneImageNames,
+  startClipText,
+  type HashStore,
+} from '../src/lib/imagePolicy';
 
 const A = 'a'.repeat(64);
 const B = 'b'.repeat(64);
@@ -227,5 +239,57 @@ describe('ImageOutbox (R7: como mucho una imagen en cola o en curso)', () => {
     box.sent('t1', A, false);
     box.clear();
     expect(box.dropQueued()).toBeNull();
+  });
+});
+
+describe('startClipText (regla de inicio)', () => {
+  it('con una imagen en el portapapeles no se anuncia el texto que viene con ella (ni se lee)', async () => {
+    let reads = 0;
+    const read = async () => {
+      reads += 1;
+      return 'https://ejemplo.com/foto.png';
+    };
+    expect(await startClipText(true, read)).toBeNull();
+    expect(reads).toBe(0);
+  });
+
+  it('sin imagen se anuncia el texto', async () => {
+    expect(await startClipText(false, async () => 'hola')).toBe('hola');
+  });
+
+  it('sin texto, nada', async () => {
+    expect(await startClipText(false, async () => null)).toBeNull();
+  });
+});
+
+describe('canWriteClipboard', () => {
+  it('solo en primer plano (en segundo Android no deja leer lo escrito)', () => {
+    expect(canWriteClipboard('active')).toBe(true);
+    expect(canWriteClipboard('background')).toBe(false);
+    expect(canWriteClipboard('inactive')).toBe(false);
+  });
+});
+
+describe('PendingImageWrite', () => {
+  it('guarda una imagen y la entrega una sola vez', () => {
+    const p = new PendingImageWrite();
+    expect(p.take()).toBeNull();
+    expect(p.set({ uri: 'file:///a.png', temp: null })).toBeNull();
+    expect(p.take()).toEqual({ uri: 'file:///a.png', temp: null });
+    expect(p.take()).toBeNull();
+  });
+
+  it('una imagen nueva sustituye a la pendiente y devuelve la antigua para limpiarla', () => {
+    const p = new PendingImageWrite();
+    p.set({ uri: 'file:///a.png', temp: 'file:///cache/a.png' });
+    expect(p.set({ uri: 'file:///b.png', temp: null })).toEqual({ uri: 'file:///a.png', temp: 'file:///cache/a.png' });
+    expect(p.take()?.uri).toBe('file:///b.png');
+  });
+
+  it('clear devuelve lo descartado', () => {
+    const p = new PendingImageWrite();
+    p.set({ uri: 'file:///a.png', temp: null });
+    expect(p.clear()?.uri).toBe('file:///a.png');
+    expect(p.clear()).toBeNull();
   });
 });

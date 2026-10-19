@@ -2,6 +2,7 @@
 import * as Clipboard from 'expo-clipboard';
 import { AppState } from 'react-native';
 
+import { SuppressGuard } from './clipboardGuard';
 import { clipboardKind } from './imagePolicy';
 
 /** Texto actual del portapapeles, o null si está vacío o no se puede leer. */
@@ -23,16 +24,21 @@ export async function clipboardHasImage(): Promise<boolean> {
   }
 }
 
-/** Escrituras de la app en curso: mientras tanto el oyente no avisa de nada. */
-let suppressed = 0;
+/** Escrituras de imágenes de la app en curso: mientras tanto el oyente descarta los avisos. */
+const guard = new SuppressGuard();
+/** Revisa el portapapeles si se descartó algún aviso durante una escritura (lo pone el vigilante). */
+let onMissed: (() => void) | null = null;
 
-/** Ejecuta `fn` con el oyente callado (escritura de una imagen recibida o del historial). */
+/**
+ * Ejecuta `fn` con el oyente callado. Solo para la escritura de la imagen y su lectura de
+ * vuelta, no para la galería ni los permisos. Los avisos descartados se recuperan al soltar.
+ */
 export async function withClipboardSuppressed<T>(fn: () => Promise<T>): Promise<T> {
-  suppressed += 1;
+  guard.enter();
   try {
     return await fn();
   } finally {
-    suppressed -= 1;
+    if (guard.exit()) onMissed?.();
   }
 }
 
@@ -40,6 +46,8 @@ export interface ClipboardHandlers {
   onText(text: string): void;
   /** Hay una imagen en el portapapeles; quien la recibe la lee (imagen gana a texto). */
   onImage(): void;
+  /** Se descartó algún aviso durante una escritura de la app: revisar el portapapeles. */
+  onMissed(): void;
 }
 
 /**
@@ -48,22 +56,23 @@ export interface ClipboardHandlers {
  */
 export function startClipboardWatcher(handlers: ClipboardHandlers): () => void {
   let active = true;
+  onMissed = handlers.onMissed;
   const readText = async () => {
     const text = await readClipboard();
-    if (active && suppressed === 0 && text !== null) handlers.onText(text);
+    if (active && text !== null && !guard.swallow()) handlers.onText(text);
   };
   const readAny = async () => {
     const image = await clipboardHasImage();
-    if (!active || suppressed > 0) return;
+    if (!active || guard.swallow()) return;
     if (image) handlers.onImage();
     else await readText();
   };
 
   const clipSub = Clipboard.addClipboardListener(({ contentTypes }) => {
-    if (suppressed > 0) return;
     const kind = clipboardKind(contentTypes);
+    if (kind === 'none' || guard.swallow()) return;
     if (kind === 'image') handlers.onImage();
-    else if (kind === 'text') void readText();
+    else void readText();
   });
   const appSub = AppState.addEventListener('change', (state) => {
     if (state === 'active') void readAny();
@@ -71,6 +80,7 @@ export function startClipboardWatcher(handlers: ClipboardHandlers): () => void {
 
   return () => {
     active = false;
+    if (onMissed === handlers.onMissed) onMissed = null;
     clipSub.remove();
     appSub.remove();
   };

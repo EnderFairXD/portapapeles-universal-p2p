@@ -76,25 +76,42 @@ export function cachedImageSource(bytes: Uint8Array): { source: FileSource; uri:
   }
 }
 
+/** Resultado de poner una imagen en el portapapeles. */
+export type ClipboardWrite =
+  | { kind: 'ok'; hash: string }
+  /** Se puso, pero no se pudo leer de vuelta (p. ej. en segundo plano): se reintenta en primer plano. */
+  | { kind: 'unreadable' }
+  | { kind: 'failed' };
+
 /**
- * Pone la imagen de `uri` en el portapapeles y devuelve el hash de su lectura de vuelta (si no
- * se puede leer, p. ej. en segundo plano, el de los bytes del archivo); null si no se pudo poner.
- * Llamar con el oyente callado (`withClipboardSuppressed`); los avisos que lleguen tarde los
- * descarta el anti-rebote, porque el gestor los lee después de marcar este hash.
+ * Pone la imagen de `uri` en el portapapeles y devuelve el hash de su lectura de vuelta. Solo
+ * `setImageAsync` y la lectura de vuelta van con el oyente callado; los avisos que lleguen
+ * mientras tanto se recuperan al soltar. Si no se puede leer de vuelta: `unreadable`, salvo con
+ * `lastTry` (primer plano y ya reintentado), que usa el hash de los bytes del archivo.
  */
-export async function setClipboardImage(uri: string): Promise<string | null> {
+export async function setClipboardImage(uri: string, lastTry: boolean): Promise<ClipboardWrite> {
   const file = new File(uri);
+  let data: string;
   try {
-    await Clipboard.setImageAsync(await file.base64());
+    data = await file.base64();
   } catch {
-    return null;
+    return { kind: 'failed' };
   }
-  const back = await readClipboardImage();
-  if (back) return back.hash;
+  const back = await withClipboardSuppressed(async () => {
+    try {
+      await Clipboard.setImageAsync(data);
+    } catch {
+      return 'failed' as const;
+    }
+    return readClipboardImage();
+  });
+  if (back === 'failed') return { kind: 'failed' };
+  if (back) return { kind: 'ok', hash: back.hash };
+  if (!lastTry) return { kind: 'unreadable' };
   try {
-    return sha256Hex(await file.bytes());
+    return { kind: 'ok', hash: sha256Hex(await file.bytes()) };
   } catch {
-    return null;
+    return { kind: 'failed' };
   }
 }
 
@@ -144,41 +161,39 @@ function pruneHistoryImages(): void {
   }
 }
 
-export interface ReceivedImage {
-  /** Hash de la lectura de vuelta, para `markSynced`; null si no se pudo poner en el portapapeles. */
-  hash: string | null;
+export interface SavedImage {
   /** El recurso creado en la galería; null si no se guardó (desactivado o fallo). */
   galleryUri: string | null;
   /** Se intentó guardar en la galería y falló (aviso «No se pudo guardar en la galería»). */
   galleryFailed: boolean;
   /** Copia para el historial en `Paths.document/images/`; null si no se pudo guardar. */
   imageUri: string | null;
+  /** Archivo que se pondrá en el portapapeles: la copia del historial o, si no la hay, el de la caché. */
+  clipUri: string;
+  /** Archivo de la caché que borrar tras escribir en el portapapeles (null si ya está en el historial). */
+  temp: string | null;
 }
 
 /**
- * Una imagen recibida (en `Paths.cache/images/`): 1) a la galería si está activado, 2) al
- * portapapeles con el oyente callado y 3) lectura de vuelta para el hash; 4) copia para el
- * historial y 5) se borra de la caché. Un fallo de la galería no impide el portapapeles. Todo
- * con el oyente del portapapeles callado (se suelta siempre, también si algo lanza).
+ * Una imagen recibida (en `Paths.cache/images/`): 1) a la galería si está activado (sin tocar
+ * el oyente del portapapeles) y 2) copia para el historial. El portapapeles va aparte
+ * (`setClipboardImage`): en segundo plano se difiere hasta volver a primer plano.
  */
-export function writeReceivedImage(path: string, saveToGalleryOn: boolean): Promise<ReceivedImage> {
-  return withClipboardSuppressed(async () => {
+export async function saveReceivedImage(path: string, saveToGalleryOn: boolean): Promise<SavedImage> {
+  let galleryUri: string | null = null;
+  let galleryFailed = false;
+  if (saveToGalleryOn) {
     try {
-      let galleryUri: string | null = null;
-      let galleryFailed = false;
-      if (saveToGalleryOn) {
-        try {
-          galleryUri = await saveToGallery(path);
-        } catch {
-          galleryFailed = true;
-        }
-      }
-      const hash = await setClipboardImage(path);
-      const imageUri = keepForHistory(path);
-      return { hash, galleryUri, galleryFailed, imageUri };
-    } finally {
-      // si no se movió al historial, no queda en la caché
-      deleteQuietly(new File(path));
+      galleryUri = await saveToGallery(path);
+    } catch {
+      galleryFailed = true;
     }
-  });
+  }
+  const imageUri = keepForHistory(path);
+  return { galleryUri, galleryFailed, imageUri, clipUri: imageUri ?? path, temp: imageUri ? null : path };
+}
+
+/** Borra el temporal de la caché de una imagen ya escrita (o descartada). */
+export function discardTemp(temp: string | null): void {
+  if (temp) deleteQuietly(new File(temp));
 }

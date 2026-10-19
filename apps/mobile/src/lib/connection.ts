@@ -31,7 +31,6 @@ import {
   clipboardHasImage,
   readClipboard,
   startClipboardWatcher,
-  withClipboardSuppressed,
   writeClipboard,
 } from './clipboardWatcher';
 import { resolvedPcs, startDiscovery, stopDiscovery } from './discovery';
@@ -49,8 +48,16 @@ import {
   type SendFileResult,
 } from './connectionPolicy';
 import { deleteQuietly, isPickerOpen, onPickerSettled, openSink, resetPickers } from './files';
-import { ImageKeeper, ImageOutbox, isOwnWrite } from './imagePolicy';
-import { cachedImageSource, keepForHistory, readClipboardImage, setClipboardImage, writeReceivedImage } from './images';
+import {
+  canWriteClipboard,
+  ImageKeeper,
+  ImageOutbox,
+  isOwnWrite,
+  PendingImageWrite,
+  startClipText,
+  type PendingImage,
+} from './imagePolicy';
+import { cachedImageSource, discardTemp, keepForHistory, readClipboardImage, saveReceivedImage, setClipboardImage } from './images';
 import { bytesToHex, hexToBytes, pairedPcFromInfo, type PairedPc } from './pairing';
 import { connectCandidates, type PcAddress } from './pcAddress';
 import { getDeviceId, loadSettings, updateSettings } from './settings';
@@ -194,6 +201,8 @@ export class ConnectionManager {
   /** Lecturas y escrituras de imágenes, de una en una (nunca dos a la vez sobre el portapapeles). */
   private imageWork: Promise<void> = Promise.resolve();
   private imageCheckQueued = false;
+  /** Imagen recibida en segundo plano (o sin poder leerla de vuelta): se escribe al pasar a 'active'. */
+  private readonly pendingWrite = new PendingImageWrite();
   /** Hash de lectura de vuelta de la última imagen que escribió la app (hasta que se vea otra). */
   private lastWrittenImage: string | null = null;
   /** Última dirección WiFi del PC que funcionó; se prueba la primera. */
@@ -315,6 +324,7 @@ export class ConnectionManager {
     this.keeper = null;
     this.imageKeeper = null;
     this.lastWrittenImage = null;
+    this.dropPendingImage();
     this.handshakeFailures = 0;
     updateSettings({ pc: this.pc, lastSyncedHash: null, lastImageHash: null, lastPc: null });
     this.update({ status: 'searching', transport: null, peerName: null, pc: pcView(this.pc), lastError: null });
@@ -325,6 +335,7 @@ export class ConnectionManager {
   forgetPc(): void {
     this.pause({ status: 'unpaired', transport: null, peerName: null, pc: null, lastError: null });
     this.pc = null;
+    this.dropPendingImage();
     this.handshakeFailures = 0;
     updateSettings({ pc: null });
   }
@@ -336,6 +347,8 @@ export class ConnectionManager {
       // de vuelta en primer plano no queda ningún selector vivo (aunque no haya terminado)
       resetPickers();
       this.pauseCheck.cancel();
+      // antes que cualquier revisión de imágenes: la cadena las atiende por orden
+      this.flushPendingImage();
       this.resume();
     } else if (s === 'background') this.applyBackground(s);
   };
@@ -386,6 +399,7 @@ export class ConnectionManager {
     this.stopWatcher ??= startClipboardWatcher({
       onText: (text) => this.onLocalText(text),
       onImage: () => this.queueImageCheck(),
+      onMissed: () => this.recheckClipboard(),
     });
   }
 
@@ -553,6 +567,7 @@ export class ConnectionManager {
       session.on('clip', (text) => {
         if (gen !== this.generation) return;
         this.addTextOnce('in', text);
+        this.dropPendingImage(); // el texto es lo último del portapapeles: la imagen pendiente ya no va
         // el listener saltará con este texto; el anti-rebote ya lo tiene marcado
         writeClipboard(text).catch(() => this.setError(CLIP_WRITE_FAILED));
       });
@@ -577,7 +592,8 @@ export class ConnectionManager {
 
   /** Regla de inicio: el texto actual se anuncia en el hello (la sesión decide si se envía). */
   private async localClipForStart(): Promise<string | null> {
-    const text = await readClipboard();
+    // con una imagen en el portapapeles solo se envía la imagen (la regla de inicio de imágenes)
+    const text = await startClipText(await clipboardHasImage(), readClipboard);
     if (text === null) return null;
     // la misma decisión que tomará la Session (también si el JSON no cabe)
     if (decideClip(this.sync().current, text) === 'too_large') this.setError(CLIP_TOO_LARGE);
@@ -671,34 +687,83 @@ export class ConnectionManager {
     }
   }
 
-  /** Recibida del PC: galería, portapapeles y lectura de vuelta (en `writeReceivedImage`). */
+  /**
+   * Recibida del PC: galería y copia del historial al momento; el portapapeles ahora si la app
+   * está en primer plano y se puede leer de vuelta, y si no, al pasar a 'active'.
+   */
   private async onImageReceived(path: string, name: string): Promise<void> {
-    const r = await writeReceivedImage(path, loadSettings().saveToGallery);
-    if (r.hash !== null) {
-      this.images().current.markSynced(r.hash);
-      this.lastWrittenImage = r.hash;
-      // la que esperaba en cola ya no es lo último del portapapeles
-      const queued = this.outbox.dropQueued();
-      if (queued) this.session?.cancelTransfer(queued.id);
-    } else {
-      this.setError(IMAGE_WRITE_FAILED);
-    }
+    this.dropPendingImage(); // la nueva sustituye a una pendiente anterior
+    const r = await saveReceivedImage(path, loadSettings().saveToGallery);
     if (r.galleryFailed) this.setError(GALLERY_FAILED);
     if (r.imageUri) this.addHistory({ kind: 'image', direction: 'in', fileName: name, imageUri: r.imageUri });
+    await this.writeImageToClipboard({ uri: r.clipUri, temp: r.temp }, false);
+  }
+
+  /** Pone la imagen en el portapapeles, o la deja pendiente si ahora no se puede (segundo plano). */
+  private async writeImageToClipboard(image: PendingImage, lastTry: boolean): Promise<void> {
+    if (!canWriteClipboard(AppState.currentState)) {
+      this.deferImage(image);
+      return;
+    }
+    const w = await setClipboardImage(image.uri, lastTry);
+    if (w.kind === 'unreadable') {
+      this.deferImage(image);
+      return;
+    }
+    discardTemp(image.temp);
+    if (w.kind === 'failed') {
+      this.setError(IMAGE_WRITE_FAILED);
+      return;
+    }
+    this.images().current.markSynced(w.hash);
+    this.lastWrittenImage = w.hash;
+    // la que esperaba en cola ya no es lo último del portapapeles
+    const queued = this.outbox.dropQueued();
+    if (queued) this.session?.cancelTransfer(queued.id);
+  }
+
+  private deferImage(image: PendingImage): void {
+    const old = this.pendingWrite.set(image);
+    if (old) discardTemp(old.temp);
+  }
+
+  /** Descarta la imagen pendiente (otra más nueva, un texto o un cambio de PC la sustituye). */
+  private dropPendingImage(): void {
+    const old = this.pendingWrite.clear();
+    if (old) discardTemp(old.temp);
+  }
+
+  /** Vuelta a primer plano: escribe la imagen que llegó en segundo plano, antes de revisar nada más. */
+  private flushPendingImage(): void {
+    const image = this.pendingWrite.take();
+    if (image) this.queueImageWork(() => this.writeImageToClipboard(image, true));
+  }
+
+  /**
+   * Se descartaron avisos del portapapeles mientras la app escribía una imagen: se revisa el
+   * portapapeles por la cadena de imágenes (imagen primero; si no hay, el texto).
+   */
+  private recheckClipboard(): void {
+    if (!this.stopWatcher) return;
+    this.queueImageWork(async () => {
+      if (!this.stopWatcher) return;
+      if (await clipboardHasImage()) {
+        await this.onLocalImage();
+        return;
+      }
+      const text = await readClipboard();
+      if (text !== null && this.stopWatcher !== null) this.onLocalText(text);
+    });
   }
 
   /** Lanza si no se pudo poner en el portapapeles (la interfaz avisa «No se pudo copiar»). */
   private async copyImageFromHistory(uri: string): Promise<void> {
-    const hash = await withClipboardSuppressed(async () => {
-      const h = await setClipboardImage(uri);
-      // se marca antes de soltar el oyente: así no se reenvía al PC
-      if (h !== null) {
-        this.images().current.markSynced(h);
-        this.lastWrittenImage = h;
-      }
-      return h;
-    });
-    if (hash === null) throw new Error(IMAGE_WRITE_FAILED);
+    // pendiente de una recibida en segundo plano: lo elegido ahora es lo último del portapapeles
+    this.dropPendingImage();
+    const w = await setClipboardImage(uri, true);
+    if (w.kind !== 'ok') throw new Error(IMAGE_WRITE_FAILED);
+    this.images().current.markSynced(w.hash);
+    this.lastWrittenImage = w.hash;
   }
 
   /** Una lectura pendiente basta para cualquier número de avisos seguidos del portapapeles. */
