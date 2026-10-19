@@ -4,6 +4,9 @@ import { AccessibilityInfo, Animated, Easing, Pressable, StyleSheet, Text, View 
 import type { ConnState } from '@/lib/connection';
 import { colors, radius, TOUCH, type } from '@/theme';
 
+/** Aviso cuando enviar capturas está activado pero falta el permiso de fotos. */
+export const PHOTO_ACCESS_NOTICE = 'Permite el acceso a las fotos para enviar tus capturas';
+
 const WIRE_WIDTH = 48;
 const DASH_PERIOD = 12;
 
@@ -82,9 +85,11 @@ interface Props {
   /** Si se da, el aviso informativo lleva un botón «Cancelar». */
   onCancelNotice?: () => void;
   onDismissError: () => void;
+  /** Con el aviso de permiso de fotos: abre los ajustes de Android de la app. */
+  onOpenPhotoSettings?: () => void;
 }
 
-export function StatusCard({ state, notice, onCancelNotice, onDismissError }: Props) {
+export function StatusCard({ state, notice, onCancelNotice, onDismissError, onOpenPhotoSettings }: Props) {
   const connected = state.status === 'connected';
   return (
     <View>
@@ -100,7 +105,7 @@ export function StatusCard({ state, notice, onCancelNotice, onDismissError }: Pr
         <Wire connected={connected} searching={state.status === 'searching'} />
       </View>
 
-      {(state.lastError || notice) && (
+      {(state.lastError || notice || state.photoAccessMissing) && (
         <View style={styles.notices}>
           {state.lastError && (
             <Pressable
@@ -115,6 +120,25 @@ export function StatusCard({ state, notice, onCancelNotice, onDismissError }: Pr
               </View>
               <Text style={styles.noticeText}>{state.lastError}</Text>
             </Pressable>
+          )}
+          {state.photoAccessMissing && (
+            <View style={[styles.notice, styles.noticeInfo]} accessibilityLiveRegion="polite">
+              <View style={[styles.mark, { backgroundColor: colors.outFg }]}>
+                <Text style={styles.markText}>i</Text>
+              </View>
+              <Text style={styles.noticeText}>{PHOTO_ACCESS_NOTICE}</Text>
+              {onOpenPhotoSettings && (
+                <Pressable
+                  style={styles.noticeAction}
+                  onPress={onOpenPhotoSettings}
+                  accessibilityRole="button"
+                  accessibilityLabel="Abrir ajustes de Android para permitir el acceso a las fotos"
+                  hitSlop={6}
+                >
+                  <Text style={styles.noticeActionText}>Abrir ajustes</Text>
+                </Pressable>
+              )}
+            </View>
           )}
           {notice && (
             <View style={[styles.notice, styles.noticeInfo]} accessibilityLiveRegion="polite">
