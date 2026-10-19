@@ -18,7 +18,6 @@ import {
 } from '@clipsync/protocol';
 import * as Crypto from 'expo-crypto';
 import * as Device from 'expo-device';
-import { File } from 'expo-file-system';
 import {
   AppState,
   type AppStateStatus,
@@ -54,7 +53,9 @@ import {
   ImageOutbox,
   isOwnWrite,
   PendingImageWrite,
+  pendingExpired,
   startClipText,
+  UnverifiedWrite,
   type PendingImage,
 } from './imagePolicy';
 import { cachedImageSource, discardTemp, keepForHistory, readClipboardImage, saveReceivedImage, setClipboardImage } from './images';
@@ -218,6 +219,8 @@ export class ConnectionManager {
   private imageCheckQueued = false;
   /** Imagen recibida en segundo plano (o sin poder leerla de vuelta): se escribe al pasar a 'active'. */
   private readonly pendingWrite = new PendingImageWrite();
+  /** Escritura sin lectura de vuelta: la primera imagen distinta que se lea (10 s) es la suya recodificada. */
+  private readonly unverified = new UnverifiedWrite();
   /** Hash de lectura de vuelta de la última imagen que escribió la app (hasta que se vea otra). */
   private lastWrittenImage: string | null = null;
   /** Última dirección WiFi del PC que funcionó; se prueba la primera. */
@@ -339,6 +342,7 @@ export class ConnectionManager {
     this.keeper = null;
     this.imageKeeper = null;
     this.lastWrittenImage = null;
+    this.unverified.clear();
     this.dropPendingImage();
     this.handshakeFailures = 0;
     updateSettings({ pc: this.pc, lastSyncedHash: null, lastImageHash: null, lastPc: null });
@@ -783,7 +787,7 @@ export class ConnectionManager {
       const imageUri = send.cacheUri ? keepForHistory(send.cacheUri) : send.imageUri;
       if (imageUri) this.addHistory({ kind: 'image', direction: 'out', fileName: u.name, imageUri });
     } else if (send.cacheUri) {
-      deleteQuietly(new File(send.cacheUri));
+      deleteQuietly(send.cacheUri);
     }
   }
 
@@ -796,7 +800,7 @@ export class ConnectionManager {
     const r = await saveReceivedImage(path, loadSettings().saveToGallery);
     if (r.galleryFailed) this.setError(GALLERY_FAILED);
     if (r.imageUri) this.addHistory({ kind: 'image', direction: 'in', fileName: name, imageUri: r.imageUri });
-    await this.writeImageToClipboard({ uri: r.clipUri, temp: r.temp }, false);
+    await this.writeImageToClipboard({ uri: r.clipUri, temp: r.temp, at: Date.now() }, false);
   }
 
   /** Pone la imagen en el portapapeles, o la deja pendiente si ahora no se puede (segundo plano). */
@@ -815,8 +819,15 @@ export class ConnectionManager {
       this.setError(IMAGE_WRITE_FAILED);
       return;
     }
-    this.images().current.markSynced(w.hash);
-    this.lastWrittenImage = w.hash;
+    this.adoptWrittenImage(w.hash, w.unverified === true);
+  }
+
+  /** Lo que la app acaba de escribir es lo último del portapapeles: ni rebota ni deja en cola a otra. */
+  private adoptWrittenImage(hash: string, unverified: boolean): void {
+    this.images().current.markSynced(hash);
+    this.lastWrittenImage = hash;
+    if (unverified) this.unverified.arm(Date.now());
+    else this.unverified.clear();
     // la que esperaba en cola ya no es lo último del portapapeles
     const queued = this.outbox.dropQueued();
     if (queued) this.session?.cancelTransfer(queued.id);
@@ -836,7 +847,12 @@ export class ConnectionManager {
   /** Vuelta a primer plano: escribe la imagen que llegó en segundo plano, antes de revisar nada más. */
   private flushPendingImage(): void {
     const image = this.pendingWrite.take();
-    if (image) this.queueImageWork(() => this.writeImageToClipboard(image, true));
+    if (!image) return;
+    if (pendingExpired(image, Date.now())) {
+      discardTemp(image.temp); // demasiado vieja: la entrada del historial se queda
+      return;
+    }
+    this.queueImageWork(() => this.writeImageToClipboard(image, true));
   }
 
   /**
@@ -862,8 +878,7 @@ export class ConnectionManager {
     this.dropPendingImage();
     const w = await setClipboardImage(uri, true);
     if (w.kind !== 'ok') throw new Error(IMAGE_WRITE_FAILED);
-    this.images().current.markSynced(w.hash);
-    this.lastWrittenImage = w.hash;
+    this.adoptWrittenImage(w.hash, w.unverified === true);
   }
 
   /** Una lectura pendiente basta para cualquier número de avisos seguidos del portapapeles. */
@@ -897,6 +912,12 @@ export class ConnectionManager {
     const img = await readClipboardImage();
     if (!img || !this.readySession()) return;
     if (isOwnWrite(img.hash, this.lastWrittenImage)) return;
+    if (this.unverified.take(Date.now())) {
+      // la imagen que escribimos sin poder leerla de vuelta, recodificada: se adopta, no se envía
+      this.images().current.markSynced(img.hash);
+      this.lastWrittenImage = img.hash;
+      return;
+    }
     this.lastWrittenImage = null; // ya hay otra: si vuelve la escrita, es una copia nueva
     if (this.images().current.isDuplicate(img.hash)) return;
     if (img.bytes.length > MAX_CLIP_IMAGE_BYTES) {
@@ -910,7 +931,7 @@ export class ConnectionManager {
       return; // sin espacio en la caché: se reintenta con la siguiente copia
     }
     const result = this.queueImage(cached.source, img.hash, { cacheUri: cached.uri });
-    if (!result.ok) deleteQuietly(new File(cached.uri));
+    if (!result.ok) deleteQuietly(cached.uri);
   }
 
   /** Encola una imagen con `purpose: 'clipboard'` (R7 si lleva hash). Cierra `src` si no sale. */

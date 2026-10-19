@@ -184,6 +184,57 @@ export interface PendingImage {
   uri: string;
   /** Archivo de la caché que borrar al terminar (si no se pudo mover al historial). */
   temp: string | null;
+  /** Date.now() de cuando se difirió. */
+  at: number;
+}
+
+/** Una imagen diferida más vieja que esto ya no se escribe: el usuario habrá copiado otra cosa. */
+export const PENDING_IMAGE_MAX_AGE_MS = 120_000;
+
+export function pendingExpired(image: Pick<PendingImage, 'at'>, now: number): boolean {
+  return now - image.at > PENDING_IMAGE_MAX_AGE_MS;
+}
+
+/** Vigencia de una escritura sin lectura de vuelta: la primera imagen distinta que se lea es la suya. */
+export const UNVERIFIED_WRITE_TTL_MS = 10_000;
+
+/**
+ * Tras escribir una imagen sin poder leerla de vuelta (hash del archivo de repuesto), el
+ * portapapeles puede devolverla recodificada. Mientras dure el plazo, la primera imagen
+ * distinta que se lea se adopta como propia (`take` = true) en vez de enviarla al PC.
+ */
+export class UnverifiedWrite {
+  private armedAt: number | null = null;
+
+  arm(now: number): void {
+    this.armedAt = now;
+  }
+
+  /** true una sola vez, dentro del plazo; pasado el plazo se desarma sin adoptar. */
+  take(now: number): boolean {
+    const at = this.armedAt;
+    this.armedAt = null;
+    return at !== null && now - at <= UNVERIFIED_WRITE_TTL_MS;
+  }
+
+  clear(): void {
+    this.armedAt = null;
+  }
+}
+
+/** Lee y, si no da nada, reintenta `retries` veces con `delayMs` de espera entre intentos. */
+export async function readWithRetries<T>(
+  read: () => Promise<T | null>,
+  retries: number,
+  delayMs: number,
+  sleep: (ms: number) => Promise<void>,
+): Promise<T | null> {
+  let value = await read();
+  for (let i = 0; i < retries && value === null; i++) {
+    await sleep(delayMs);
+    value = await read();
+  }
+  return value;
 }
 
 /** La imagen recibida en segundo plano, a la espera de poder escribirla (solo la más reciente). */

@@ -8,7 +8,7 @@ import { Album, Asset, getPermissionsAsync, requestPermissionsAsync } from 'expo
 
 import { withClipboardSuppressed } from './clipboardWatcher';
 import { appDir, deleteQuietly, fileSourceFromUri, newImageFileName } from './files';
-import { outgoingImageName, pruneImageNames } from './imagePolicy';
+import { outgoingImageName, pruneImageNames, readWithRetries } from './imagePolicy';
 import { nativeBase64 } from './nativeCrypto';
 
 /** Álbum de la galería donde se guardan las imágenes recibidas. */
@@ -76,9 +76,14 @@ export function cachedImageSource(bytes: Uint8Array): { source: FileSource; uri:
   }
 }
 
+const READBACK_RETRIES = 4;
+const READBACK_RETRY_MS = 250;
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 /** Resultado de poner una imagen en el portapapeles. */
 export type ClipboardWrite =
-  | { kind: 'ok'; hash: string }
+  /** `unverified`: sin lectura de vuelta, el hash es el del archivo y el portapapeles puede devolverla recodificada. */
+  | { kind: 'ok'; hash: string; unverified?: true }
   /** Se puso, pero no se pudo leer de vuelta (p. ej. en segundo plano): se reintenta en primer plano. */
   | { kind: 'unreadable' }
   | { kind: 'failed' };
@@ -86,8 +91,10 @@ export type ClipboardWrite =
 /**
  * Pone la imagen de `uri` en el portapapeles y devuelve el hash de su lectura de vuelta. Solo
  * `setImageAsync` y la lectura de vuelta van con el oyente callado; los avisos que lleguen
- * mientras tanto se recuperan al soltar. Si no se puede leer de vuelta: `unreadable`, salvo con
- * `lastTry` (primer plano y ya reintentado), que usa el hash de los bytes del archivo.
+ * mientras tanto se recuperan al soltar. Si no se puede leer de vuelta: `unreadable`. Con
+ * `lastTry` (primer plano y ya reintentado) la lectura se repite hasta 4 veces cada 250 ms (justo
+ * al pasar a `active` la ventana aún puede no tener foco) y, si sigue sin ir, usa el hash de los
+ * bytes del archivo con `unverified`.
  */
 export async function setClipboardImage(uri: string, lastTry: boolean): Promise<ClipboardWrite> {
   const file = new File(uri);
@@ -103,13 +110,13 @@ export async function setClipboardImage(uri: string, lastTry: boolean): Promise<
     } catch {
       return 'failed' as const;
     }
-    return readClipboardImage();
+    return readWithRetries(readClipboardImage, lastTry ? READBACK_RETRIES : 0, READBACK_RETRY_MS, sleep);
   });
   if (back === 'failed') return { kind: 'failed' };
   if (back) return { kind: 'ok', hash: back.hash };
   if (!lastTry) return { kind: 'unreadable' };
   try {
-    return { kind: 'ok', hash: sha256Hex(await file.bytes()) };
+    return { kind: 'ok', hash: sha256Hex(await file.bytes()), unverified: true };
   } catch {
     return { kind: 'failed' };
   }
@@ -195,5 +202,5 @@ export async function saveReceivedImage(path: string, saveToGalleryOn: boolean):
 
 /** Borra el temporal de la caché de una imagen ya escrita (o descartada). */
 export function discardTemp(temp: string | null): void {
-  if (temp) deleteQuietly(new File(temp));
+  if (temp) deleteQuietly(temp);
 }

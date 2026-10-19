@@ -9,8 +9,13 @@ import {
   isOwnWrite,
   outgoingImageName,
   PendingImageWrite,
+  PENDING_IMAGE_MAX_AGE_MS,
+  pendingExpired,
   pruneImageNames,
+  readWithRetries,
   startClipText,
+  UNVERIFIED_WRITE_TTL_MS,
+  UnverifiedWrite,
   type HashStore,
 } from '../src/lib/imagePolicy';
 
@@ -274,22 +279,114 @@ describe('PendingImageWrite', () => {
   it('guarda una imagen y la entrega una sola vez', () => {
     const p = new PendingImageWrite();
     expect(p.take()).toBeNull();
-    expect(p.set({ uri: 'file:///a.png', temp: null })).toBeNull();
-    expect(p.take()).toEqual({ uri: 'file:///a.png', temp: null });
+    expect(p.set({ uri: 'file:///a.png', temp: null, at: 0 })).toBeNull();
+    expect(p.take()).toEqual({ uri: 'file:///a.png', temp: null, at: 0 });
     expect(p.take()).toBeNull();
   });
 
   it('una imagen nueva sustituye a la pendiente y devuelve la antigua para limpiarla', () => {
     const p = new PendingImageWrite();
-    p.set({ uri: 'file:///a.png', temp: 'file:///cache/a.png' });
-    expect(p.set({ uri: 'file:///b.png', temp: null })).toEqual({ uri: 'file:///a.png', temp: 'file:///cache/a.png' });
+    p.set({ uri: 'file:///a.png', temp: 'file:///cache/a.png', at: 0 });
+    expect(p.set({ uri: 'file:///b.png', temp: null, at: 0 })).toEqual({ uri: 'file:///a.png', temp: 'file:///cache/a.png', at: 0 });
     expect(p.take()?.uri).toBe('file:///b.png');
   });
 
   it('clear devuelve lo descartado', () => {
     const p = new PendingImageWrite();
-    p.set({ uri: 'file:///a.png', temp: null });
+    p.set({ uri: 'file:///a.png', temp: null, at: 0 });
     expect(p.clear()?.uri).toBe('file:///a.png');
     expect(p.clear()).toBeNull();
+  });
+});
+
+describe('pendingExpired', () => {
+  const img = (at: number) => ({ uri: 'file:///a.png', temp: null, at });
+
+  it('una imagen diferida reciente sigue valiendo', () => {
+    expect(pendingExpired(img(1000), 1000 + PENDING_IMAGE_MAX_AGE_MS)).toBe(false);
+    expect(pendingExpired(img(1000), 5000)).toBe(false);
+  });
+
+  it('pasados 120 s ya no se escribe (el usuario habrá copiado otra cosa)', () => {
+    expect(PENDING_IMAGE_MAX_AGE_MS).toBe(120_000);
+    expect(pendingExpired(img(1000), 1000 + PENDING_IMAGE_MAX_AGE_MS + 1)).toBe(true);
+  });
+});
+
+describe('readWithRetries', () => {
+  it('devuelve la primera lectura que da algo, sin esperar de más', async () => {
+    const waits: number[] = [];
+    let calls = 0;
+    const got = await readWithRetries(
+      async () => (++calls === 3 ? 'ok' : null),
+      4,
+      250,
+      async (ms) => {
+        waits.push(ms);
+      },
+    );
+    expect(got).toBe('ok');
+    expect(calls).toBe(3);
+    expect(waits).toEqual([250, 250]);
+  });
+
+  it('lectura inicial más 4 reintentos y se rinde con null', async () => {
+    let calls = 0;
+    const waits: number[] = [];
+    const got = await readWithRetries(
+      async () => {
+        calls += 1;
+        return null;
+      },
+      4,
+      250,
+      async (ms) => {
+        waits.push(ms);
+      },
+    );
+    expect(got).toBeNull();
+    expect(calls).toBe(5);
+    expect(waits).toEqual([250, 250, 250, 250]);
+  });
+
+  it('con 0 reintentos lee una sola vez', async () => {
+    let calls = 0;
+    await readWithRetries(async () => (calls++, null), 0, 250, async () => {});
+    expect(calls).toBe(1);
+  });
+});
+
+describe('UnverifiedWrite (escritura sin lectura de vuelta)', () => {
+  it('sin armar no adopta nada', () => {
+    expect(new UnverifiedWrite().take(0)).toBe(false);
+  });
+
+  it('adopta la primera lectura distinta y solo esa', () => {
+    const u = new UnverifiedWrite();
+    u.arm(1000);
+    expect(u.take(2000)).toBe(true);
+    expect(u.take(2001)).toBe(false);
+  });
+
+  it('caduca a los 10 s', () => {
+    expect(UNVERIFIED_WRITE_TTL_MS).toBe(10_000);
+    const u = new UnverifiedWrite();
+    u.arm(1000);
+    expect(u.take(1000 + UNVERIFIED_WRITE_TTL_MS + 1)).toBe(false);
+    // y queda desarmada
+    expect(u.take(1000 + 5)).toBe(false);
+  });
+
+  it('en el límite aún vale', () => {
+    const u = new UnverifiedWrite();
+    u.arm(1000);
+    expect(u.take(1000 + UNVERIFIED_WRITE_TTL_MS)).toBe(true);
+  });
+
+  it('clear la desarma', () => {
+    const u = new UnverifiedWrite();
+    u.arm(0);
+    u.clear();
+    expect(u.take(1)).toBe(false);
   });
 });
