@@ -164,3 +164,46 @@ export class ImageOutbox {
     return null;
   }
 }
+
+/**
+ * Regla de inicio del texto: si el portapapeles tiene una imagen, solo se envía la imagen
+ * (spec §3: imagen y texto en la misma copia), así que el texto que la acompaña ni se lee ni se anuncia.
+ */
+export async function startClipText(hasImage: boolean, readText: () => Promise<string | null>): Promise<string | null> {
+  return hasImage ? null : readText();
+}
+
+/** En segundo plano Android no deja leer el portapapeles: la lectura de vuelta fallaría. */
+export function canWriteClipboard(appState: string): boolean {
+  return appState === 'active';
+}
+
+/** Una imagen recibida que aún no está en el portapapeles. */
+export interface PendingImage {
+  /** Archivo que se pondrá en el portapapeles (la copia del historial, o el de la caché). */
+  uri: string;
+  /** Archivo de la caché que borrar al terminar (si no se pudo mover al historial). */
+  temp: string | null;
+}
+
+/** La imagen recibida en segundo plano, a la espera de poder escribirla (solo la más reciente). */
+export class PendingImageWrite {
+  private item: PendingImage | null = null;
+
+  /** Guarda la imagen; devuelve la que sustituye para que el llamante limpie su temporal. */
+  set(image: PendingImage): PendingImage | null {
+    const old = this.item;
+    this.item = image;
+    return old;
+  }
+
+  take(): PendingImage | null {
+    return this.clear();
+  }
+
+  clear(): PendingImage | null {
+    const old = this.item;
+    this.item = null;
+    return old;
+  }
+}
