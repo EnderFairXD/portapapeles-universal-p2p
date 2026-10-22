@@ -18,7 +18,7 @@ import {
 } from '../src/lib/transportPolicy';
 
 const BT = 'AA:BB:CC:DD:EE:FF';
-const ok: PolicyCtx = { btAddress: BT, btPermission: 'granted', btState: 'on', btCoolingDown: false };
+const ok: PolicyCtx = { btAddress: BT, btBonded: true, btPermission: 'granted', btState: 'on', btCoolingDown: false };
 
 describe('candidates', () => {
   it('auto con todo disponible: WiFi, USB y Bluetooth, en ese orden', () => {
@@ -40,6 +40,18 @@ describe('candidates', () => {
     expect(candidates('auto', { ...ok, btAddress: null })).toMatchObject({ transports: ['wifi', 'usb'], issue: 'no_address' });
     expect(candidates('auto', { ...ok, btState: 'off' })).toMatchObject({ transports: ['wifi', 'usb'], issue: 'off' });
     expect(candidates('auto', { ...ok, btState: 'unavailable' })).toMatchObject({ transports: ['wifi', 'usb'], issue: 'unavailable' });
+  });
+
+  it('auto con una dirección no vinculada en el sistema: se salta Bluetooth como sin dirección', () => {
+    expect(candidates('auto', { ...ok, btBonded: false })).toEqual({ transports: ['wifi', 'usb'], issue: 'no_address', reason: null });
+  });
+
+  it('modo fijo bluetooth con la dirección sin vincular: pide emparejar en los ajustes', () => {
+    expect(candidates('bluetooth', { ...ok, btBonded: false })).toEqual({
+      transports: [],
+      issue: 'no_address',
+      reason: 'Empareja el móvil y el PC en los ajustes de Bluetooth del sistema',
+    });
   });
 
   it('auto tras un fallo reciente de Bluetooth: espera antes de reintentarlo, pero no es un problema', () => {
@@ -99,8 +111,12 @@ describe('shouldUpgrade', () => {
     expect(shouldUpgrade('bluetooth', 'auto', { ...idle, busy: true })).toBe(false);
   });
 
-  it('no antes de 30 s conectado', () => {
-    expect(shouldUpgrade('bluetooth', 'auto', { connectedForMs: UPGRADE_INTERVAL_MS - 1, busy: false })).toBe(false);
+  it('con 500 ms de margen: un aviso algo adelantado no se salta el ciclo', () => {
+    expect(shouldUpgrade('bluetooth', 'auto', { connectedForMs: UPGRADE_INTERVAL_MS - 500, busy: false })).toBe(true);
+  });
+
+  it('no antes de 30 s conectado (menos el margen)', () => {
+    expect(shouldUpgrade('bluetooth', 'auto', { connectedForMs: UPGRADE_INTERVAL_MS - 501, busy: false })).toBe(false);
   });
 
   it('no en modo fijo', () => {

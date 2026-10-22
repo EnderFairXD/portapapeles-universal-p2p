@@ -31,6 +31,8 @@ export const BLUETOOTH_ISSUE_MESSAGES: Record<BluetoothIssue, string> = {
 export interface PolicyCtx {
   /** Dirección Bluetooth del PC (del QR o elegida de la lista de emparejados). */
   btAddress: string | null;
+  /** La dirección está entre los dispositivos vinculados del sistema (si no, Android abriría su diálogo de emparejar). */
+  btBonded: boolean;
   /** `undetermined`: aún no se ha pedido; se pedirá al primer uso. */
   btPermission: 'granted' | 'denied' | 'undetermined';
   btState: 'on' | 'off' | 'unavailable';
@@ -47,9 +49,10 @@ export interface Candidates {
   reason: string | null;
 }
 
-export function bluetoothIssue(ctx: Pick<PolicyCtx, 'btAddress' | 'btPermission' | 'btState'>): BluetoothIssue | null {
+export function bluetoothIssue(ctx: Pick<PolicyCtx, 'btAddress' | 'btBonded' | 'btPermission' | 'btState'>): BluetoothIssue | null {
   if (ctx.btState === 'unavailable') return 'unavailable';
-  if (ctx.btAddress === null) return 'no_address';
+  // sin dirección o sin vincular en el sistema: mismo aviso, empareja en los ajustes de Bluetooth
+  if (ctx.btAddress === null || !ctx.btBonded) return 'no_address';
   if (ctx.btPermission === 'denied') return 'no_permission';
   if (ctx.btState === 'off') return 'off';
   return null;
@@ -97,16 +100,19 @@ export function modeChangeAction(mode: TransportMode, current: Transport | null,
   return busy ? 'defer' : 'restart';
 }
 
+/** Margen del temporizador de mejora: el aviso puede llegar unos ms antes del plazo y saltarse un ciclo. */
+export const UPGRADE_MARGIN_MS = 500;
+
 /**
  * ¿Toca buscar un medio mejor? Solo en Auto, estando en uno peor desde hace al menos
- * `UPGRADE_INTERVAL_MS` y sin transferencias en curso ni en cola.
+ * `UPGRADE_INTERVAL_MS` (con `UPGRADE_MARGIN_MS` de margen) y sin transferencias en curso ni en cola.
  */
 export function shouldUpgrade(
   current: Transport,
   mode: TransportMode,
   s: { connectedForMs: number; busy: boolean },
 ): boolean {
-  return mode === 'auto' && !s.busy && s.connectedForMs >= UPGRADE_INTERVAL_MS && betterTransports(current).length > 0;
+  return mode === 'auto' && !s.busy && s.connectedForMs >= UPGRADE_INTERVAL_MS - UPGRADE_MARGIN_MS && betterTransports(current).length > 0;
 }
 
 /** Espera tras un fallo de Bluetooth en Auto. Un reloj que retrocede no bloquea. */
