@@ -62,6 +62,8 @@ export default function Home() {
   const onOpenPhotoSettings = useCallback(() => {
     Linking.openSettings().catch(() => {});
   }, []);
+  // el permiso de Bluetooth también se cambia en los ajustes de Android de la app
+  const onOpenBluetoothSettings = onOpenPhotoSettings;
 
   const disabled = !connected || picking;
 
@@ -91,6 +93,7 @@ export default function Home() {
             onCancelNotice={waiting > 0 ? () => resetShareIntent() : undefined}
             onDismissError={onDismissError}
             onOpenPhotoSettings={onOpenPhotoSettings}
+            onOpenBluetoothSettings={onOpenBluetoothSettings}
           />
         </View>
       </LinearGradient>

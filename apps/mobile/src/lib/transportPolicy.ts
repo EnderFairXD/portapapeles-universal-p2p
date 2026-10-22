@@ -78,6 +78,25 @@ export function allowsTransport(mode: TransportMode, t: Transport): boolean {
   return mode === 'auto' || mode === t;
 }
 
+/** ¿La sesión actual va por un medio que el modo elegido ya no admite? (Cambio pendiente de aplicar.) */
+export function modeChangePending(mode: TransportMode, current: Transport | null): boolean {
+  return current !== null && !allowsTransport(mode, current);
+}
+
+/**
+ * Qué hacer al cambiar de modo (o al terminar lo pendiente, cuando hay un cambio aplazado):
+ * - `wake`: la sesión sirve (o no hay) y solo se despierta el bucle;
+ * - `restart`: la sesión va por un medio no admitido y nada la ata: se reinicia;
+ * - `defer`: lo mismo, pero hay transferencias en curso o en cola: no se corta la sesión (R2),
+ *   se espera a que termine.
+ */
+export type ModeChangeAction = 'wake' | 'restart' | 'defer';
+
+export function modeChangeAction(mode: TransportMode, current: Transport | null, busy: boolean): ModeChangeAction {
+  if (!modeChangePending(mode, current)) return 'wake';
+  return busy ? 'defer' : 'restart';
+}
+
 /**
  * ¿Toca buscar un medio mejor? Solo en Auto, estando en uno peor desde hace al menos
  * `UPGRADE_INTERVAL_MS` y sin transferencias en curso ni en cola.

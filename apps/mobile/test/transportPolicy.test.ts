@@ -8,6 +8,8 @@ import {
   betterTransports,
   btCoolingDown,
   candidates,
+  modeChangeAction,
+  modeChangePending,
   parseBtAddress,
   parseTransportMode,
   shouldUpgrade,
@@ -152,5 +154,43 @@ describe('ajustes guardados', () => {
     expect(parseBtAddress('')).toBeNull();
     expect(parseBtAddress(null)).toBeNull();
     expect(parseBtAddress(12)).toBeNull();
+  });
+});
+
+describe('modeChangeAction (cambio de modo con transferencias, R2)', () => {
+  it('sin sesión o con un medio que el modo admite: solo se despierta el bucle', () => {
+    expect(modeChangeAction('usb', null, false)).toBe('wake');
+    expect(modeChangeAction('usb', null, true)).toBe('wake');
+    expect(modeChangeAction('auto', 'bluetooth', true)).toBe('wake');
+    expect(modeChangeAction('wifi', 'wifi', true)).toBe('wake');
+  });
+
+  it('sesión por un medio no admitido y libre: se reinicia', () => {
+    expect(modeChangeAction('bluetooth', 'wifi', false)).toBe('restart');
+    expect(modeChangeAction('wifi', 'usb', false)).toBe('restart');
+  });
+
+  it('sesión por un medio no admitido con transferencias: se aplaza, no se corta', () => {
+    expect(modeChangeAction('bluetooth', 'wifi', true)).toBe('defer');
+    expect(modeChangeAction('usb', 'bluetooth', true)).toBe('defer');
+  });
+
+  it('al terminar lo pendiente, la misma decisión pasa de aplazar a reiniciar', () => {
+    expect(modeChangeAction('usb', 'wifi', true)).toBe('defer');
+    expect(modeChangeAction('usb', 'wifi', false)).toBe('restart');
+  });
+
+  it('volver a un modo que admite la sesión cancela el cambio aplazado', () => {
+    expect(modeChangeAction('wifi', 'wifi', true)).toBe('wake');
+    expect(modeChangeAction('auto', 'wifi', true)).toBe('wake');
+  });
+});
+
+describe('modeChangePending', () => {
+  it('solo si hay sesión por un medio que el modo no admite', () => {
+    expect(modeChangePending('usb', 'wifi')).toBe(true);
+    expect(modeChangePending('usb', 'usb')).toBe(false);
+    expect(modeChangePending('auto', 'bluetooth')).toBe(false);
+    expect(modeChangePending('bluetooth', null)).toBe(false);
   });
 });

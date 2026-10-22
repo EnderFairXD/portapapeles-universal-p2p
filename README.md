@@ -33,7 +33,7 @@ El móvil prueba los medios por orden de preferencia y cae al siguiente si el an
 |---|---|
 | WiFi / LAN (mDNS + TCP) | ✅ Bidireccional (texto, archivos, imágenes y capturas) |
 | Cable USB (túnel ADB) | ✅ Con el `adb` del sistema. 50 MB a unos 4 MiB/s en los dos sentidos (móvil de pruebas, cifrado nativo de Android) |
-| Bluetooth (BLE / Classic) | Pendiente |
+| Bluetooth (RFCOMM, dispositivos ya emparejados) | 🟡 Implementado (PC Linux y Windows, móvil Android); aún sin probar con hardware real |
 
 No hay Modo Invitado: ClipSync necesita estar instalado en los dos dispositivos.
 
@@ -63,7 +63,8 @@ el actual.
 
 Fases 1 y 2 (sesión por WiFi/USB, emparejamiento y cifrado) y fase 2b (imágenes y capturas)
 implementadas. Las pruebas manuales de imágenes y capturas están en curso; la lista está en
-[`docs/testing-checklist.md`](docs/testing-checklist.md). Pendiente: Bluetooth.
+[`docs/testing-checklist.md`](docs/testing-checklist.md). Fase 4 (Bluetooth) implementada, pendiente de
+probar con hardware real.
 
 ## Comprobación manual
 
