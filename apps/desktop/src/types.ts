@@ -1,7 +1,7 @@
 // Contrato con el backend de Tauri (Tarea 10): el estado completo que llega por "ui-state".
 // En Rust `null` es "ausente"; en TS los campos opcionales aceptan ambas formas.
 
-export type Transport = "wifi" | "usb";
+export type Transport = "wifi" | "usb" | "bluetooth";
 export type Direction = "in" | "out";
 export type HistoryDirection = Direction | "local";
 export type TransferState = "queued" | "active" | "failed" | "cancelled";
@@ -66,6 +66,8 @@ export interface UiState {
   clipNotice?: string | null;
   /** El PC no pudo abrir su puerto TCP (p. ej. otra copia abierta). */
   serverError?: string | null;
+  /** Estado del Bluetooth del PC («Este PC no tiene Bluetooth», «Bluetooth apagado»); `null` si funciona. */
+  bluetoothNotice?: string | null;
   /** Móviles emparejados con este PC. */
   paired: PairedDevice[];
   /** `null` si no hay un QR vigente. */

@@ -266,19 +266,41 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
-/// URI del QR: `clipsync://pair?v=2&pk=…&t=…&n=…&ip=…&port=…`. El nombre se recorta a 64
-/// caracteres (Unicode, no bytes) antes de codificarlo.
-pub fn pairing_uri(public_key: &[u8; 32], token: &str, pc_name: &str, ips: &[Ipv4Addr], port: u16) -> String {
+/// `true` si es una dirección Bluetooth `AA:BB:CC:DD:EE:FF`: 6 octetos hex en mayúsculas.
+pub fn is_bt_address(s: &str) -> bool {
+    let partes: Vec<&str> = s.split(':').collect();
+    partes.len() == 6
+        && partes
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)))
+}
+
+/// URI del QR: `clipsync://pair?v=2&pk=…&t=…&n=…&ip=…&port=…[&bt=…]`. El nombre se recorta a 64
+/// caracteres (Unicode, no bytes) antes de codificarlo. `bt` (dirección Bluetooth del PC) solo
+/// va si es válida: sin adaptador, o con una dirección rara, el QR no la lleva.
+pub fn pairing_uri(
+    public_key: &[u8; 32],
+    token: &str,
+    pc_name: &str,
+    ips: &[Ipv4Addr],
+    port: u16,
+    bt: Option<&str>,
+) -> String {
     let nombre: String = pc_name.chars().take(MAX_NAME_CHARS).collect();
     let ips: Vec<String> = ips.iter().map(|ip| ip.to_string()).collect();
-    format!(
+    let mut uri = format!(
         "clipsync://pair?v=2&pk={}&t={}&n={}&ip={}&port={}",
         URL_SAFE_NO_PAD.encode(public_key),
         token,
         percent_encode(&nombre),
         ips.join(","),
         port
-    )
+    );
+    if let Some(bt) = bt.filter(|b| is_bt_address(b)) {
+        uri.push_str("&bt=");
+        uri.push_str(bt);
+    }
+    uri
 }
 
 /// SVG del QR (corrección M, mínimo 240×240). Con el nombre recortado la URI siempre cabe;
@@ -588,10 +610,20 @@ mod tests {
     #[test]
     fn nombre_se_recorta_a_64_caracteres_y_se_codifica() {
         let largo = "ñ".repeat(70);
-        let uri = pairing_uri(&[0u8; 32], "tok", &largo, &[], 52847);
+        let uri = pairing_uri(&[0u8; 32], "tok", &largo, &[], 52847, None);
         let n = uri.split("&n=").nth(1).unwrap().split('&').next().unwrap();
         assert_eq!(n, "%C3%B1".repeat(64));
         assert!(uri.ends_with("&ip=&port=52847"));
+    }
+
+    #[test]
+    fn bt_solo_va_si_es_una_direccion_valida() {
+        let con = |bt| pairing_uri(&[0u8; 32], "tok", "PC", &[], 52847, bt);
+        assert!(con(None).ends_with("&port=52847"));
+        assert!(con(Some("00:1A:7D:DA:71:13")).ends_with("&port=52847&bt=00:1A:7D:DA:71:13"));
+        for mala in ["00:1a:7d:da:71:13", "00:1A:7D:DA:71", "00:1A:7D:DA:71:13:00", "ZZ:1A:7D:DA:71:13", "", "001A7DDA7113"] {
+            assert!(con(Some(mala)).ends_with("&port=52847"), "{mala}");
+        }
     }
 
     #[test]
@@ -617,6 +649,7 @@ mod tests {
                 caso["pcName"].as_str().unwrap(),
                 &ips,
                 caso["port"].as_u64().unwrap() as u16,
+                caso.get("bt").and_then(|v| v.as_str()),
             );
             if escribir {
                 caso["uri"] = serde_json::Value::String(uri);

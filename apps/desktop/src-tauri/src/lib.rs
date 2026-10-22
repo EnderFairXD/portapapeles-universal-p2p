@@ -2,6 +2,7 @@
 pub mod core;
 mod app;
 mod discovery;
+mod listeners;
 mod protocol;
 mod usb;
 
@@ -145,7 +146,13 @@ pub fn run() {
 
             tauri::async_runtime::spawn(ctx.clone().run_emitter(tauri_app.handle().clone()));
             tauri::async_runtime::spawn(ctx.clone().run_events(events));
-            tauri::async_runtime::spawn(serve(hub, ctx.clone()));
+            tauri::async_runtime::spawn(serve(hub.clone(), ctx.clone()));
+            // RFCOMM (Bluetooth): sin adaptador o con BlueZ apagado no hace nada salvo avisar y
+            // reintentar cada 30 s; nunca bloquea el arranque
+            tauri::async_runtime::spawn(listeners::run(hub, {
+                let ctx = ctx.clone();
+                Arc::new(move |estado| ctx.set_bluetooth(estado))
+            }));
 
             // El ServiceDaemon debe seguir vivo mientras la app corra; Box::leak lo mantiene
             // anunciado hasta que el proceso termine.

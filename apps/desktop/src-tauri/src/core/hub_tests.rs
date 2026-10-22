@@ -756,6 +756,18 @@ async fn serve_tcp_desde_localhost_es_usb() {
     assert_eq!(s.event().await, peer_connected(1, "m1", "usb"));
 }
 
+/// Un flujo RFCOMM (aquí un `duplex`) entra por `accept_stream` igual que uno TCP y la sesión
+/// se rotula «bluetooth».
+#[tokio::test]
+async fn flujo_rfcomm_es_una_sesion_bluetooth() {
+    let mut s = setup(None);
+    let (a, b) = tokio::io::duplex(256 * 1024);
+    s.hub.accept_stream(b, Transport::Bluetooth);
+    let mut c = over(a);
+    c.hello("m1", Some(false)).await;
+    assert_eq!(s.event().await, peer_connected(1, "m1", "bluetooth"));
+}
+
 // --- latido ---
 
 #[tokio::test(start_paused = true)]

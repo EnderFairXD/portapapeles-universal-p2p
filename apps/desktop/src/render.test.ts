@@ -68,6 +68,11 @@ describe("estado de conexión", () => {
     expect(q(".status-title")!.textContent).toBe("Conectado con Pixel 8 por WiFi");
   });
 
+  it("con un peer Bluetooth dice «por Bluetooth»", () => {
+    render(root, state({ peers: [peer({ transport: "bluetooth" })] }));
+    expect(q(".status-title")!.textContent).toBe("Conectado con Pixel 8 por Bluetooth");
+  });
+
   it("un transporte que coincide con un miembro de Object.prototype no se rotula", () => {
     const transport = "constructor" as unknown as Peer["transport"];
     render(root, state({ peers: [peer({ transport })] }));
@@ -586,6 +591,15 @@ describe("emparejamiento", () => {
     expect(n.classList.contains("notice-info")).toBe(true);
     expect(q(".notices")!.hidden).toBe(false);
     render(root, state({ pairNotice: null }));
+    expect(qa(".notice")).toHaveLength(0);
+  });
+
+  it("bluetoothNotice se ve como aviso informativo y desaparece al limpiarse", () => {
+    render(root, state({ bluetoothNotice: "Este PC no tiene Bluetooth" }));
+    const n = qa(".notice").find((e) => e.textContent!.includes("Este PC no tiene Bluetooth"))!;
+    expect(n.classList.contains("notice-info")).toBe(true);
+    expect(q(".notices")!.hidden).toBe(false);
+    render(root, state({ bluetoothNotice: null }));
     expect(qa(".notice")).toHaveLength(0);
   });
 

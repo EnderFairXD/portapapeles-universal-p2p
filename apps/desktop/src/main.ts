@@ -21,6 +21,7 @@ const EMPTY_STATE: UiState = {
   clipboardError: null,
   clipNotice: null,
   serverError: null,
+  bluetoothNotice: null,
   paired: [],
   pairing: null,
   pairNotice: null,
