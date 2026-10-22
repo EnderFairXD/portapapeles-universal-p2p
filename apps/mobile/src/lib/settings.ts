@@ -4,6 +4,7 @@ import { File, Paths } from 'expo-file-system';
 
 import { parseLastPc, type PcAddress } from './pcAddress';
 import { parsePairedPc, type PairedPc } from './pairing';
+import { parseBtAddress, parseTransportMode, type TransportMode } from './transportPolicy';
 
 export interface Settings {
   /** Carpeta SAF elegida para guardar los archivos recibidos. */
@@ -22,6 +23,10 @@ export interface Settings {
   sendScreenshots: boolean;
   /** «Guardar imágenes recibidas en la galería». */
   saveToGallery: boolean;
+  /** Medio de conexión: `auto` (WiFi → USB → Bluetooth) o uno fijo. */
+  transportMode: TransportMode;
+  /** Dirección Bluetooth del PC (del QR o elegida de los emparejados), AA:BB:CC:DD:EE:FF. */
+  btAddress: string | null;
 }
 
 const SHA256_HEX = /^[0-9a-f]{64}$/;
@@ -56,6 +61,8 @@ export function loadSettings(): Settings {
     // activados por defecto
     sendScreenshots: raw?.sendScreenshots !== false,
     saveToGallery: raw?.saveToGallery !== false,
+    transportMode: parseTransportMode(raw?.transportMode),
+    btAddress: parseBtAddress(raw?.btAddress),
   };
 }
 
@@ -69,6 +76,8 @@ export function saveSettings(s: Settings): void {
     lastScreenshotCheck: s.lastScreenshotCheck,
     sendScreenshots: s.sendScreenshots,
     saveToGallery: s.saveToGallery,
+    transportMode: s.transportMode,
+    btAddress: s.btAddress,
   });
 }
 

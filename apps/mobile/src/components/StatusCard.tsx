@@ -13,7 +13,7 @@ const DASH_PERIOD = 12;
 /** Texto de estado según la conexión. */
 export function statusTitle(s: Pick<ConnState, 'status' | 'peerName' | 'transport' | 'pc'>): string {
   if (s.status === 'connected') {
-    const via = s.transport === 'wifi' ? ' por WiFi' : s.transport === 'usb' ? ' por USB' : '';
+    const via = s.transport === 'wifi' ? ' por WiFi' : s.transport === 'usb' ? ' por USB' : s.transport === 'bluetooth' ? ' por Bluetooth' : '';
     return `Conectado con ${s.peerName || 'el PC'}${via}`;
   }
   if (s.pc?.pairing) return `Emparejando con ${s.pc.name}…`;
