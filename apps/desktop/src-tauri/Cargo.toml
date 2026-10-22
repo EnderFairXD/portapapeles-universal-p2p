@@ -75,3 +75,6 @@ tempfile = "3.27.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 bluer = { version = "0.17.4", features = ["rfcomm", "bluetoothd"] }
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = ["Devices_Bluetooth", "Devices_Bluetooth_Rfcomm", "Devices_Radios", "Foundation", "Networking_Sockets", "Storage_Streams"] }

@@ -17,6 +17,10 @@ use crate::core::Hub;
 mod rfcomm_linux;
 #[cfg(target_os = "linux")]
 use rfcomm_linux::serve_rfcomm;
+#[cfg(windows)]
+mod rfcomm_windows;
+#[cfg(windows)]
+use rfcomm_windows::serve_rfcomm;
 
 /// Cada cuánto se reintenta abrir el listener si no hay adaptador o BlueZ no responde.
 pub const RETRY_INTERVAL: Duration = Duration::from_secs(30);
@@ -75,11 +79,18 @@ fn log(msg: &str) {
     let _ = writeln!(std::io::stderr(), "[Bluetooth] {msg}");
 }
 
-/// Sin soporte de RFCOMM en este sistema (el de Windows llega en su propio módulo).
-#[cfg(not(target_os = "linux"))]
+/// Sin soporte de RFCOMM en este sistema (Linux y Windows tienen su propio módulo).
+#[cfg(not(any(target_os = "linux", windows)))]
 async fn serve_rfcomm(_hub: Hub, report: Report) -> Result<(), String> {
     report(AdapterState::Unavailable);
     Err("RFCOMM no está disponible en este sistema".to_string())
+}
+
+/// Dirección Bluetooth `AA:BB:CC:DD:EE:FF` a partir del entero de 48 bits que da Windows.
+#[cfg(any(windows, test))]
+fn address_from_u64(address: u64) -> String {
+    let b = address.to_be_bytes(); // los dos primeros bytes son 0: la dirección usa 48 bits
+    format!("{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", b[2], b[3], b[4], b[5], b[6], b[7])
 }
 
 /// Repite `serve` con una pausa de `retry` entre intentos; no termina. Un error se registra
@@ -122,6 +133,13 @@ mod tests {
         assert_eq!(AdapterState::from_adapter(None, true), AdapterState::Unavailable);
         assert_eq!(AdapterState::from_adapter(Some(DIR.into()), false), AdapterState::Off { address: DIR.into() });
         assert_eq!(AdapterState::from_adapter(Some(DIR.into()), true), AdapterState::On { address: DIR.into() });
+    }
+
+    #[test]
+    fn direccion_desde_el_entero_de_windows() {
+        assert_eq!(address_from_u64(0x001A_7DDA_7113), DIR);
+        assert_eq!(address_from_u64(0xFFFF_FFFF_FFFF), "FF:FF:FF:FF:FF:FF");
+        assert!(is_bt_address(&address_from_u64(0x0000_0000_000A)));
     }
 
     #[test]
