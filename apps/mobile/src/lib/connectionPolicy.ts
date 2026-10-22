@@ -1,6 +1,8 @@
 // Decisiones puras de ConnectionManager (sin React Native), para poder probarlas.
 import type { TransferUpdate } from '@clipsync/protocol';
 
+import type { Transport } from './transportPolicy';
+
 /** Una sesión que duró menos que esto antes de caer no cuenta como estable. */
 export const STABLE_SESSION_MS = 5000;
 
@@ -136,7 +138,7 @@ export type CloseOutcome = { kind: 'retry'; handshakeFailures: number } | { kind
  */
 export function closeOutcome(
   reason: string,
-  ctx: { tokenSent: boolean; handshakeFailures: number; transport: 'wifi' | 'usb' },
+  ctx: { tokenSent: boolean; handshakeFailures: number; transport: Transport },
 ): CloseOutcome {
   switch (reason) {
     case 'not_paired':

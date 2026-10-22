@@ -29,6 +29,7 @@
       "favicon": "./assets/favicon.png"
     },
     "plugins": [
+      "./plugins/withBluetooth",
       "expo-sharing",
       "expo-router",
       "expo-status-bar",

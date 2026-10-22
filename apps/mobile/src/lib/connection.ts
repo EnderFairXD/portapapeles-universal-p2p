@@ -1,6 +1,5 @@
-// Conexión persistente con el PC: WiFi (mDNS) o USB (adb reverse), con reintentos.
+// Conexión persistente con el PC: WiFi (mDNS), USB (adb reverse) o Bluetooth (RFCOMM), con reintentos.
 import {
-  CONNECT_TIMEOUT_MS,
   DEFAULT_TCP_PORT,
   MAX_CLIP_IMAGE_BYTES,
   MAX_HISTORY,
@@ -32,6 +31,7 @@ import {
   startClipboardWatcher,
   writeClipboard,
 } from './clipboardWatcher';
+import { bluetoothState, hasBluetoothPermission, listBondedDevices, requestBluetoothPermission } from './bluetooth';
 import { resolvedPcs, startDiscovery, stopDiscovery } from './discovery';
 import { loadIdentity } from './identity';
 import { installNativeCrypto } from './nativeCrypto';
@@ -61,14 +61,32 @@ import {
 import { cachedImageSource, discardTemp, keepForHistory, readClipboardImage, saveReceivedImage, setClipboardImage } from './images';
 import { bytesToHex, hexToBytes, pairedPcFromInfo, type PairedPc } from './pairing';
 import { connectCandidates, type PcAddress } from './pcAddress';
+import { connectRfcomm } from './rfcommLink';
 import { pickScreenshots, screenshotMime, type ShotAsset } from './screenshotPolicy';
 import { ensurePhotoAccess, startScreenshotWatcher } from './screenshots';
 import { getDeviceId, loadSettings, updateSettings } from './settings';
 import { SyncKeeper } from './syncKeeper';
 import { connectTcp } from './tcpLink';
+import {
+  BLUETOOTH_ISSUE_MESSAGES,
+  UPGRADE_INTERVAL_MS,
+  allowsTransport,
+  betterTransports,
+  btCoolingDown,
+  candidates,
+  parseBtAddress,
+  shouldUpgrade,
+  transportTimeoutMs,
+  type BluetoothIssue,
+  type PolicyCtx,
+  type Transport,
+  type TransportMode,
+} from './transportPolicy';
+import type { BondedDevice } from '../../modules/clipsync-native';
 
 export type ConnStatus = 'unpaired' | 'searching' | 'connecting' | 'connected';
-export type Transport = 'wifi' | 'usb';
+export type { Transport, TransportMode, BluetoothIssue } from './transportPolicy';
+export type { BondedDevice } from '../../modules/clipsync-native';
 
 export interface HistoryEntry {
   id: string;
@@ -101,6 +119,12 @@ export interface ConnState {
   pc: { name: string; pairing: boolean } | null;
   /** Enviar capturas está activado pero falta el permiso de fotos (denegado o solo algunas fotos). */
   photoAccessMissing: boolean;
+  /** Medio elegido en ajustes (`auto` por defecto). */
+  transportMode: TransportMode;
+  /** Dirección Bluetooth del PC (del QR o elegida de los emparejados); null si no hay. */
+  btAddress: string | null;
+  /** Por qué Bluetooth no se puede usar ahora (null si se puede o no se ha comprobado aún). */
+  bluetoothIssue: BluetoothIssue | null;
 }
 
 /** Resultado de `sendClipboardImageFile`: además, `duplicate` si el PC ya la tiene o ya va de camino. */
@@ -113,6 +137,17 @@ const USB_HOST = '127.0.0.1';
 const CLIP_TOO_LARGE = 'Texto demasiado grande para sincronizar (máx. 1 MB)';
 const PC_UNREACHABLE = 'PC no alcanzable. Comprueba que el móvil y el PC están en la misma red WiFi.';
 const IDENTITY_FAILED = 'No se pudo acceder al almacén seguro del móvil.';
+/** Avisos de modo fijo cuando el único medio elegido no conecta. */
+const USB_UNREACHABLE = 'PC no alcanzable por USB. Conecta el cable y activa la depuración USB.';
+const BT_UNREACHABLE = 'No se pudo conectar por Bluetooth. Comprueba que el PC tiene Bluetooth y ClipSync abiertos.';
+/** Avisos que se borran solos al conectar. */
+const TRANSPORT_ERRORS: ReadonlySet<string> = new Set([
+  PC_UNREACHABLE,
+  IDENTITY_FAILED,
+  USB_UNREACHABLE,
+  BT_UNREACHABLE,
+  ...Object.values(BLUETOOTH_ISSUE_MESSAGES),
+]);
 const CLIP_WRITE_FAILED = 'No se pudo escribir en el portapapeles';
 export const IMAGE_TOO_LARGE = 'Imagen demasiado grande para sincronizar (máx. 20 MB)';
 export const IMAGE_WRITE_FAILED = 'No se pudo poner la imagen en el portapapeles';
@@ -158,9 +193,17 @@ function normalize(u: TransferUpdate): TransferUpdate {
   return out;
 }
 
+/** Enlace ya abierto con el medio por el que se abrió. */
+interface OpenLink {
+  link: Link;
+  transport: Transport;
+  addr: PcAddress | null;
+}
+
 export class ConnectionManager {
+  private readonly initial = loadSettings();
   /** El PC emparejado (settings.json); null hasta escanear su QR. */
-  private pc: PairedPc | null = loadSettings().pc;
+  private pc: PairedPc | null = this.initial.pc;
   /** Cuándo empezó cada transferencia en curso (solo para el registro de velocidad). */
   private transferStarts = new Map<string, number>();
   private state: ConnState = {
@@ -172,6 +215,9 @@ export class ConnectionManager {
     lastError: null,
     pc: pcView(this.pc),
     photoAccessMissing: false,
+    transportMode: this.initial.transportMode,
+    btAddress: this.initial.btAddress,
+    bluetoothIssue: null,
   };
   private readonly listeners = new Set<() => void>();
 
@@ -229,6 +275,14 @@ export class ConnectionManager {
   private handshakeFailures = 0;
   private nextHistoryId = 1;
   private self: PeerInfo | null = null;
+  /** Ya se pidió BLUETOOTH_CONNECT en esta ejecución: no se vuelve a abrir el diálogo solo. */
+  private btPermissionAsked = false;
+  /** Cuándo falló el último intento de Bluetooth (frena el modo Auto; null si no falló). */
+  private btFailedAt: number | null = null;
+  /** Cambio de medio en marcha: enlace nuevo ya abierto que el bucle usará tras cerrar la sesión vieja. */
+  private upgradeLink: OpenLink | null = null;
+  private upgradeTimer: ReturnType<typeof setInterval> | null = null;
+  private upgrading = false;
 
   // --- API pública ---
 
@@ -345,8 +399,11 @@ export class ConnectionManager {
     this.unverified.clear();
     this.dropPendingImage();
     this.handshakeFailures = 0;
-    updateSettings({ pc: this.pc, lastSyncedHash: null, lastImageHash: null, lastPc: null });
-    this.update({ status: 'searching', transport: null, peerName: null, pc: pcView(this.pc), lastError: null });
+    // un QR sin `bt` (PC sin Bluetooth o versión antigua) borra la dirección del PC anterior
+    const btAddress = info.bt ?? null;
+    this.btFailedAt = null;
+    updateSettings({ pc: this.pc, lastSyncedHash: null, lastImageHash: null, lastPc: null, btAddress });
+    this.update({ status: 'searching', transport: null, peerName: null, pc: pcView(this.pc), lastError: null, btAddress });
     if (this.enabled && AppState.currentState !== 'background') this.resume();
   }
 
@@ -356,7 +413,52 @@ export class ConnectionManager {
     this.pc = null;
     this.dropPendingImage();
     this.handshakeFailures = 0;
-    updateSettings({ pc: null });
+    updateSettings({ pc: null, btAddress: null });
+    this.update({ btAddress: null });
+  }
+
+  /** Cambia el medio de conexión. Un medio fijo distinto del actual reinicia la conexión. */
+  setTransportMode(mode: TransportMode): void {
+    if (this.state.transportMode === mode) return;
+    updateSettings({ transportMode: mode });
+    this.update({ transportMode: mode });
+    if (this.state.lastError !== null && TRANSPORT_ERRORS.has(this.state.lastError)) this.setError(null);
+    if (!this.running) return;
+    const current = this.state.transport;
+    if (current !== null && !allowsTransport(mode, current)) this.restart();
+    else this.wake?.(); // sin sesión: reintenta ya con el medio nuevo
+  }
+
+  /** Fija la dirección Bluetooth del PC (de la lista de emparejados) o la borra con null. */
+  setBtAddress(address: string | null): void {
+    const value = parseBtAddress(address);
+    if (this.state.btAddress === value) return;
+    updateSettings({ btAddress: value });
+    this.btFailedAt = null;
+    this.update({ btAddress: value });
+    this.wake?.();
+  }
+
+  /**
+   * Dispositivos Bluetooth ya emparejados en el sistema, para elegir el PC. Pide BLUETOOTH_CONNECT si
+   * falta; sin permiso devuelve [] y avisa en lastError.
+   */
+  async bondedDevices(): Promise<BondedDevice[]> {
+    this.btPermissionAsked = true;
+    if (!(await requestBluetoothPermission())) {
+      this.setError(BLUETOOTH_ISSUE_MESSAGES.no_permission);
+      return [];
+    }
+    return listBondedDevices();
+  }
+
+  /** Pide BLUETOOTH_CONNECT (Android 12+); true si está concedido. */
+  async requestBluetoothPermission(): Promise<boolean> {
+    this.btPermissionAsked = true;
+    const granted = await requestBluetoothPermission();
+    if (granted && this.state.lastError === BLUETOOTH_ISSUE_MESSAGES.no_permission) this.setError(null);
+    if (granted) this.wake?.();
+    return granted;
   }
 
   // --- ciclo de vida ---
@@ -416,6 +518,12 @@ export class ConnectionManager {
     void this.loop(gen);
   }
 
+  /** Corta la conexión y la reabre (cambio de modo con una sesión por un medio que ya no vale). */
+  private restart(): void {
+    this.pause();
+    if (this.enabled && AppState.currentState !== 'background') this.resume();
+  }
+
   private startClipboardWatcher(): void {
     this.stopWatcher ??= startClipboardWatcher({
       onText: (text) => this.onLocalText(text),
@@ -440,6 +548,8 @@ export class ConnectionManager {
     this.stopClipboardWatcher();
     this.stopScreenshots();
     stopDiscovery();
+    this.stopUpgradeWatch();
+    this.dropUpgradeLink();
     // antes de cambiar de generación para que lleguen los 'failed' de las transferencias en
     // curso; el anti-rebote vuelve al último hash confirmado al cerrarse (R29)
     this.session?.close('closed');
@@ -454,7 +564,8 @@ export class ConnectionManager {
     while (gen === this.generation) {
       const pc = this.pc;
       if (!pc) return; // sin emparejar no hay nada que buscar
-      this.update({ status: 'searching', transport: null, peerName: null });
+      // en un cambio de medio el enlace nuevo ya está abierto: no se parpadea a «buscando»
+      if (!this.upgradeLink) this.update({ status: 'searching', transport: null, peerName: null });
       let identity: KeyPair;
       try {
         identity = await loadIdentity();
@@ -481,7 +592,7 @@ export class ConnectionManager {
         this.handshakeFailures = outcome.handshakeFailures;
         // la sesión funcionó el tiempo suficiente: se reintenta enseguida; si cae al poco, se espera
         if (reconnectDelayMs(wasReady, readyForMs, RECONNECT_INTERVAL_MS) === 0) continue;
-      } else if (this.pc?.token != null) {
+      } else if (this.pc?.token != null && loadSettings().transportMode === 'auto') {
         // una vuelta entera sin llegar a ningún candidato con el emparejamiento por completar
         this.setError(PC_UNREACHABLE);
       }
@@ -493,36 +604,177 @@ export class ConnectionManager {
   private unpair(message: string): void {
     this.pc = null;
     this.handshakeFailures = 0;
-    updateSettings({ pc: null });
-    this.pause({ status: 'unpaired', transport: null, peerName: null, pc: null, lastError: message });
+    updateSettings({ pc: null, btAddress: null });
+    this.pause({ status: 'unpaired', transport: null, peerName: null, pc: null, lastError: message, btAddress: null });
   }
 
   /**
-   * WiFi (la última dirección que funcionó, las resueltas por mDNS con la huella de este PC y
-   * las IPs del QR) y, si no, USB por 127.0.0.1. Cada intento tiene su propio plazo de CONNECT_TIMEOUT_MS.
+   * Prueba los medios que dicta `candidates` (Auto: WiFi 2 s → USB 2 s → Bluetooth 8 s; modo fijo:
+   * solo el elegido, con el motivo en lastError si falla). Si hay un enlace nuevo ya abierto por un
+   * cambio de medio, lo usa sin volver a conectar.
    */
-  private async connectOnce(gen: number, pc: PairedPc): Promise<{ link: Link; transport: Transport; addr: PcAddress | null } | null> {
+  private async connectOnce(gen: number, pc: PairedPc): Promise<OpenLink | null> {
+    const handoff = this.upgradeLink;
+    if (handoff) {
+      this.upgradeLink = null;
+      return handoff;
+    }
+    const mode = loadSettings().transportMode;
+    const ctx = await this.policyCtx(loadSettings().btAddress);
+    if (gen !== this.generation) return null;
+    const plan = candidates(mode, ctx);
+    this.update({ bluetoothIssue: plan.issue });
+    if (plan.reason) {
+      this.setError(plan.reason);
+      return null;
+    }
+    let reason: string | null = null;
+    for (const transport of plan.transports) {
+      if (transport === 'bluetooth' && ctx.btPermission !== 'granted') {
+        // primer uso: se pide una sola vez por ejecución; el diálogo no pausa la sesión (withPicker)
+        this.btPermissionAsked = true;
+        const granted = await requestBluetoothPermission();
+        if (gen !== this.generation) return null;
+        if (!granted) {
+          this.update({ bluetoothIssue: 'no_permission' });
+          if (mode !== 'auto') reason = BLUETOOTH_ISSUE_MESSAGES.no_permission;
+          continue;
+        }
+        this.update({ bluetoothIssue: null });
+      }
+      const conn = await this.connectVia(transport, gen, pc, ctx.btAddress, true);
+      if (gen !== this.generation) {
+        conn?.link.close();
+        return null;
+      }
+      if (conn) {
+        if (transport === 'bluetooth') this.btFailedAt = null;
+        return conn;
+      }
+      if (transport === 'bluetooth') this.btFailedAt = Date.now();
+    }
+    if (mode !== 'auto' && reason === null && plan.transports.length > 0) {
+      reason = mode === 'wifi' ? PC_UNREACHABLE : mode === 'usb' ? USB_UNREACHABLE : BT_UNREACHABLE;
+    }
+    if (reason) this.setError(reason);
+    return null;
+  }
+
+  /** Lo que el bucle necesita saber de Bluetooth para elegir los medios. */
+  private async policyCtx(btAddress: string | null): Promise<PolicyCtx> {
+    const btState = bluetoothState();
+    let btPermission: PolicyCtx['btPermission'] = 'granted';
+    // el permiso solo importa si hay a quién conectar y adaptador
+    if (btAddress !== null && btState !== 'unavailable' && !(await hasBluetoothPermission())) {
+      btPermission = this.btPermissionAsked ? 'denied' : 'undetermined';
+    }
+    return { btAddress, btPermission, btState, btCoolingDown: btCoolingDown(this.btFailedAt, Date.now()) };
+  }
+
+  /**
+   * Un solo medio. WiFi: la última dirección que funcionó, las resueltas por mDNS con la huella de
+   * este PC y las IPs del QR. Cada intento tiene su plazo (`transportTimeoutMs`). Con `announce`
+   * el estado pasa a «conectando»; la búsqueda de un medio mejor lo hace en silencio.
+   */
+  private async connectVia(
+    transport: Transport,
+    gen: number,
+    pc: PairedPc,
+    btAddress: string | null,
+    announce: boolean,
+  ): Promise<OpenLink | null> {
+    const timeout = transportTimeoutMs(transport);
+    if (transport === 'usb') {
+      try {
+        return { link: await connectTcp(USB_HOST, DEFAULT_TCP_PORT, timeout), transport, addr: null };
+      } catch {
+        return null;
+      }
+    }
+    if (transport === 'bluetooth') {
+      if (btAddress === null) return null;
+      if (announce) this.update({ status: 'connecting' });
+      try {
+        return { link: await connectRfcomm(btAddress, timeout), transport, addr: null };
+      } catch {
+        return null;
+      }
+    }
     if (this.lastPc === undefined) this.lastPc = loadSettings().lastPc;
     const last = this.lastPc;
     const qr = pc.ips.map((host) => ({ host, port: pc.port }));
     // con una dirección guardada o las del QR no se espera a mDNS: se prueba ya y, si no, lo resuelto
-    const resolved = await resolvedPcs(last || qr.length > 0 ? 0 : CONNECT_TIMEOUT_MS, fingerprint(hexToBytes(pc.publicKeyHex)));
+    const resolved = await resolvedPcs(last || qr.length > 0 ? 0 : timeout, fingerprint(hexToBytes(pc.publicKeyHex)));
     if (gen !== this.generation) return null;
     for (const addr of connectCandidates(last, resolved, qr)) {
-      this.update({ status: 'connecting' });
+      if (announce) this.update({ status: 'connecting' });
       try {
-        const link = await connectTcp(addr.host, addr.port, CONNECT_TIMEOUT_MS);
+        const link = await connectTcp(addr.host, addr.port, timeout);
         // la dirección se recuerda en `ready`, no aquí: una IP del QR podría ser de otro dispositivo
-        return { link, transport: 'wifi', addr }; // si cambió la generación, el bucle lo cierra
+        return { link, transport, addr }; // si cambió la generación, el bucle lo cierra
       } catch {
         // la siguiente
       }
       if (gen !== this.generation) return null;
     }
+    return null;
+  }
+
+  // --- cambio a un medio mejor ---
+
+  /** Hay archivos en cola o en curso, o un compartir sin enviar: no se cambia de medio. */
+  private isBusy(): boolean {
+    return hasPendingWork(this.state.transfers, this.sharePending);
+  }
+
+  private dropUpgradeLink(): void {
+    this.upgradeLink?.link.close();
+    this.upgradeLink = null;
+  }
+
+  private stopUpgradeWatch(): void {
+    if (this.upgradeTimer) clearInterval(this.upgradeTimer);
+    this.upgradeTimer = null;
+  }
+
+  /** Estando en un medio peor (Auto), cada 30 s mira si hay uno mejor. */
+  private startUpgradeWatch(gen: number, session: Session, transport: Transport, pc: PairedPc, readyAt: number): void {
+    this.stopUpgradeWatch();
+    if (betterTransports(transport).length === 0) return;
+    this.upgradeTimer = setInterval(() => {
+      void this.checkUpgrade(gen, session, transport, pc, readyAt);
+    }, UPGRADE_INTERVAL_MS);
+  }
+
+  /**
+   * Abre (solo el enlace, sin sesión) un medio mejor. Si sigue sin haber transferencias, cierra la
+   * sesión vieja y el bucle arranca la nueva sobre ese enlace; así nunca coexisten dos sesiones del
+   * mismo dispositivo (el PC cerraría una con `replaced`). Si ya hay trabajo, descarta el enlace y
+   * lo vuelve a intentar en el siguiente turno.
+   */
+  private async checkUpgrade(gen: number, session: Session, transport: Transport, pc: PairedPc, readyAt: number): Promise<void> {
+    const stale = () => gen !== this.generation || this.session !== session || !this.ready;
+    if (this.upgrading || stale()) return;
+    const mode = loadSettings().transportMode;
+    if (!shouldUpgrade(transport, mode, { connectedForMs: Date.now() - readyAt, busy: this.isBusy() })) return;
+    this.upgrading = true;
     try {
-      return { link: await connectTcp(USB_HOST, DEFAULT_TCP_PORT, CONNECT_TIMEOUT_MS), transport: 'usb', addr: null };
-    } catch {
-      return null;
+      let better: OpenLink | null = null;
+      for (const t of betterTransports(transport)) {
+        better = await this.connectVia(t, gen, pc, null, false);
+        if (better || stale()) break;
+      }
+      if (!better) return;
+      // durante la conexión puede haber empezado una transferencia o cerrarse la sesión
+      if (stale() || this.isBusy()) {
+        better.link.close();
+        return;
+      }
+      this.upgradeLink = better;
+      this.stopUpgradeWatch();
+      session.close('closed');
+    } finally {
+      this.upgrading = false;
     }
   }
 
@@ -575,8 +827,9 @@ export class ConnectionManager {
           this.pc = { ...this.pc, token: null };
           updateSettings({ pc: this.pc });
         }
-        if (this.state.lastError === PC_UNREACHABLE || this.state.lastError === IDENTITY_FAILED) this.setError(null);
+        if (this.state.lastError !== null && TRANSPORT_ERRORS.has(this.state.lastError)) this.setError(null);
         this.update({ status: 'connected', transport, peerName: peer.deviceName, pc: pcView(this.pc) });
+        this.startUpgradeWatch(gen, session, transport, pc, readyAt);
         // regla de inicio de imágenes: la actual del portapapeles, si el PC no la tiene
         void clipboardHasImage().then((image) => {
           if (image && gen === this.generation) this.queueImageCheck();
@@ -596,6 +849,7 @@ export class ConnectionManager {
       session.on('transfer', (u) => this.onTransfer(normalize(u)));
       session.on('closed', (reason) => {
         if (this.session === session) {
+          this.stopUpgradeWatch();
           this.session = null;
           this.ready = false;
         }
