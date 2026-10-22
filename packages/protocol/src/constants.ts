@@ -10,6 +10,9 @@ export const MDNS_SERVICE_DOMAIN = 'local.';
 /** Forma completa, tal como la espera mdns-sd en el escritorio (ServiceInfo::new). */
 export const MDNS_FULL_SERVICE_TYPE = `_${MDNS_SERVICE_NAME}._${MDNS_SERVICE_PROTOCOL}.${MDNS_SERVICE_DOMAIN}`;
 
+/** UUID del servicio RFCOMM (Bluetooth Classic) con el que el PC escucha y el móvil conecta. */
+export const RFCOMM_SERVICE_UUID = 'fd256337-cbf3-43ea-a04f-eed132b4a1d6';
+
 /** Máximo de bytes de datos por trama (u16). */
 export const MAX_FRAME_BYTES = 65535;
 /** Bytes de archivo por trama de datos (48 KiB). */

@@ -13,6 +13,7 @@ const MAX_PREVIEW_CHARS = 600;
 const TRANSPORT_LABEL = new Map([
   ["wifi", "WiFi"],
   ["usb", "USB"],
+  ["bluetooth", "Bluetooth"],
 ]);
 
 /**
@@ -121,6 +122,7 @@ interface View {
   noticeError: HTMLElement;
   noticeInfo: HTMLElement;
   noticePair: HTMLElement;
+  noticeBluetooth: HTMLElement;
   pairing: HTMLElement;
   pairingImg: HTMLImageElement;
   pairingCountdown: HTMLElement;
@@ -175,6 +177,7 @@ function build(root: HTMLElement): View {
   const noticeError = notice("error");
   const noticeInfo = notice("info");
   const noticePair = notice("info");
+  const noticeBluetooth = notice("info");
 
   // Panel del QR: la imagen se pinta como <img>, nunca como HTML.
   const pairingImg = el("img", "pairing-qr");
@@ -222,6 +225,7 @@ function build(root: HTMLElement): View {
     noticeError,
     noticeInfo,
     noticePair,
+    noticeBluetooth,
     pairing,
     pairingImg,
     pairingCountdown,
@@ -281,6 +285,8 @@ function renderNotices(view: View, state: UiState): void {
   setNotice(view.notices, view.noticeServer, state.serverError, true);
   setNotice(view.notices, view.noticeInfo, state.clipNotice, false);
   setNotice(view.notices, view.noticePair, state.pairNotice, false);
+  // sin Bluetooth o apagado: el PC sigue funcionando por WiFi y USB, así que solo informa
+  setNotice(view.notices, view.noticeBluetooth, state.bluetoothNotice, false);
   view.notices.hidden = view.notices.childElementCount === 0;
 }
 

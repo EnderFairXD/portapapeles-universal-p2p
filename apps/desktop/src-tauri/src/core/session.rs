@@ -38,6 +38,7 @@ use crate::protocol::{
 pub enum Transport {
     Wifi,
     Usb,
+    Bluetooth,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq)]

@@ -28,6 +28,18 @@
       "publicKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
       "token": "AAECAwQFBgcICQoLDA0ODw",
       "uri": "clipsync://pair?v=2&pk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&t=AAECAwQFBgcICQoLDA0ODw&n=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx&ip=&port=52847"
+    },
+    {
+      "bt": "00:1A:7D:DA:71:13",
+      "ips": [
+        "192.168.1.5",
+        "10.0.0.2"
+      ],
+      "pcName": "Mi PC",
+      "port": 52847,
+      "publicKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "token": "AAECAwQFBgcICQoLDA0ODw",
+      "uri": "clipsync://pair?v=2&pk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&t=AAECAwQFBgcICQoLDA0ODw&n=Mi%20PC&ip=192.168.1.5,10.0.0.2&port=52847&bt=00:1A:7D:DA:71:13"
     }
   ],
   "fingerprints": [
@@ -153,6 +165,63 @@
       },
       "name": "esquema https",
       "uri": "https://pair?v=2&pk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&t=AAECAwQFBgcICQoLDA0ODw&n=PC%20de%20Pe%C3%B1a%20%F0%9F%92%BB&ip=192.168.1.5&port=52847"
+    },
+    {
+      "expect": {
+        "bt": "00:1A:7D:DA:71:13",
+        "ips": [
+          "192.168.1.5",
+          "10.0.0.2"
+        ],
+        "name": "PC de Peña 💻",
+        "port": 52847,
+        "publicKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "token": "AAECAwQFBgcICQoLDA0ODw"
+      },
+      "name": "bt válido se lee",
+      "uri": "clipsync://pair?v=2&pk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&t=AAECAwQFBgcICQoLDA0ODw&n=PC%20de%20Pe%C3%B1a%20%F0%9F%92%BB&ip=192.168.1.5,10.0.0.2&port=52847&bt=00:1A:7D:DA:71:13"
+    },
+    {
+      "expect": {
+        "ips": [
+          "192.168.1.5",
+          "10.0.0.2"
+        ],
+        "name": "PC de Peña 💻",
+        "port": 52847,
+        "publicKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "token": "AAECAwQFBgcICQoLDA0ODw"
+      },
+      "name": "bt en minúsculas se ignora",
+      "uri": "clipsync://pair?v=2&pk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&t=AAECAwQFBgcICQoLDA0ODw&n=PC%20de%20Pe%C3%B1a%20%F0%9F%92%BB&ip=192.168.1.5,10.0.0.2&port=52847&bt=00:1a:7d:da:71:13"
+    },
+    {
+      "expect": {
+        "ips": [
+          "192.168.1.5",
+          "10.0.0.2"
+        ],
+        "name": "PC de Peña 💻",
+        "port": 52847,
+        "publicKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "token": "AAECAwQFBgcICQoLDA0ODw"
+      },
+      "name": "bt con 5 octetos se ignora",
+      "uri": "clipsync://pair?v=2&pk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&t=AAECAwQFBgcICQoLDA0ODw&n=PC%20de%20Pe%C3%B1a%20%F0%9F%92%BB&ip=192.168.1.5,10.0.0.2&port=52847&bt=00:1A:7D:DA:71"
+    },
+    {
+      "expect": {
+        "ips": [
+          "192.168.1.5",
+          "10.0.0.2"
+        ],
+        "name": "PC de Peña 💻",
+        "port": 52847,
+        "publicKeyHex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        "token": "AAECAwQFBgcICQoLDA0ODw"
+      },
+      "name": "bt con basura se ignora",
+      "uri": "clipsync://pair?v=2&pk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&t=AAECAwQFBgcICQoLDA0ODw&n=PC%20de%20Pe%C3%B1a%20%F0%9F%92%BB&ip=192.168.1.5,10.0.0.2&port=52847&bt=ZZ:1A:7D:DA:71:13"
     }
   ]
 }

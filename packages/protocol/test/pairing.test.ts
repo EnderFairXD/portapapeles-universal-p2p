@@ -9,6 +9,7 @@ interface Expected {
   name: string;
   ips: string[];
   port: number;
+  bt?: string;
 }
 interface ParseVector {
   name: string;
@@ -21,6 +22,7 @@ interface BuildVector {
   pcName: string;
   ips: string[];
   port: number;
+  bt?: string;
   uri: string;
 }
 interface FingerprintVector {
@@ -48,6 +50,7 @@ describe('parsePairingUri con los vectores de Rust', () => {
       expect(info!.name).toBe(v.expect.name);
       expect(info!.ips).toEqual(v.expect.ips);
       expect(info!.port).toBe(v.expect.port);
+      expect(info!.bt).toBe(v.expect.bt);
     });
   }
 
@@ -61,6 +64,7 @@ describe('parsePairingUri con los vectores de Rust', () => {
       expect(info!.name).toBe(Array.from(b.pcName).slice(0, 64).join(''));
       expect(info!.ips).toEqual(b.ips);
       expect(info!.port).toBe(b.port);
+      expect(info!.bt).toBe(b.bt);
     });
   }
 });
@@ -149,6 +153,21 @@ describe('parsePairingUri: casos de borde', () => {
   test('parámetro repetido: gana el último', () => {
     const info = parsePairingUri(`${VALID_URI}&port=1234`);
     expect(info?.port).toBe(1234);
+  });
+
+  test('un QR sin bt sigue valiendo y no trae bt', () => {
+    const info = parsePairingUri(VALID_URI);
+    expect(info).not.toBeNull();
+    expect('bt' in info!).toBe(false);
+  });
+
+  test('bt válido se lee; mal formado se ignora sin invalidar el QR', () => {
+    expect(parsePairingUri(`${VALID_URI}&bt=AA:BB:CC:DD:EE:FF`)?.bt).toBe('AA:BB:CC:DD:EE:FF');
+    for (const bt of ['', 'aa:bb:cc:dd:ee:ff', 'AA:BB:CC:DD:EE', 'AA:BB:CC:DD:EE:FF:00', 'AA-BB-CC-DD-EE-FF', 'GG:BB:CC:DD:EE:FF']) {
+      const info = parsePairingUri(`${VALID_URI}&bt=${bt}`);
+      expect(info).not.toBeNull();
+      expect(info!.bt).toBeUndefined();
+    }
   });
 
   test('sin parámetros → null', () => {

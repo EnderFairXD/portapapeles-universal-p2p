@@ -22,6 +22,7 @@ use crate::core::{
     ClipDecision, ClipboardSync, Direction, Hub, HubEvent, LocalImage, TransferState,
     TransferUpdate, Transport,
 };
+use crate::listeners::AdapterState;
 use crate::protocol::{
     encode_control, ControlMessage, DEFAULT_TCP_PORT, MAX_CLIP_IMAGE_BYTES, MAX_HISTORY,
     PURPOSE_CLIPBOARD,
@@ -105,6 +106,8 @@ pub struct UiState {
     pub clipboard_error: Option<String>,
     pub clip_notice: Option<String>,
     pub server_error: Option<String>,
+    /// Estado del Bluetooth del PC («Este PC no tiene Bluetooth», «Bluetooth apagado»); `None` si funciona.
+    pub bluetooth_notice: Option<String>,
     pub paired: Vec<PairedView>,
     pub pairing: Option<PairingView>,
     pub pair_notice: Option<String>,
@@ -157,6 +160,8 @@ pub struct AppState {
     /// aviso informativo (texto o imagen) y hasta cuándo se muestra
     clip_notice: Option<(String, u64)>,
     server_error: Option<String>,
+    /// último estado del adaptador Bluetooth que comunicó el listener RFCOMM
+    bluetooth: Option<AdapterState>,
     paired: Vec<PairedDevice>,
     pairing: Option<PairingView>,
     /// texto del aviso «emparejado» y hasta cuándo se muestra
@@ -181,6 +186,7 @@ impl AppState {
             clipboard_error: None,
             clip_notice: None,
             server_error: None,
+            bluetooth: None,
             paired: Vec::new(),
             pairing: None,
             pair_notice: None,
@@ -433,6 +439,20 @@ impl AppState {
         });
     }
 
+    /// Guarda el estado del Bluetooth; `true` si cambió.
+    pub fn set_bluetooth(&mut self, estado: AdapterState) -> bool {
+        if self.bluetooth.as_ref() == Some(&estado) {
+            return false;
+        }
+        self.bluetooth = Some(estado);
+        true
+    }
+
+    /// Dirección Bluetooth del PC para el QR, si hay adaptador.
+    pub fn bluetooth_address(&self) -> Option<String> {
+        self.bluetooth.as_ref().and_then(|b| b.qr_address()).map(str::to_string)
+    }
+
     pub fn show_clip_notice(&mut self, now_ms: u64) {
         self.show_notice(CLIP_TOO_LARGE_NOTICE, now_ms);
     }
@@ -484,6 +504,11 @@ impl AppState {
             clipboard_error: self.clipboard_error.clone(),
             clip_notice,
             server_error: self.server_error.clone(),
+            bluetooth_notice: self
+                .bluetooth
+                .as_ref()
+                .and_then(|b| b.notice())
+                .map(str::to_string),
             paired,
             pairing,
             pair_notice,
@@ -569,6 +594,13 @@ impl Ctx {
         self.notify();
     }
 
+    /// Estado del adaptador Bluetooth que comunica el listener RFCOMM (aviso y dirección del QR).
+    pub fn set_bluetooth(&self, estado: AdapterState) {
+        if lock(&self.state).set_bluetooth(estado) {
+            self.notify();
+        }
+    }
+
     pub fn set_clipboard_error(&self, error: Option<String>) {
         if !lock(&self.state).set_clipboard_error(error.clone()) {
             return;
@@ -614,6 +646,7 @@ impl Ctx {
             &self.pc_name,
             &ips,
             DEFAULT_TCP_PORT,
+            st.bluetooth_address().as_deref(),
         );
         let svg = qr_svg(&uri);
         if svg.is_empty() {
@@ -1212,6 +1245,25 @@ mod tests {
         );
         assert!(s.set_clipboard_error(None));
         assert_eq!(s.snapshot(0).clipboard_error, None);
+    }
+
+    #[test]
+    fn aviso_y_direccion_de_bluetooth_siguen_al_adaptador() {
+        let dir = "00:1A:7D:DA:71:13".to_string();
+        let mut s = st();
+        // aún sin noticias del listener: ni aviso ni dirección
+        assert_eq!(s.snapshot(0).bluetooth_notice, None);
+        assert_eq!(s.bluetooth_address(), None);
+        assert!(s.set_bluetooth(AdapterState::Unavailable));
+        assert!(!s.set_bluetooth(AdapterState::Unavailable));
+        assert_eq!(s.snapshot(0).bluetooth_notice.as_deref(), Some("Este PC no tiene Bluetooth"));
+        assert_eq!(s.bluetooth_address(), None);
+        assert!(s.set_bluetooth(AdapterState::Off { address: dir.clone() }));
+        assert_eq!(s.snapshot(0).bluetooth_notice.as_deref(), Some("Bluetooth apagado"));
+        assert_eq!(s.bluetooth_address().as_deref(), Some("00:1A:7D:DA:71:13"));
+        assert!(s.set_bluetooth(AdapterState::On { address: dir }));
+        assert_eq!(s.snapshot(0).bluetooth_notice, None);
+        assert_eq!(s.bluetooth_address().as_deref(), Some("00:1A:7D:DA:71:13"));
     }
 
     #[test]

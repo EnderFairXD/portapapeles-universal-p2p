@@ -16,6 +16,9 @@ pub const DEFAULT_TCP_PORT: u16 = 52847;
 /// Forma completa del servicio mDNS, tal como la espera mdns-sd (ServiceInfo::new).
 pub const MDNS_FULL_SERVICE_TYPE: &str = "_clipsync._tcp.local.";
 
+/// UUID del servicio RFCOMM (Bluetooth Classic) con el que el PC escucha y el móvil conecta.
+pub const RFCOMM_SERVICE_UUID: &str = "fd256337-cbf3-43ea-a04f-eed132b4a1d6";
+
 /// Máximo de bytes de datos por trama (u16).
 pub const MAX_FRAME_BYTES: usize = 65535;
 /// Etiqueta de autenticación Poly1305 que Noise añade a cada mensaje cifrado.
@@ -71,6 +74,7 @@ mod tests {
         assert_eq!(PROTOCOL_VERSION, 2);
         assert_eq!(DEFAULT_TCP_PORT, 52847);
         assert_eq!(MDNS_FULL_SERVICE_TYPE, "_clipsync._tcp.local.");
+        assert_eq!(RFCOMM_SERVICE_UUID, "fd256337-cbf3-43ea-a04f-eed132b4a1d6");
         assert_eq!(MAX_FRAME_BYTES, 65535);
         assert_eq!(NOISE_TAG_BYTES, 16);
         assert_eq!(MAX_PAYLOAD_BYTES, MAX_FRAME_BYTES - NOISE_TAG_BYTES);
