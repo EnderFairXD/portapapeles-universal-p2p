@@ -151,8 +151,10 @@ export function closeOutcome(
     case 'handshake_failed': {
       // Con `adb reverse` activo, 127.0.0.1 siempre acepta la conexión (la acepta adbd) y la cierra
       // si la app del PC no está escuchando: eso no prueba que el PC sea alcanzable, así que por
-      // USB un handshake fallido no cuenta (D8: solo «con el PC alcanzable»).
-      if (ctx.transport === 'usb') return { kind: 'retry', handshakeFailures: ctx.handshakeFailures };
+      // USB un handshake fallido no cuenta (D8: solo «con el PC alcanzable»). Por Bluetooth tampoco:
+      // fuera de alcance, con el PC suspendido o rechazando la autenticación, el enlace RFCOMM cae
+      // en el handshake sin que el emparejamiento esté roto. Solo WiFi cuenta.
+      if (ctx.transport !== 'wifi') return { kind: 'retry', handshakeFailures: ctx.handshakeFailures };
       const failures = ctx.handshakeFailures + 1;
       return failures >= MAX_HANDSHAKE_FAILURES
         ? { kind: 'unpair', message: 'No se pudo verificar el PC. Vuelve a emparejar.' }

@@ -3,6 +3,7 @@ package expo.modules.clipsyncnative
 import android.Manifest
 import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothSocket
 import android.content.Context
@@ -108,6 +109,7 @@ class ClipsyncNativeModule : Module() {
     AsyncFunction("connect") { address: String, uuid: String, timeoutMs: Int, promise: Promise ->
       Thread({
         var socket: BluetoothSocket? = null
+        var registeredId: Int? = null
         val timedOut = AtomicBoolean(false)
         try {
           if (!hasConnectPermission()) {
@@ -124,7 +126,13 @@ class ClipsyncNativeModule : Module() {
             promise.reject("ERR_BT_ADDRESS", "Dirección Bluetooth no válida", null)
             return@Thread
           }
-          val s = a.getRemoteDevice(addr).createRfcommSocketToServiceRecord(UUID.fromString(uuid))
+          // un dispositivo sin vincular haría que Android abriese su diálogo de emparejar al conectar
+          val device = a.getRemoteDevice(addr)
+          if (device.bondState != BluetoothDevice.BOND_BONDED) {
+            promise.reject("ERR_BT_NOT_BONDED", "El dispositivo no está vinculado en los ajustes de Bluetooth", null)
+            return@Thread
+          }
+          val s = device.createRfcommSocketToServiceRecord(UUID.fromString(uuid))
           socket = s
           // connect() no tiene plazo propio: cerrar el socket desde otro hilo lo interrumpe
           val timer = watchdog.schedule({
@@ -138,6 +146,7 @@ class ClipsyncNativeModule : Module() {
           }
           if (timedOut.get()) throw IOException("Tiempo de conexión agotado")
           val id = nextId.getAndIncrement()
+          registeredId = id
           connections[id] = RfcommConnection(
             id, s, watchdog,
             emitData = { cid, b64 -> sendEvent("onData", mapOf("id" to cid, "base64" to b64)) },
@@ -149,8 +158,11 @@ class ClipsyncNativeModule : Module() {
           promise.resolve(id)
         } catch (e: Throwable) {
           try { socket?.close() } catch (_: Throwable) {}
+          // si ya se registró la conexión (p. ej. falló promise.resolve), se cierra para no dejarla colgada
+          registeredId?.let { connections.remove(it)?.abort() }
           val message = if (timedOut.get()) "Tiempo de conexión agotado" else e.message?.takeIf { it.isNotBlank() } ?: e.javaClass.simpleName
-          promise.reject("ERR_BT_CONNECT", message, e)
+          // un fallo al rechazar no debe escapar del hilo
+          try { promise.reject("ERR_BT_CONNECT", message, e) } catch (_: Throwable) {}
         }
       }, "clipsync-rfcomm-connect").apply { isDaemon = true }.start()
     }

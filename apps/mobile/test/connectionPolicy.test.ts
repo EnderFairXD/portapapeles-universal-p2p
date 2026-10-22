@@ -296,6 +296,9 @@ describe('closeOutcome', () => {
     // por USB (adb reverse) el PC puede no estar: no cuenta y nunca desempareja
     ['handshake_failed', { tokenSent: false, handshakeFailures: 2, transport: 'usb' }, { kind: 'retry', handshakeFailures: 2 }],
     ['handshake_failed', { tokenSent: true, handshakeFailures: 0, transport: 'usb' }, { kind: 'retry', handshakeFailures: 0 }],
+    // por Bluetooth tampoco: fuera de alcance, PC suspendido o autenticación rechazada no rompen el emparejamiento
+    ['handshake_failed', { tokenSent: false, handshakeFailures: 2, transport: 'bluetooth' }, { kind: 'retry', handshakeFailures: 2 }],
+    ['handshake_failed', { tokenSent: true, handshakeFailures: 0, transport: 'bluetooth' }, { kind: 'retry', handshakeFailures: 0 }],
     ['link_closed', { tokenSent: false, handshakeFailures: 2, transport: 'wifi' }, { kind: 'retry', handshakeFailures: 2 }],
     ['heartbeat_timeout', { tokenSent: true, handshakeFailures: 0, transport: 'usb' }, { kind: 'retry', handshakeFailures: 0 }],
     ['protocol_error', { tokenSent: false, handshakeFailures: 1, transport: 'wifi' }, { kind: 'retry', handshakeFailures: 1 }],

@@ -139,6 +139,8 @@ const PC_UNREACHABLE = 'PC no alcanzable. Comprueba que el móvil y el PC están
 const IDENTITY_FAILED = 'No se pudo acceder al almacén seguro del móvil.';
 /** Avisos de modo fijo cuando el único medio elegido no conecta. */
 const USB_UNREACHABLE = 'PC no alcanzable por USB. Conecta el cable y activa la depuración USB.';
+/** Cuánto vale la consulta de dispositivos vinculados (el usuario puede vincular desde los ajustes). */
+const BONDED_CACHE_MS = 10_000;
 const BT_UNREACHABLE = 'No se pudo conectar por Bluetooth. Comprueba que el PC tiene Bluetooth y ClipSync abiertos.';
 /** Avisos que se borran solos al conectar. */
 const TRANSPORT_ERRORS: ReadonlySet<string> = new Set([
@@ -277,6 +279,8 @@ export class ConnectionManager {
   private self: PeerInfo | null = null;
   /** Ya se pidió BLUETOOTH_CONNECT en esta ejecución: no se vuelve a abrir el diálogo solo. */
   private btPermissionAsked = false;
+  /** Último resultado de «¿está vinculada la dirección?», para no consultarlo en cada vuelta del bucle. */
+  private bondedCache: { address: string; bonded: boolean; at: number } | null = null;
   /** Cuándo falló el último intento de Bluetooth (frena el modo Auto; null si no falló). */
   private btFailedAt: number | null = null;
   /** Cambio de medio en marcha: enlace nuevo ya abierto que el bucle usará tras cerrar la sesión vieja. */
@@ -443,6 +447,7 @@ export class ConnectionManager {
     if (this.state.btAddress === value) return;
     updateSettings({ btAddress: value });
     this.btFailedAt = null;
+    this.bondedCache = null;
     this.update({ btAddress: value });
     this.wake?.();
   }
@@ -677,7 +682,26 @@ export class ConnectionManager {
     if (btAddress !== null && btState !== 'unavailable' && !(await hasBluetoothPermission())) {
       btPermission = this.btPermissionAsked ? 'denied' : 'undetermined';
     }
-    return { btAddress, btPermission, btState, btCoolingDown: btCoolingDown(this.btFailedAt, Date.now()) };
+    const btBonded = btAddress === null || this.isBonded(btAddress, btState, btPermission);
+    return { btAddress, btBonded, btPermission, btState, btCoolingDown: btCoolingDown(this.btFailedAt, Date.now()) };
+  }
+
+  /**
+   * ¿Está la dirección entre los dispositivos vinculados? Conectar a una no vinculada abre el diálogo
+   * de emparejar de Android, así que no se intenta. Se consulta como mucho una vez por
+   * `BONDED_CACHE_MS` y por dirección. Sin permiso o con Bluetooth apagado no se puede saber:
+   * se da por vinculada (ya lo avisan el permiso o el estado) y el módulo nativo lo vuelve a comprobar.
+   */
+  private isBonded(btAddress: string, btState: PolicyCtx['btState'], btPermission: PolicyCtx['btPermission']): boolean {
+    if (btState !== 'on' || btPermission !== 'granted') return true;
+    const now = Date.now();
+    const cached = this.bondedCache;
+    if (cached && cached.address === btAddress && now - cached.at >= 0 && now - cached.at < BONDED_CACHE_MS) {
+      return cached.bonded;
+    }
+    const bonded = listBondedDevices().some((d) => d.address.toUpperCase() === btAddress);
+    this.bondedCache = { address: btAddress, bonded, at: now };
+    return bonded;
   }
 
   /**

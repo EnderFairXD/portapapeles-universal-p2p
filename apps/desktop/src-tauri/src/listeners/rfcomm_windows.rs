@@ -114,8 +114,16 @@ fn abrir_servicio() -> Result<Servicio, String> {
     Ok(Servicio { provider, _listener: listener, conexiones })
 }
 
-/// Bombea del socket al flujo de la sesión hasta que uno de los dos se cierre.
+/// Bombea del socket al flujo de la sesión hasta que uno de los dos se cierre. Al terminar, por
+/// cualquier camino, cierra el flujo con `shutdown` para que la sesión vea el fin (EOF).
 fn bombear_entrada(socket: &StreamSocket, mut destino: WriteHalf<DuplexStream>, rt: &Handle) -> windows::core::Result<()> {
+    let resultado = bombear_entrada_datos(socket, &mut destino, rt);
+    // soltar el `WriteHalf` no cierra el `duplex` (queda el otro medio de `split`): hay que cerrarlo
+    let _ = rt.block_on(destino.shutdown());
+    resultado
+}
+
+fn bombear_entrada_datos(socket: &StreamSocket, destino: &mut WriteHalf<DuplexStream>, rt: &Handle) -> windows::core::Result<()> {
     let reader = DataReader::CreateDataReader(&socket.InputStream()?)?;
     // con `Partial`, `LoadAsync` vuelve en cuanto hay algún dato en vez de esperar a llenar el trozo
     reader.SetInputStreamOptions(InputStreamOptions::Partial)?;
@@ -160,8 +168,8 @@ fn entregar(hub: &Hub, socket: StreamSocket, rt: &Handle) {
         if let Err(e) = bombear_entrada(&socket_entrada, escritura, &rt_entrada) {
             super::log(&format!("lectura del socket RFCOMM: {e}"));
         }
-        // al soltar `escritura` la sesión ve el fin del flujo; el socket se cierra para que el
-        // hilo de salida no se quede esperando
+        // `bombear_entrada` ya cerró el flujo (la sesión ve el EOF); el socket se cierra para que
+        // el hilo de salida no se quede esperando
         let _ = socket_entrada.Close();
     });
     if let Err(e) = entrada {
