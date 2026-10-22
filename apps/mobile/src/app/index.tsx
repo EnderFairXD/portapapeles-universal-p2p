@@ -13,7 +13,7 @@ import { TransferList } from '@/components/TransferList';
 import { Welcome } from '@/components/Welcome';
 import { connection, type HistoryEntry } from '@/lib/connection';
 import { filesLabel } from '@/lib/format';
-import { pickAndSend } from '@/lib/sendFlow';
+import { pickAndSend, pickImageAndSend } from '@/lib/sendFlow';
 import { useConnection } from '@/lib/useConnection';
 import { colors, radius, TOUCH, type } from '@/theme';
 
@@ -34,14 +34,16 @@ export default function Home() {
   const connected = state.status === 'connected';
   const waiting = hasShareIntent && !connected ? (shareIntent.files?.length ?? 0) : 0;
 
-  const onPick = useCallback(async () => {
+  const runPicker = useCallback(async (pick: () => Promise<void>) => {
     setPicking(true);
     try {
-      await pickAndSend();
+      await pick();
     } finally {
       setPicking(false);
     }
   }, []);
+  const onPick = useCallback(() => runPicker(pickAndSend), [runPicker]);
+  const onPickImage = useCallback(() => runPicker(pickImageAndSend), [runPicker]);
 
   const onCopy = useCallback(async (entry: HistoryEntry) => {
     try {
@@ -107,6 +109,19 @@ export default function Home() {
           <Text style={styles.sendText}>{connected ? 'Enviar archivo' : 'Abre ClipSync en el PC'}</Text>
         </Pressable>
 
+        {connected && (
+          <Pressable
+            style={({ pressed }) => [styles.send, styles.sendSecondary, pressed && styles.sendPressed, picking && styles.sendDisabled]}
+            onPress={onPickImage}
+            disabled={picking}
+            accessibilityRole="button"
+            accessibilityLabel="Enviar imagen de la galería al portapapeles del PC"
+            accessibilityState={{ disabled: picking }}
+          >
+            <Text style={styles.sendText}>Enviar imagen</Text>
+          </Pressable>
+        )}
+
         <TransferList transfers={state.transfers} onCancel={onCancel} />
         <HistoryList history={state.history} onCopy={onCopy} />
       </ScrollView>
@@ -131,6 +146,7 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     backgroundColor: colors.indigoDeep,
   },
+  sendSecondary: { marginTop: 12, backgroundColor: colors.surfaceAlt, borderWidth: 1, borderColor: colors.border },
   sendPressed: { backgroundColor: colors.indigo },
   sendDisabled: { opacity: 0.45 },
   sendText: { ...type.body, color: '#fff', fontWeight: '700' },
