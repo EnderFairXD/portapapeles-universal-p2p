@@ -50,6 +50,15 @@ export function screenshotMime(filename: string | null | undefined): 'image/png'
   return null;
 }
 
+/** Imagen elegida en la galería: su mime si el PC lo admite (exacto, como el protocolo); si no, por la extensión. */
+export function pickedImageMime(
+  mimeType: string | null | undefined,
+  fileName: string | null | undefined,
+): 'image/png' | 'image/jpeg' | 'image/webp' | null {
+  if (mimeType === 'image/png' || mimeType === 'image/jpeg' || mimeType === 'image/webp') return mimeType;
+  return screenshotMime(fileName);
+}
+
 /** Acceso a las fotos: `partial` (solo las elegidas) no sirve para ver las capturas nuevas. */
 export function photoAccess(p: { granted: boolean; accessPrivileges?: string }): 'full' | 'partial' | 'none' {
   if (!p.granted) return 'none';

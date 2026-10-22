@@ -1,13 +1,22 @@
 // Envío de archivos desde la interfaz: abre el origen y lo encola, avisando de los fallos.
 import { connection } from './connection';
 import { INVALID_FILE_SIZE_MESSAGE, sendFailureMessage } from './connectionPolicy';
-import { FileTooLargeError, fileSourceFromUri, pickFileSource, UnknownFileSizeError } from './files';
+import {
+  FileTooLargeError,
+  fileSourceFromUri,
+  pickFileSource,
+  pickImageSource,
+  UnknownFileSizeError,
+  UnsupportedImageError,
+} from './files';
 
 const OPEN_FAILED = 'No se pudo abrir el archivo';
 
 /** Solo se enseñan los mensajes propios; el resto de errores no (pueden traer rutas o texto interno). */
 function openErrorText(e: unknown): string {
-  return e instanceof FileTooLargeError || e instanceof UnknownFileSizeError ? e.message : OPEN_FAILED;
+  return e instanceof FileTooLargeError || e instanceof UnknownFileSizeError || e instanceof UnsupportedImageError
+    ? e.message
+    : OPEN_FAILED;
 }
 
 /** Botón «Enviar archivo»: abre el selector y envía lo elegido. */
@@ -17,6 +26,24 @@ export async function pickAndSend(): Promise<void> {
     if (!src) return;
     // un rechazo ya dejó su propio aviso en lastError: no se pisa con «sin conexión»
     const failure = sendFailureMessage(connection.sendFile(src));
+    if (failure) connection.reportError(failure);
+  } catch (e) {
+    connection.reportError(openErrorText(e));
+  }
+}
+
+/**
+ * Botón «Enviar imagen»: elige una foto de la galería y la manda al portapapeles del PC,
+ * como una captura (también queda en ~/Imágenes/ClipSync).
+ */
+export async function pickImageAndSend(): Promise<void> {
+  try {
+    const picked = await pickImageSource();
+    if (!picked) return;
+    const result = connection.sendClipboardImageFile(picked.src, undefined, picked.uri);
+    // sin hash no hay 'duplicate'; un rechazo ya dejó su aviso (p. ej. más de 20 MB)
+    if (result.ok || result.reason === 'duplicate') return;
+    const failure = sendFailureMessage(result);
     if (failure) connection.reportError(failure);
   } catch (e) {
     connection.reportError(openErrorText(e));

@@ -3,10 +3,12 @@ import { PURPOSE_CLIPBOARD, type FileMeta, type FileSink, type FileSource } from
 import * as Crypto from 'expo-crypto';
 import * as DocumentPicker from 'expo-document-picker';
 import { Directory, File, FileMode, Paths } from 'expo-file-system';
+import * as ImagePicker from 'expo-image-picker';
 
 import { sanitizeFileName } from './fileName';
 import { imageExtension } from './imagePolicy';
 import { createPickerGuard } from './pickerGuard';
+import { pickedImageMime } from './screenshotPolicy';
 import { loadSettings, saveSettings } from './settings';
 
 /** Techo de cordura para lo que se envía desde el móvil. */
@@ -141,6 +143,29 @@ export async function pickFileSource(): Promise<FileSource | null> {
   const asset = result.assets[0];
   if (!asset) return null;
   return fileSourceFromUri(asset.uri, asset.name, asset.mimeType ?? '', asset.size ?? -1);
+}
+
+export class UnsupportedImageError extends Error {
+  constructor() {
+    super('Formato de imagen no compatible');
+  }
+}
+
+/**
+ * Botón «Enviar imagen»: selector de fotos del sistema (en Android 13+ no pide permiso).
+ * Una sola imagen: solo cabe una imagen de portapapeles en cola por PC.
+ */
+export async function pickImageSource(): Promise<{ src: FileSource; uri: string } | null> {
+  const result = await withPicker(() =>
+    ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsMultipleSelection: false, quality: 1, exif: false }),
+  );
+  if (result.canceled) return null;
+  const asset = result.assets[0];
+  if (!asset) return null;
+  const mime = pickedImageMime(asset.mimeType, asset.fileName ?? asset.uri);
+  if (!mime) throw new UnsupportedImageError();
+  const name = asset.fileName || `imagen.${imageExtension(mime)}`;
+  return { src: fileSourceFromUri(asset.uri, name, mime, asset.fileSize ?? -1), uri: asset.uri };
 }
 
 // --- recepción ---
