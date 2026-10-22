@@ -70,10 +70,10 @@ import { connectTcp } from './tcpLink';
 import {
   BLUETOOTH_ISSUE_MESSAGES,
   UPGRADE_INTERVAL_MS,
-  allowsTransport,
   betterTransports,
   btCoolingDown,
   candidates,
+  modeChangeAction,
   parseBtAddress,
   shouldUpgrade,
   transportTimeoutMs,
@@ -424,9 +424,17 @@ export class ConnectionManager {
     this.update({ transportMode: mode });
     if (this.state.lastError !== null && TRANSPORT_ERRORS.has(this.state.lastError)) this.setError(null);
     if (!this.running) return;
-    const current = this.state.transport;
-    if (current !== null && !allowsTransport(mode, current)) this.restart();
-    else this.wake?.(); // sin sesión: reintenta ya con el medio nuevo
+    // con transferencias en curso o en cola no se corta la sesión: el cambio espera (R2) y
+    // `applyPendingMode` lo aplica al terminar; la interfaz lo deduce con `modeChangePending`
+    const action = modeChangeAction(mode, this.state.transport, this.isBusy());
+    if (action === 'restart') this.restart();
+    else if (action === 'wake') this.wake?.(); // sin sesión: reintenta ya con el medio nuevo
+  }
+
+  /** Aplica un cambio de modo aplazado en cuanto no queda nada pendiente. */
+  private applyPendingMode(): void {
+    if (!this.running) return;
+    if (modeChangeAction(this.state.transportMode, this.state.transport, this.isBusy()) === 'restart') this.restart();
   }
 
   /** Fija la dirección Bluetooth del PC (de la lista de emparejados) o la borra con null. */
@@ -481,6 +489,7 @@ export class ConnectionManager {
    */
   private applyBackground(appState: string = AppState.currentState): void {
     if (!this.enabled) return;
+    this.applyPendingMode();
     const busy = hasPendingWork(this.state.transfers, this.sharePending);
     const decision = backgroundDecision({ appState, pickerOpen: isPickerOpen(), busy });
     if (decision === 'pause') this.pause();

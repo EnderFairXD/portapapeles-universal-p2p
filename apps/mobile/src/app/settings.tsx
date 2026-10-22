@@ -5,11 +5,12 @@ import { useState } from 'react';
 import { Alert, Linking, Pressable, StyleSheet, Switch, Text, View } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
-import { PHOTO_ACCESS_NOTICE } from '@/components/StatusCard';
-import { connection } from '@/lib/connection';
+import { MODE_CHANGE_NOTICE, PHOTO_ACCESS_NOTICE } from '@/components/StatusCard';
+import { connection, type BondedDevice } from '@/lib/connection';
 import { chooseReceiveDir } from '@/lib/files';
 import { readableDir } from '@/lib/format';
 import { loadSettings, updateSettings } from '@/lib/settings';
+import { BLUETOOTH_ISSUE_MESSAGES, modeChangePending, type TransportMode } from '@/lib/transportPolicy';
 import { useConnection } from '@/lib/useConnection';
 import { colors, radius, TOUCH, type } from '@/theme';
 
@@ -40,6 +41,48 @@ function ToggleRow({ title, hint, value, onChange }: { title: string; hint: stri
   );
 }
 
+const MODE_OPTIONS: { mode: TransportMode; label: string }[] = [
+  { mode: 'auto', label: 'Auto' },
+  { mode: 'wifi', label: 'WiFi' },
+  { mode: 'usb', label: 'USB' },
+  { mode: 'bluetooth', label: 'Bluetooth' },
+];
+
+const MODE_HINTS: Record<TransportMode, string> = {
+  auto: 'Prueba WiFi, USB y Bluetooth, por ese orden, y cambia al mejor cuando puede.',
+  wifi: 'Solo se conecta por la red WiFi.',
+  usb: 'Solo se conecta por cable USB.',
+  bluetooth: 'Solo se conecta por Bluetooth.',
+};
+
+/** Selector de una opción entre varias, en una fila. */
+function Segmented({ label, options, value, onChange }: {
+  label: string;
+  options: { mode: TransportMode; label: string }[];
+  value: TransportMode;
+  onChange: (mode: TransportMode) => void;
+}) {
+  return (
+    <View style={styles.segmented} accessibilityRole="radiogroup" accessibilityLabel={label}>
+      {options.map((o) => {
+        const selected = o.mode === value;
+        return (
+          <Pressable
+            key={o.mode}
+            style={[styles.segment, selected && styles.segmentOn]}
+            onPress={() => onChange(o.mode)}
+            accessibilityRole="radio"
+            accessibilityLabel={o.label}
+            accessibilityState={{ checked: selected }}
+          >
+            <Text style={[styles.segmentText, selected && styles.segmentTextOn]}>{o.label}</Text>
+          </Pressable>
+        );
+      })}
+    </View>
+  );
+}
+
 export default function Settings() {
   const router = useRouter();
   const insets = useSafeAreaInsets();
@@ -58,6 +101,34 @@ export default function Settings() {
   const toggleGallery = (value: boolean) => {
     setSaveGallery(value);
     updateSettings({ saveToGallery: value }); // se lee en cada imagen recibida
+  };
+
+  // lista de dispositivos Bluetooth emparejados en el sistema (null: aún no se ha abierto)
+  const [bonded, setBonded] = useState<BondedDevice[] | null>(null);
+  const [listing, setListing] = useState(false);
+  const [btDenied, setBtDenied] = useState(false);
+  const modePending = modeChangePending(conn.transportMode, conn.transport);
+  const permissionMissing = btDenied || conn.bluetoothIssue === 'no_permission';
+
+  const chooseMode = (mode: TransportMode) => connection.setTransportMode(mode);
+
+  const openBonded = async () => {
+    if (listing) return;
+    setListing(true);
+    try {
+      const list = await connection.bondedDevices();
+      // sin lista y con el aviso de permiso puesto, es que se denegó el permiso
+      setBtDenied(list.length === 0 && connection.getState().lastError === BLUETOOTH_ISSUE_MESSAGES.no_permission);
+      setBonded(list);
+    } finally {
+      setListing(false);
+    }
+  };
+
+  const pickDevice = (d: BondedDevice) => {
+    connection.setBtAddress(d.address);
+    setBonded(null);
+    setBtDenied(false);
   };
 
   const forget = () => {
@@ -145,6 +216,70 @@ export default function Settings() {
         </View>
 
         <View style={[styles.card, styles.cardTop]}>
+          <Text style={styles.label}>Medio de conexión</Text>
+          <Segmented label="Medio de conexión" options={MODE_OPTIONS} value={conn.transportMode} onChange={chooseMode} />
+          <Text style={styles.hint}>{MODE_HINTS[conn.transportMode]}</Text>
+          {modePending && (
+            <Text style={[styles.hint, styles.pendingNote]} accessibilityLiveRegion="polite">
+              {MODE_CHANGE_NOTICE}
+            </Text>
+          )}
+        </View>
+
+        <View style={[styles.card, styles.cardTop]}>
+          <Text style={styles.label}>PC por Bluetooth</Text>
+          <Text style={[styles.value, !conn.btAddress && styles.valueEmpty]} numberOfLines={1}>
+            {conn.btAddress ?? 'Sin elegir'}
+          </Text>
+          <Pressable
+            style={({ pressed }) => [styles.change, styles.changeTop, pressed && styles.changePressed, listing && styles.changeBusy]}
+            onPress={openBonded}
+            disabled={listing}
+            accessibilityRole="button"
+            accessibilityLabel="Elegir el PC entre los dispositivos Bluetooth emparejados"
+            accessibilityState={{ disabled: listing }}
+          >
+            <Text style={styles.changeText}>Elegir</Text>
+          </Pressable>
+          {bonded && bonded.length > 0 && (
+            <View style={styles.devices}>
+              {bonded.map((d) => (
+                <Pressable
+                  key={d.address}
+                  style={({ pressed }) => [styles.device, pressed && styles.changePressed]}
+                  onPress={() => pickDevice(d)}
+                  accessibilityRole="button"
+                  accessibilityLabel={`Usar ${d.name || d.address}`}
+                >
+                  <Text style={styles.value} numberOfLines={1}>
+                    {d.name || 'Sin nombre'}
+                  </Text>
+                  <Text style={styles.hint}>{d.address}</Text>
+                </Pressable>
+              ))}
+            </View>
+          )}
+          {bonded && bonded.length === 0 && !permissionMissing && (
+            <Text style={styles.hint}>{BLUETOOTH_ISSUE_MESSAGES.no_address}</Text>
+          )}
+          {permissionMissing && (
+            <View style={styles.permission}>
+              <Text style={styles.hint}>{BLUETOOTH_ISSUE_MESSAGES.no_permission}</Text>
+              <Pressable
+                style={({ pressed }) => [styles.change, styles.changeTop, pressed && styles.changePressed]}
+                onPress={() => {
+                  Linking.openSettings().catch(() => {});
+                }}
+                accessibilityRole="button"
+                accessibilityLabel="Abrir ajustes de Android para permitir el acceso a Bluetooth"
+              >
+                <Text style={styles.changeText}>Abrir ajustes</Text>
+              </Pressable>
+            </View>
+          )}
+        </View>
+
+        <View style={[styles.card, styles.cardTop]}>
           <Text style={styles.label}>Imágenes y capturas</Text>
           <ToggleRow
             title="Enviar capturas automáticamente"
@@ -222,5 +357,31 @@ const styles = StyleSheet.create({
   changePressed: { backgroundColor: colors.surfaceAlt },
   changeBusy: { opacity: 0.45 },
   changeText: { ...type.body, color: colors.text, fontWeight: '600' },
+  segmented: {
+    flexDirection: 'row',
+    marginTop: 10,
+    padding: 3,
+    gap: 3,
+    borderRadius: radius.md,
+    backgroundColor: colors.bg,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  segment: { flex: 1, minHeight: TOUCH, alignItems: 'center', justifyContent: 'center', borderRadius: radius.sm },
+  segmentOn: { backgroundColor: colors.indigoDeep },
+  segmentText: { ...type.small, color: colors.textMuted, fontWeight: '600' },
+  segmentTextOn: { color: '#fff' },
+  pendingNote: { color: colors.outFg, fontWeight: '600' },
+  devices: { marginTop: 10, gap: 6 },
+  device: {
+    minHeight: TOUCH,
+    justifyContent: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 8,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.surfaceAlt,
+  },
   version: { flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 4, marginTop: 20 },
 });

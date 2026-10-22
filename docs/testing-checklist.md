@@ -156,3 +156,19 @@ Se prueba por WiFi y otra vez por USB, con el móvil emparejado. Android 10 o an
 - [ ] ajustes del móvil: «Enviar capturas automáticamente» y «Guardar imágenes recibidas en la
   galería» (se conservan al cerrar la app y se aplican sin reiniciar)
 - [ ] CPU del PC con una captura 4K en el portapapeles (< 5 % de un núcleo)
+
+## Bluetooth (fase 4)
+
+Implementado pero sin probar con hardware. Hace falta un PC con adaptador Bluetooth y el móvil
+emparejado con él en los ajustes del sistema.
+
+- [ ] PC sin adaptador → aviso, y WiFi/USB siguen
+- [ ] emparejar en el sistema y conectar con el WiFi apagado
+- [ ] texto y una captura por Bluetooth
+- [ ] archivo de 5 MB, anotando la velocidad
+- [ ] encender el WiFi con la sesión por Bluetooth → cambia a WiFi en ≤ 30 s sin cortar un archivo
+- [ ] modo fijo Bluetooth
+- [ ] permiso denegado
+- [ ] conectar por Bluetooth con el PC que exige autenticación (si falla, anotar el error)
+- [ ] cambiar de medio en Ajustes con un archivo en curso: no se corta, sale «Se cambiará al terminar
+  la transferencia» y el cambio se aplica al terminar
