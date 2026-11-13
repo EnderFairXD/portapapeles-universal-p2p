@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  js:
+    name: Protocolo, escritorio y móvil (TypeScript)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      # Usa la versión de pnpm fijada en "packageManager" del package.json raíz.
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Instalar dependencias
+        run: pnpm install --frozen-lockfile
+
+      - name: Tests del protocolo
+        run: pnpm --filter @clipsync/protocol test
+
+      - name: Tests de escritorio
+        run: pnpm --filter @clipsync/desktop test
+
+      - name: Tests del móvil
+        run: pnpm --filter @clipsync/mobile test
+
+      - name: Tipos de escritorio
+        run: pnpm --filter @clipsync/desktop exec tsc --noEmit
+
+      - name: Tipos del móvil
+        run: pnpm --filter @clipsync/mobile exec tsc --noEmit
+
+      - name: Lint del móvil
+        run: pnpm --filter @clipsync/mobile exec expo lint
+
+  rust:
+    name: Escritorio (Rust)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/desktop/src-tauri
+    steps:
+      - uses: actions/checkout@v7
+
+      # Bibliotecas de Linux que necesita Tauri 2, más D-Bus para el Bluetooth (bluer).
+      - name: Bibliotecas del sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libssl-dev libdbus-1-dev \
+            libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri -> target
+
+      - name: Tests de Rust
+        run: cargo test --locked
